@@ -1,0 +1,141 @@
+name: Build iOS app
+
+on:
+  push:
+    branches: [ main ]
+    paths-ignore: [ 'README.md' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: ios-build
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      TORRSERVER_TAG: MatriX.145
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      STATUS_ISSUE: "1"
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Notify start
+        continue-on-error: true
+        run: |
+          gh issue comment "$STATUS_ISSUE" --body "▶️ Сборка №${{ github.run_number }} запущена (коммит ${GITHUB_SHA::7}). Лог: $RUN_URL"
+
+      - uses: actions/checkout@v4
+
+      - name: Xcode info
+        run: |
+          {
+            xcodebuild -version
+            xcrun --sdk iphoneos --show-sdk-version
+            xcrun simctl list runtimes || true
+          } 2>&1 | tee -a steps.log
+
+      - name: Install XcodeGen
+        run: brew install xcodegen 2>&1 | tee -a steps.log
+
+      - name: Download TorrServerKit
+        run: |
+          {
+            curl -fsSL -o tsk.zip "https://github.com/YouROK/TorrServer/releases/download/${TORRSERVER_TAG}/TorrServer-ios-TorrServerKit.xcframework.zip"
+            mkdir -p Frameworks
+            unzip -q -o tsk.zip -d Frameworks
+            ls Frameworks
+          } 2>&1 | tee -a steps.log
+
+      - name: App icon
+        run: base64 -D -i Config/AppIcon.png.b64 -o Sources/Assets.xcassets/AppIcon.appiconset/AppIcon.png 2>&1 | tee -a steps.log
+
+      - name: Generate Xcode project
+        run: xcodegen generate 2>&1 | tee -a steps.log
+
+      - name: Build
+        run: |
+          set +e
+          xcodebuild \
+            -project Kinoteka.xcodeproj \
+            -scheme Kinoteka \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build > build.log 2>&1
+          STATUS=$?
+          grep -E "error:|fatal error:|Undefined symbol" build.log | sort -u | head -60
+          tail -25 build.log
+          exit $STATUS
+
+      - name: Package IPA
+        run: |
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -1)
+          echo "App: $APP"
+          rm -rf Payload && mkdir Payload
+          cp -R "$APP" Payload/
+          zip -qry Kinoteka.ipa Payload
+          ls -lh Kinoteka.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Kinoteka-ipa
+          path: Kinoteka.ipa
+          retention-days: 14
+
+      - name: Publish release
+        run: |
+          TAG="build-${{ github.run_number }}"
+          gh release create "$TAG" Kinoteka.ipa \
+            --target "$GITHUB_SHA" \
+            --title "Кинотека — сборка ${{ github.run_number }}" \
+            --notes "Коммит ${GITHUB_SHA::7}. Файл Kinoteka.ipa ставится на iPhone через Sideloadly (см. README)." \
+            --latest
+          gh issue comment "$STATUS_ISSUE" --body "✅ Сборка №${{ github.run_number }} готова: ${{ github.server_url }}/${{ github.repository }}/releases/tag/$TAG" || true
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: build-logs
+          path: |
+            build.log
+            steps.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Report failure
+        if: failure()
+        run: |
+          set +e
+          {
+            echo "Сборка №${{ github.run_number }} упала на коммите ${GITHUB_SHA::7}."
+            echo ""
+            echo "Лог: $RUN_URL"
+            echo ""
+            echo '```'
+            if [ -f build.log ]; then
+              grep -E "error:|fatal error:|Undefined symbol|ld: " build.log | sort -u | head -80 | cut -c1-600
+              echo "-----"
+              tail -60 build.log | cut -c1-600
+            else
+              echo "build.log отсутствует: ошибка на шаге до компиляции."
+              tail -60 steps.log | cut -c1-600
+            fi
+            echo '```'
+          } > report.md
+          URL=$(gh issue create --title "Ошибка сборки ${GITHUB_SHA::7}" --body-file report.md)
+          echo "$URL"
+          gh issue comment "$STATUS_ISSUE" --body "❌ Сборка №${{ github.run_number }} упала: $URL"
