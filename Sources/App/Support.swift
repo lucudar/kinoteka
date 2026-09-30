@@ -14,15 +14,11 @@ enum SettingsKeys {
     static let savePlayerSettings = "savePlayerSettings"
     static let playerRate = "playerRate"
     static let playerAspect = "playerAspect"
-}
-
-extension String {
-    var trimmed: String { trimmingCharacters(in: .whitespacesAndNewlines) }
-
-    var capitalizedFirst: String {
-        guard let first = first else { return self }
-        return String(first).uppercased() + String(dropFirst())
-    }
+    static let backgroundAudio = "backgroundAudio"
+    static let searchServer = "torrentSearchServer"
+    static let searchApiKey = "torrentSearchApiKey"
+    static let preferredQuality = "preferredQuality"
+    static let autoPlayBest = "autoPlayBestRelease"
 }
 
 enum TimeFormat {

@@ -2,7 +2,7 @@ name: Build iOS app
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, 'feature/**' ]
     paths-ignore: [ 'README.md' ]
   workflow_dispatch:
 
@@ -37,6 +37,11 @@ jobs:
           gh issue comment "$STATUS_ISSUE" --body "▶️ Сборка №${{ github.run_number }} запущена (коммит ${GITHUB_SHA::7}). Лог: $RUN_URL"
 
       - uses: actions/checkout@v4
+
+      - name: Unit tests (Sources/Core)
+        run: |
+          set -o pipefail
+          swift test 2>&1 | tee -a steps.log | tail -40
 
       - name: Xcode info
         run: |
@@ -99,12 +104,20 @@ jobs:
       - name: Publish release
         run: |
           TAG="build-${{ github.run_number }}"
-          gh release create "$TAG" Kinoteka.ipa \
-            --target "$GITHUB_SHA" \
-            --title "Кинотека — сборка ${{ github.run_number }}" \
-            --notes "Коммит ${GITHUB_SHA::7}. Файл Kinoteka.ipa ставится на iPhone через Sideloadly (см. README)." \
-            --latest
-          gh issue comment "$STATUS_ISSUE" --body "✅ Сборка №${{ github.run_number }} готова: ${{ github.server_url }}/${{ github.repository }}/releases/tag/$TAG" || true
+          if [ "$GITHUB_REF_NAME" = "main" ]; then
+            gh release create "$TAG" Kinoteka.ipa \
+              --target "$GITHUB_SHA" \
+              --title "Кинотека — сборка ${{ github.run_number }}" \
+              --notes "Коммит ${GITHUB_SHA::7}. Файл Kinoteka.ipa ставится на iPhone через Sideloadly (см. README)." \
+              --latest
+          else
+            gh release create "$TAG" Kinoteka.ipa \
+              --target "$GITHUB_SHA" \
+              --title "Кинотека — тестовая сборка ${{ github.run_number }} ($GITHUB_REF_NAME)" \
+              --notes "Тестовая сборка из ветки $GITHUB_REF_NAME, коммит ${GITHUB_SHA::7}. Основные сборки — из main." \
+              --prerelease --latest=false
+          fi
+          gh issue comment "$STATUS_ISSUE" --body "✅ Сборка №${{ github.run_number }} ($GITHUB_REF_NAME) готова: ${{ github.server_url }}/${{ github.repository }}/releases/tag/$TAG" || true
 
       - uses: actions/upload-artifact@v4
         if: failure()

@@ -335,6 +335,23 @@ struct SavedSource: Codable, Hashable, Identifiable {
     var title: String
     var link: String
     var added = Date()
+    /// Seasons contained in the torrent (from the search result); nil when unknown.
+    var seasons: [Int]? = nil
+    /// Short description from the search: quality, size, voice-over.
+    var info: String? = nil
+
+    func covers(season: Int) -> Bool {
+        seasons?.contains(season) ?? true
+    }
+}
+
+extension SavedSource {
+    init(release: TorrentRelease) {
+        self.init(title: release.title,
+                  link: LinkInspector.markTorrent(release.link),
+                  seasons: release.seasons.isEmpty ? nil : release.seasons,
+                  info: release.summary.isEmpty ? nil : release.summary)
+    }
 }
 
 struct ContinueEntry: Codable, Hashable, Identifiable {
@@ -348,17 +365,6 @@ struct ContinueEntry: Codable, Hashable, Identifiable {
     var updated: Date
 
     var id: String { itemKey }
-}
-
-struct Channel: Codable, Hashable, Identifiable {
-    var name: String
-    var url: String
-    var logo: String?
-    var group: String?
-    var userAgent: String? = nil
-    var referrer: String? = nil
-
-    var id: String { url }
 }
 
 struct LibraryData: Codable {

@@ -14,6 +14,7 @@ struct PlayerHostView: View {
     @AppStorage(SettingsKeys.savePlayerSettings) private var savePlayerSettings = true
     @AppStorage(SettingsKeys.playerRate) private var savedRate = 1.0
     @AppStorage(SettingsKeys.playerAspect) private var savedAspect = AspectMode.fit.rawValue
+    @AppStorage(SettingsKeys.backgroundAudio) private var backgroundAudio = true
 
     enum Phase: Equatable {
         case resolving
@@ -64,6 +65,7 @@ struct PlayerHostView: View {
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
         .task { await resolve() }
+        .task { await loadArtwork() }
         .task(id: hash) { await pollTorrentStats() }
         .onAppear {
             UIApplication.shared.isIdleTimerDisabled = true
@@ -94,11 +96,19 @@ struct PlayerHostView: View {
             if !open { bumpControls() }
         }
         .onChange(of: scenePhase) { _, newPhase in
-            if newPhase != .active {
+            switch newPhase {
+            case .active:
+                model.setVideoEnabled(true)
+            case .background:
                 saveProgress(final: true)
-                if newPhase == .background && model.isPlaying {
-                    model.togglePlay()
+                if backgroundAudio && phase == .playing {
+                    // Keep the sound playing (lock screen, other apps); the picture is not needed.
+                    model.setVideoEnabled(false)
+                } else {
+                    model.pause()
                 }
+            default:
+                saveProgress(final: true)
             }
         }
         .sheet(isPresented: $showFiles) { filesSheet }
@@ -118,7 +128,7 @@ struct PlayerHostView: View {
             streamKey = link
             start(url: url, slaves: [])
         case .torrent:
-            await resolveTorrent(link)
+            await resolveTorrent(LinkInspector.stripMarker(link))
         }
     }
 
@@ -134,6 +144,11 @@ struct PlayerHostView: View {
                 throw TorrServerError.server("не удалось добавить торрент")
             }
             hash = h
+            // The previous torrent stays connected after its player closes; free it for the new one.
+            if let previous = coordinator.lastTorrentHash, previous.lowercased() != h.lowercased() {
+                Task { await TorrServer.shared.drop(hash: previous) }
+            }
+            coordinator.lastTorrentHash = h
             let all = try await TorrServer.shared.waitForFiles(hash: h) { s in
                 statusText = "Подключение к пирам…"
                 detailText = s.peersText
@@ -217,6 +232,9 @@ struct PlayerHostView: View {
         let rate: Float = (savePlayerSettings && !request.isLive) ? Float(savedRate) : 1
         let aspect: AspectMode = savePlayerSettings ? (AspectMode(rawValue: savedAspect) ?? .fit) : .fit
         model.load(url: url, startAt: resume > 10_000 ? resume - 3_000 : 0, options: options, rate: rate, aspect: aspect, slaves: slaves)
+        model.enableRemoteControls(title: request.item?.title ?? request.title,
+                                   subtitle: currentFile.flatMap { files.count > 1 ? fileLabel($0) : nil },
+                                   isLive: request.isLive)
         lastResumeSave = Date()
         lastContinueSave = Date.distantPast
         bumpControls()
@@ -238,13 +256,14 @@ struct PlayerHostView: View {
         play(file)
     }
 
+    /// The next episode by its number (not the next file name), same folder first.
     private var nextFile: TorrentFile? {
-        guard let current = currentFile, let index = files.firstIndex(of: current), index + 1 < files.count else { return nil }
-        return files[index + 1]
+        guard let current = currentFile, files.count > 1 else { return nil }
+        return EpisodeMatcher.next(after: current, in: files)
     }
 
     private func fileLabel(_ file: TorrentFile) -> String {
-        if let parsed = EpisodeMatcher.parse(file.path) {
+        if let parsed = EpisodeMatcher.numbers(of: file) {
             if let season = parsed.season { return "\(season) сезон, \(parsed.episode) серия" }
             return "\(parsed.episode) серия"
         }
@@ -323,11 +342,17 @@ struct PlayerHostView: View {
             saveProgress(final: true)
             model.stop()
         }
-        if let h = hash {
-            Task { await TorrServer.shared.drop(hash: h) }
-        }
+        // The torrent is not dropped here: TorrServer keeps it for a few minutes
+        // (reopening or the next episode starts without reconnecting) and closes it itself.
         if OrientationHelper.isPhone {
             OrientationHelper.set(landscape: false)
+        }
+    }
+
+    private func loadArtwork() async {
+        guard let url = request.item?.poster else { return }
+        if let image = await ImageCache.shared.load(url), !Task.isCancelled {
+            model.setNowPlayingArtwork(image)
         }
     }
 
