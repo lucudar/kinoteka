@@ -204,7 +204,7 @@ struct DetailsView: View {
     private func watchTapped() {
         if let entry = continueEntry {
             coordinator.play(PlayRequest(title: entry.title, link: entry.link, itemKey: item.key, item: current, preferredFileId: entry.fileId))
-        } else if isSeries, let first = seasons.first?.episodes.first {
+        } else if isSeries, let first = (seasons.first(where: { $0.number > 0 }) ?? seasons.first)?.episodes.first {
             play(first)
         } else if let source = sources.first {
             coordinator.play(PlayRequest(title: current.title, link: source.link, itemKey: item.key, item: current))

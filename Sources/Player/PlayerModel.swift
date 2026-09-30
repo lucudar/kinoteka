@@ -360,7 +360,8 @@ final class VLCPlayerModel: ObservableObject {
                 return .success
             }
             center.changePlaybackPositionCommand.addTarget { [weak self] event in
-                guard let position = event as? MPChangePlaybackPositionCommandEvent else { return .commandFailed }
+                guard let position = event as? MPChangePlaybackPositionCommandEvent,
+                      position.positionTime.isFinite else { return .commandFailed }
                 let ms = Int32(max(0, min(position.positionTime * 1000, Double(Int32.max))))
                 MainActor.assumeIsolated { self?.seek(ms: ms) }
                 return .success
