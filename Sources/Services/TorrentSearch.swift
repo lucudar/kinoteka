@@ -12,6 +12,7 @@ enum TorrentSearchError: LocalizedError {
             return "Не задан сервер поиска раздач. Укажите его: Моё → Настройки → Поиск раздач."
         case .http(let code):
             if code == 401 || code == 403 { return "Сервер поиска отклонил запрос (\(code)): проверьте API-ключ в настройках." }
+            if code == 429 { return "Сервер поиска раздач просит подождать: слишком много запросов. Попробуйте через минуту." }
             return "Сервер поиска раздач недоступен (ошибка \(code)). Попробуйте позже или укажите другой сервер."
         case .badResponse:
             return "Сервер поиска вернул неожиданный ответ. Проверьте адрес в настройках: нужен Jacred или Jackett."
@@ -21,28 +22,46 @@ enum TorrentSearchError: LocalizedError {
     }
 }
 
-struct TorrentSearchResult {
+struct TorrentSearchResult: Codable, Sendable {
     var releases: [TorrentRelease]
     /// Results returned by the server before filtering.
     var found: Int
 }
 
+extension TorrentSearchQuery {
+    /// The automatic search for a film or series of the catalog.
+    init(item: MediaItem) {
+        self.init(title: item.title, originalTitle: item.originalTitle, year: item.year, isSeries: item.kind == .series)
+    }
+}
+
 /// Finds torrents for a title through a Jackett-compatible API (Jacred by default),
 /// the way Zona lists "раздачи" for every film.
+///
+/// Fast on purpose: the film page searches in advance, equal requests running at the same time
+/// share one download, and results are kept in memory and on disk (the page of a film opened
+/// before shows its releases at once, even offline).
 @MainActor
 final class TorrentSearchService {
     static let shared = TorrentSearchService()
     nonisolated static let defaultServer = "https://jac.red"
 
+    /// Results younger than this are used without asking the server again.
+    private let freshLifetime: TimeInterval = 30 * 60
+    /// Older results are still used when the server cannot be reached.
+    private let staleLifetime: TimeInterval = 3 * 24 * 60 * 60
+
     private let session: URLSession
-    private var cache: [URL: (date: Date, result: TorrentSearchResult)] = [:]
-    private let cacheLifetime: TimeInterval = 20 * 60
+    private var memory: [URL: CachedSearch] = [:]
+    private var inFlight: [URL: (id: UUID, task: Task<TorrentSearchResult, Error>)] = [:]
+    private var pruned = false
 
     init() {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 30
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         config.urlCache = nil
+        config.httpMaximumConnectionsPerHost = 4
         session = URLSession(configuration: config)
     }
 
@@ -59,25 +78,123 @@ final class TorrentSearchService {
         ReleaseQuality(rawValue: UserDefaults.standard.integer(forKey: SettingsKeys.preferredQuality)) ?? .fullHD
     }
 
+    /// Releases for the query: fresh cached ones at once, otherwise from the server
+    /// (and the older cached ones when the server does not answer).
     func search(_ query: TorrentSearchQuery, force: Bool = false) async throws -> TorrentSearchResult {
         guard let url = query.url(server: server, apiKey: apiKey) else { throw TorrentSearchError.noServer }
-        if !force, let hit = cache[url], Date().timeIntervalSince(hit.date) < cacheLifetime {
-            return hit.result
+        if !force {
+            if let hit = await cached(url), hit.age < freshLifetime { return hit.result }
+            if let running = inFlight[url] { return try await running.task.value }
         }
+        let alternative = query.url(server: server, apiKey: apiKey, useOriginalTitle: true)
+        let id = UUID()
+        let task = Task { try await self.download(url, alternative: alternative, query: query) }
+        inFlight[url] = (id, task)
+        defer {
+            if inFlight[url]?.id == id { inFlight[url] = nil }
+        }
+        do {
+            let result = try await task.value
+            store(CachedSearch(url: url.absoluteString, date: Date(), result: result), for: url)
+            return result
+        } catch {
+            if error is CancellationError { throw error }
+            if let stale = await cached(url), stale.age < staleLifetime { return stale.result }
+            throw error
+        }
+    }
+
+    /// Whatever was found before for the query (up to a few days old), without asking the server.
+    func cachedResult(_ query: TorrentSearchQuery) async -> TorrentSearchResult? {
+        guard let url = query.url(server: server, apiKey: apiKey),
+              let hit = await cached(url), hit.age < staleLifetime else { return nil }
+        return hit.result
+    }
+
+    func clearCache() {
+        memory.removeAll()
+        let dir = TorrentSearchService.cacheDirectory
+        Task.detached(priority: .utility) {
+            try? FileManager.default.removeItem(at: dir)
+        }
+    }
+
+    // MARK: Cache
+
+    private func cached(_ url: URL) async -> CachedSearch? {
+        if let hit = memory[url] { return hit }
+        let file = TorrentSearchService.cacheFile(for: url)
+        let key = url.absoluteString
+        let loaded: CachedSearch? = await Task.detached(priority: .userInitiated) {
+            guard let data = try? Data(contentsOf: file),
+                  let entry = try? JSONDecoder().decode(CachedSearch.self, from: data),
+                  entry.url == key else { return nil }
+            return entry
+        }.value
+        guard let entry = loaded else { return nil }
+        // A newer result may have arrived while the file was read.
+        if let newer = memory[url], newer.date > entry.date { return newer }
+        memory[url] = entry
+        return entry
+    }
+
+    private func store(_ entry: CachedSearch, for url: URL) {
+        memory[url] = entry
+        if memory.count > 200 {
+            let old = memory.sorted { $0.value.date < $1.value.date }.prefix(memory.count - 150)
+            for (key, _) in old { memory.removeValue(forKey: key) }
+        }
+        let file = TorrentSearchService.cacheFile(for: url)
+        let dir = TorrentSearchService.cacheDirectory
+        let prune = !pruned
+        pruned = true
+        let maxAge = staleLifetime
+        Task.detached(priority: .utility) {
+            let manager = FileManager.default
+            try? manager.createDirectory(at: dir, withIntermediateDirectories: true)
+            if let data = try? JSONEncoder().encode(entry) {
+                try? data.write(to: file, options: .atomic)
+            }
+            if prune { TorrentSearchService.prune(dir, maxAge: maxAge, keep: 300) }
+        }
+    }
+
+    private nonisolated static var cacheDirectory: URL {
+        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("torrent-search", isDirectory: true)
+    }
+
+    /// v1: bump when the parsing of results changes, so old parsed results are not reused.
+    private nonisolated static func cacheFile(for url: URL) -> URL {
+        cacheDirectory.appendingPathComponent("v1-" + CacheName.digest(url.absoluteString) + ".json")
+    }
+
+    /// Removes results older than `maxAge` and the oldest ones above `keep` files.
+    private nonisolated static func prune(_ dir: URL, maxAge: TimeInterval, keep: Int) {
+        let manager = FileManager.default
+        let files = (try? manager.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
+        let dated = files.map { file -> (URL, Date) in
+            let date = (try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            return (file, date)
+        }.sorted { $0.1 > $1.1 }
+        let now = Date()
+        for (index, item) in dated.enumerated() where index >= keep || now.timeIntervalSince(item.1) > maxAge {
+            try? manager.removeItem(at: item.0)
+        }
+    }
+
+    // MARK: Network
+
+    private func download(_ url: URL, alternative: URL?, query: TorrentSearchQuery) async throws -> TorrentSearchResult {
         var result = try await fetch(url, query: query)
         // A plain Jackett searches by one string: retry with the original title when nothing matched.
         if result.releases.isEmpty, !query.isCustom,
            let original = query.originalTitle?.nonEmpty, original != query.title,
-           let alternative = query.url(server: server, apiKey: apiKey, useOriginalTitle: true), alternative != url {
+           let alternative = alternative, alternative != url {
             let second = try await fetch(alternative, query: query)
             result = TorrentSearchResult(releases: second.releases, found: result.found + second.found)
         }
-        cache[url] = (Date(), result)
         return result
-    }
-
-    func clearCache() {
-        cache.removeAll()
     }
 
     private func fetch(_ url: URL, query: TorrentSearchQuery) async throws -> TorrentSearchResult {
@@ -101,5 +218,26 @@ final class TorrentSearchService {
         }.value
         guard let parsed = parsed else { throw TorrentSearchError.badResponse }
         return TorrentSearchResult(releases: parsed.releases, found: parsed.found)
+    }
+}
+
+/// One saved search result.
+private struct CachedSearch: Codable, Sendable {
+    var url: String
+    var date: Date
+    var result: TorrentSearchResult
+
+    var age: TimeInterval { Date().timeIntervalSince(date) }
+}
+
+/// Short stable file names for cache entries (FNV-1a, 64 bit).
+enum CacheName {
+    static func digest(_ text: String) -> String {
+        var hash: UInt64 = 0xcbf29ce484222325
+        for byte in text.utf8 {
+            hash ^= UInt64(byte)
+            hash = hash &* 0x100000001b3
+        }
+        return String(format: "%016llx", hash)
     }
 }

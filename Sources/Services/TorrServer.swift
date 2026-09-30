@@ -224,8 +224,10 @@ final class TorrServer {
         return try decoder.decode(TSStatus.self, from: data)
     }
 
-    func add(link: String, title: String, poster: String?) async throws -> TSStatus {
-        var body: [String: Any] = ["action": "add", "link": link, "title": title, "save_to_db": true]
+    /// Adds a torrent (or returns the one already added). Torrents saved to the engine's database
+    /// keep their metadata, so opening them again does not wait for peers to send it.
+    func add(link: String, title: String, poster: String?, saveToDB: Bool = true) async throws -> TSStatus {
+        var body: [String: Any] = ["action": "add", "link": link, "title": title, "save_to_db": saveToDB]
         if let poster = poster { body["poster"] = poster }
         return try decodeStatus(try await post(body))
     }
@@ -242,16 +244,19 @@ final class TorrServer {
         _ = try? await post(["action": "wipe"])
     }
 
-    /// Polls the torrent until its file list (metadata) is known.
+    /// Polls the torrent until its file list (metadata) is known: often at first
+    /// (a prepared torrent is ready at once), then less often.
     func waitForFiles(hash: String, timeout: TimeInterval = 120, progress: @escaping @MainActor (TSStatus) -> Void) async throws -> [TorrentFile] {
         let deadline = Date().addingTimeInterval(timeout)
+        var attempt = 0
         while Date() < deadline {
             try Task.checkCancellation()
             let status = try await get(hash: hash)
             await progress(status)
             let files = status.files
             if !files.isEmpty { return files }
-            try await Task.sleep(nanoseconds: 700_000_000)
+            attempt += 1
+            try await Task.sleep(nanoseconds: attempt < 20 ? 250_000_000 : 600_000_000)
         }
         throw TorrServerError.timeout
     }

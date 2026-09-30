@@ -6,6 +6,8 @@ final class ReleaseParserTests: XCTestCase {
         XCTAssertEqual(ReleaseParser.quality(title: "Дюна / Dune: Part Two / 2024 / ПМ, СТ / WEB-DL (1080p) | Jaskier", height: 480), .fullHD)
         XCTAssertEqual(ReleaseParser.quality(title: "Dune / 4K, HEVC, HDR, Dolby Vision"), .uhd)
         XCTAssertEqual(ReleaseParser.quality(title: "Film 2160p UHD BDRemux"), .uhd)
+        XCTAssertEqual(ReleaseParser.quality(title: "Дюна / Dune: Part One (2021) UHD BDRip-HEVC 1080p от RIPS CLUB | HDR"), .fullHD)
+        XCTAssertEqual(ReleaseParser.quality(title: "Film / 4K, HEVC, HDR / WEB-DL", height: 1080), .uhd)
         XCTAssertEqual(ReleaseParser.quality(title: "Film (2021) BDRip 720p"), .hd)
         XCTAssertEqual(ReleaseParser.quality(title: "Film (2021) WEB-DLRip"), .sd)
         XCTAssertEqual(ReleaseParser.quality(title: "Film (2021) WEB-DLRip", height: 720), .hd)

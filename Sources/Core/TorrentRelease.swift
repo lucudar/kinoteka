@@ -41,7 +41,7 @@ enum ReleaseQuality: Int, Codable, CaseIterable, Comparable, Identifiable, Senda
     static func < (lhs: ReleaseQuality, rhs: ReleaseQuality) -> Bool { lhs.rawValue < rhs.rawValue }
 }
 
-enum VoiceKind: Int, CaseIterable, Comparable, Sendable {
+enum VoiceKind: Int, Codable, CaseIterable, Comparable, Sendable {
     case dub
     case multi
     case two
@@ -66,7 +66,7 @@ enum VoiceKind: Int, CaseIterable, Comparable, Sendable {
 }
 
 /// One torrent found by the search (a "раздача").
-struct TorrentRelease: Identifiable, Hashable, Sendable {
+struct TorrentRelease: Identifiable, Hashable, Codable, Sendable {
     var id: String
     var title: String
     var link: String
@@ -120,9 +120,11 @@ struct TorrentRelease: Identifiable, Hashable, Sendable {
 
 enum ReleaseParser {
     static func quality(title: String, height: Int? = nil) -> ReleaseQuality {
-        if Rx.matches("(?<![0-9])2160[pi]|(?<![0-9a-z])(4k|uhd)(?![0-9a-z])", in: title) { return .uhd }
+        // An explicit resolution wins: "UHD BDRip 1080p" is a 1080p copy of a 4K disc.
+        if Rx.matches("(?<![0-9])2160[pi]", in: title) { return .uhd }
         if Rx.matches("(?<![0-9])1080[pi]", in: title) { return .fullHD }
         if Rx.matches("(?<![0-9])720p", in: title) { return .hd }
+        if Rx.matches("(?<![0-9a-z])(4k|uhd)(?![0-9a-z])", in: title) { return .uhd }
         if let height = height, height > 0 { return ReleaseQuality(height: height) }
         if Rx.matches("(?<![0-9])(480|576|360)p|rip(?![a-z])|(?<![a-z])(dvd5|dvd9|dvd|hdtv|sd|vhs)(?![a-z])", in: title) { return .sd }
         return .unknown
@@ -302,22 +304,19 @@ enum ReleaseRanking {
 
         if release.isCamRip { score -= 45 }
 
-        if preferred != .uhd {
-            let gigabytes = Double(release.size) / 1_073_741_824
-            if release.seasons.isEmpty {
-                if gigabytes > 60 {
-                    score -= 16
-                } else if gigabytes > 35 {
-                    score -= 8
-                }
-            } else {
-                let perSeason = gigabytes / Double(release.seasons.count)
-                if perSeason > 120 {
-                    score -= 14
-                } else if perSeason > 60 {
-                    score -= 8
-                }
-            }
+        // Huge files (remuxes) stream badly over a torrent on a phone; for 4K the limits are higher
+        // and the penalty is milder, so a preferred 4K still wins over 1080p.
+        let gigabytes = Double(release.size) / 1_073_741_824
+        let isUHD = release.quality == .uhd
+        let fileLimits: (soft: Double, hard: Double) = isUHD ? (45, 75) : (35, 60)
+        let seasonLimits: (soft: Double, hard: Double) = isUHD ? (100, 200) : (60, 120)
+        let penalties: (soft: Double, hard: Double) = isUHD ? (5, 10) : (8, 16)
+        let amount = release.seasons.isEmpty ? gigabytes : gigabytes / Double(release.seasons.count)
+        let limits = release.seasons.isEmpty ? fileLimits : seasonLimits
+        if amount > limits.hard {
+            score -= penalties.hard
+        } else if amount > limits.soft {
+            score -= penalties.soft
         }
 
         if let season = season {
@@ -334,7 +333,35 @@ enum ReleaseRanking {
 
     /// The release to start automatically ("Смотреть"), among those with seeders.
     static func best(_ list: [TorrentRelease], preferred: ReleaseQuality, season: Int? = nil) -> TorrentRelease? {
-        let alive = list.filter { $0.seeders > 0 }
-        return alive.max { score($0, preferred: preferred, season: season) < score($1, preferred: preferred, season: season) }
+        let scored = list.filter { $0.seeders > 0 }.map { (release: $0, score: score($0, preferred: preferred, season: season)) }
+        // Equal scores (well seeded releases): more seeders start faster.
+        return scored.max { ($0.score, $0.release.seeders) < ($1.score, $1.release.seeders) }?.release
+    }
+
+    /// Releases that can play the season (all of them for a film): torrents of other seasons are left out.
+    static func matching(_ list: [TorrentRelease], season: Int?) -> [TorrentRelease] {
+        guard let season = season else { return list }
+        return list.filter { $0.seasons.isEmpty || $0.seasons.contains(season) }
+    }
+
+    /// Qualities that have a live release for the season, best first: the "Качество" choices.
+    /// Camera copies are not offered.
+    static func qualities(_ list: [TorrentRelease], season: Int? = nil) -> [ReleaseQuality] {
+        let present = Set(matching(list, season: season).filter { $0.seeders > 0 && !$0.isCamRip }.map { $0.quality })
+        return ReleaseQuality.choices.filter { present.contains($0) }
+    }
+
+    /// The best live release of exactly this quality (not a camera copy).
+    static func best(_ list: [TorrentRelease], quality: ReleaseQuality, season: Int? = nil) -> TorrentRelease? {
+        let same = matching(list, season: season).filter { $0.quality == quality && !$0.isCamRip }
+        return best(same, preferred: quality, season: season)
+    }
+
+    /// One release per available quality (best first), with `current` kept for its own quality.
+    static func perQuality(_ list: [TorrentRelease], season: Int? = nil, current: TorrentRelease? = nil) -> [TorrentRelease] {
+        qualities(list, season: season).compactMap { quality in
+            if let current = current, current.quality == quality { return current }
+            return best(list, quality: quality, season: season)
+        }
     }
 }

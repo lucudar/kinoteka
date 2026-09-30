@@ -14,6 +14,8 @@ struct SourcesSheet: View {
     let item: MediaItem
     var episode: KPEpisode? = nil
     var seasonNumbers: [Int] = []
+    /// Quality picked on the film page: the list opens filtered by it.
+    var initialQuality: ReleaseQuality? = nil
 
     private enum LoadState: Equatable {
         case loading
@@ -140,6 +142,7 @@ struct SourcesSheet: View {
                 if !didStart {
                     didStart = true
                     season = episode?.seasonNumber
+                    quality = initialQuality
                 }
                 // Also restarts a search that was cancelled while "Своя ссылка" was open.
                 if state == .loading {

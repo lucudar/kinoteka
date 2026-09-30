@@ -7,6 +7,7 @@ struct DetailsView: View {
     @Environment(\.openURL) private var openURL
     @AppStorage(SettingsKeys.kpToken) private var token = ""
     @AppStorage(SettingsKeys.autoPlayBest) private var autoPlayBest = true
+    @AppStorage(SettingsKeys.preferredQuality) private var preferredRaw = ReleaseQuality.fullHD.rawValue
 
     @State private var film: KPFilm?
     @State private var staff: [KPStaff] = []
@@ -19,6 +20,13 @@ struct DetailsView: View {
     @State private var alertText: String?
     @State private var loadingTrailer = false
     @State private var searchingRelease = false
+    /// The film info is known (or could not be loaded): the torrent search can start.
+    @State private var filmResolved = false
+    /// Releases found in advance for the page; nil until the first search ends.
+    @State private var releases: [TorrentRelease]?
+    @State private var releasesFailed = false
+    /// Quality picked on the page for the next playback; nil means "Авто".
+    @State private var chosenQuality: ReleaseQuality?
 
     private var current: MediaItem { film?.item ?? item }
     private var isSeries: Bool { film?.isSeries ?? (item.kind == .series) }
@@ -26,6 +34,104 @@ struct DetailsView: View {
     private var continueEntry: ContinueEntry? { library.continueEntry(for: item.key) }
     private var shareURL: URL {
         URL(string: film?.webUrl ?? "") ?? URL(string: "https://www.kinopoisk.ru/film/\(item.id)/")!
+    }
+    private var preferredQuality: ReleaseQuality { ReleaseQuality(rawValue: preferredRaw) ?? .fullHD }
+
+    private var searchQuery: TorrentSearchQuery? {
+        filmResolved ? TorrentSearchQuery(item: current) : nil
+    }
+
+    /// The episode "Смотреть" starts for a series: the first one of the season chosen below.
+    private var firstEpisode: KPEpisode? {
+        let season = seasons.first(where: { $0.number == selectedSeason })
+            ?? seasons.first(where: { $0.number > 0 })
+            ?? seasons.first
+        return season?.episodes.first
+    }
+
+    /// Season of the main button: the one being continued, or the one chosen below.
+    private var planSeason: Int? {
+        guard isSeries else { return nil }
+        if let entry = continueEntry { return entry.season }
+        return firstEpisode?.seasonNumber
+    }
+
+    /// A release watched before that can play the season (any saved one for a film).
+    private func savedSource(season: Int?) -> SavedSource? {
+        guard let season = season else { return sources.first }
+        return sources.first { $0.seasons?.contains(season) == true } ?? sources.first { $0.seasons == nil }
+    }
+
+    /// The found release for the season: the best one of the chosen quality, or of the preferred one.
+    private func plannedRelease(season: Int?) -> TorrentRelease? {
+        guard let list = releases else { return nil }
+        if let quality = chosenQuality {
+            return ReleaseRanking.best(list, quality: quality, season: season)
+        }
+        return ReleaseRanking.best(ReleaseRanking.matching(list, season: season), preferred: preferredQuality, season: season)
+    }
+
+    private var qualityOptions: [ReleaseQuality] {
+        guard let list = releases else { return [] }
+        return ReleaseRanking.qualities(list, season: planSeason)
+    }
+
+    private enum Plan {
+        case resume(ContinueEntry)
+        case source(SavedSource)
+        case release(TorrentRelease)
+    }
+
+    /// What the main button plays.
+    private var plan: Plan? {
+        let season = planSeason
+        if let entry = continueEntry {
+            if chosenQuality != nil, let release = plannedRelease(season: season),
+               LinkInspector.markTorrent(release.link) != entry.link {
+                return .release(release)
+            }
+            return .resume(entry)
+        }
+        if chosenQuality == nil, let source = savedSource(season: season) {
+            return .source(source)
+        }
+        return plannedRelease(season: season).map { Plan.release($0) }
+    }
+
+    /// The torrent to prepare while the page is open, so the playback starts faster.
+    private var warmupLink: String? {
+        switch plan {
+        case .resume(let entry): return entry.link
+        case .source(let source): return source.link
+        case .release(let release): return autoPlayBest ? LinkInspector.markTorrent(release.link) : nil
+        case nil: return nil
+        }
+    }
+
+    private var watchTitle: String {
+        let title = continueEntry != nil ? "Продолжить" : "Смотреть"
+        guard let quality = chosenQuality else { return title }
+        return title + " в " + quality.title
+    }
+
+    private var captionText: String? {
+        switch plan {
+        case .resume(let entry):
+            var parts: [String] = []
+            if let subtitle = entry.subtitle, !subtitle.isEmpty { parts.append(subtitle) }
+            if let info = sources.first(where: { $0.link == entry.link })?.info { parts.append(info) }
+            return parts.isEmpty ? nil : parts.joined(separator: " · ")
+        case .source(let source):
+            return "Раздача: " + (source.info ?? source.title)
+        case .release(let release):
+            return "Раздача: " + (release.summary.isEmpty ? release.title : release.summary)
+        case nil:
+            if searchingRelease { return nil }
+            if releases == nil {
+                return releasesFailed ? "Поиск раздач не ответил — «Смотреть» попробует ещё раз" : "Ищем раздачи…"
+            }
+            return "Раздачи не найдены автоматически — откройте «Раздачи»"
+        }
     }
 
     var body: some View {
@@ -61,12 +167,22 @@ struct DetailsView: View {
             }
         }
         .sheet(isPresented: $showSources) {
-            SourcesSheet(item: current, episode: pendingEpisode, seasonNumbers: seasons.map { $0.number })
+            SourcesSheet(item: current, episode: pendingEpisode, seasonNumbers: seasons.map { $0.number },
+                         initialQuality: chosenQuality)
         }
         .alert(alertText ?? "", isPresented: Binding(get: { alertText != nil }, set: { if !$0 { alertText = nil } })) {
             Button("OK", role: .cancel) {}
         }
         .task(id: token) { await load() }
+        .task(id: searchQuery) { await prefetchReleases() }
+        .task(id: warmupLink) { await warmUp(warmupLink) }
+        .onChange(of: qualityOptions) { _, options in
+            if let quality = chosenQuality, !options.contains(quality) { chosenQuality = nil }
+        }
+        .onChange(of: coordinator.request?.id) { _, id in
+            // The choice is for one playback: next time the page continues what was watched.
+            if id != nil { chosenQuality = nil }
+        }
         .onAppear { library.addHistory(current) }
     }
 
@@ -139,7 +255,7 @@ struct DetailsView: View {
     // MARK: Actions
 
     private var actions: some View {
-        VStack(spacing: 14) {
+        VStack(spacing: 12) {
             Button {
                 watchTapped()
             } label: {
@@ -151,7 +267,7 @@ struct DetailsView: View {
                             Text("Ищем раздачу…")
                         }
                     } else {
-                        Label(continueEntry != nil ? "Продолжить" : "Смотреть", systemImage: "play.fill")
+                        Label(watchTitle, systemImage: "play.fill")
                     }
                 }
                 .font(.headline)
@@ -163,16 +279,14 @@ struct DetailsView: View {
             .buttonStyle(.plain)
             .disabled(searchingRelease)
 
-            if let entry = continueEntry, let subtitle = entry.subtitle, !subtitle.isEmpty {
-                Text(subtitle)
+            qualityChips
+
+            if let text = captionText {
+                Text(text)
                     .font(.caption)
                     .foregroundStyle(Theme.secondary)
-                    .frame(maxWidth: .infinity)
-            } else if continueEntry == nil, !isSeries, let source = sources.first {
-                Text("Раздача: " + (source.info ?? source.title))
-                    .font(.caption)
-                    .foregroundStyle(Theme.secondary)
-                    .lineLimit(1)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.center)
                     .frame(maxWidth: .infinity)
             }
 
@@ -197,29 +311,61 @@ struct DetailsView: View {
                     showSources = true
                 }
             }
+            .padding(.top, 2)
         }
         .padding(.horizontal, 16)
     }
 
-    private func watchTapped() {
-        if let entry = continueEntry {
-            coordinator.play(PlayRequest(title: entry.title, link: entry.link, itemKey: item.key, item: current, preferredFileId: entry.fileId))
-        } else if isSeries, let first = (seasons.first(where: { $0.number > 0 }) ?? seasons.first)?.episodes.first {
-            play(first)
-        } else if let source = sources.first {
-            coordinator.play(PlayRequest(title: current.title, link: source.link, itemKey: item.key, item: current))
-        } else {
-            playBestRelease(for: nil)
+    /// "Авто" plays what was watched before or the best release of the preferred quality;
+    /// a quality plays the best release of that quality.
+    @ViewBuilder
+    private var qualityChips: some View {
+        let options = qualityOptions
+        if autoPlayBest && options.count > 1 {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    Text("Качество")
+                        .font(.subheadline)
+                        .foregroundStyle(Theme.secondary)
+                        .padding(.trailing, 2)
+                    Chip(title: "Авто", selected: chosenQuality == nil) { chosenQuality = nil }
+                    ForEach(options) { quality in
+                        Chip(title: quality.title, selected: chosenQuality == quality) { chosenQuality = quality }
+                    }
+                }
+            }
         }
     }
 
+    private func watchTapped() {
+        if let entry = continueEntry {
+            continueWatching(entry)
+        } else if isSeries, let episode = firstEpisode {
+            play(episode)
+        } else {
+            playRelease(for: nil)
+        }
+    }
+
+    private func continueWatching(_ entry: ContinueEntry) {
+        var request = PlayRequest(continuing: entry, item: current)
+        request.itemKey = item.key
+        if case .release(let release) = plan {
+            // Another quality is chosen: the same episode and place in that release.
+            let source = SavedSource(release: release)
+            library.addSource(source, for: item.key)
+            request.link = source.link
+            request.preferredFileId = nil
+            if let time = entry.time, time > 10_000 { request.startTime = time }
+        }
+        coordinator.play(request)
+    }
+
     private func play(_ episode: KPEpisode) {
-        let season = episode.seasonNumber
-        let source = sources.first { $0.seasons?.contains(season) == true } ?? sources.first { $0.seasons == nil }
-        if let source = source {
+        if chosenQuality == nil, let source = savedSource(season: episode.seasonNumber) {
             coordinator.play(request(for: episode, link: source.link))
         } else {
-            playBestRelease(for: episode)
+            playRelease(for: episode)
         }
     }
 
@@ -232,33 +378,82 @@ struct DetailsView: View {
                            season: episode.seasonNumber, episode: episode.episodeNumber)
     }
 
-    /// Like Zona: finds the torrents for the title and starts the best one right away.
-    /// The list of all releases opens when nothing suitable is found (or auto start is off).
-    private func playBestRelease(for episode: KPEpisode?) {
+    /// Like Zona: starts the release watched before or the best found one right away (the search
+    /// usually has finished while the page was open). The list of all releases opens when nothing
+    /// suitable is found or auto start is off.
+    private func playRelease(for episode: KPEpisode?) {
+        let season = episode?.seasonNumber
+        if chosenQuality == nil, episode == nil, let source = sources.first {
+            coordinator.play(request(for: nil, link: source.link))
+            return
+        }
         guard autoPlayBest else {
             pendingEpisode = episode
             showSources = true
             return
         }
+        if releases != nil, let release = plannedRelease(season: season) {
+            start(release, episode: episode)
+            return
+        }
         guard !searchingRelease else { return }
         searchingRelease = true
-        let title = current
-        let query = TorrentSearchQuery(title: title.title, originalTitle: title.originalTitle, year: title.year, isSeries: isSeries)
+        let query = TorrentSearchQuery(item: current)
         Task {
             defer { searchingRelease = false }
-            let service = TorrentSearchService.shared
-            var candidates = (try? await service.search(query))?.releases ?? []
-            if let season = episode?.seasonNumber {
-                candidates = candidates.filter { $0.seasons.isEmpty || $0.seasons.contains(season) }
+            if let result = try? await TorrentSearchService.shared.search(query) {
+                releases = result.releases
+                releasesFailed = false
             }
-            guard let best = ReleaseRanking.best(candidates, preferred: service.preferredQuality, season: episode?.seasonNumber) else {
+            if let release = plannedRelease(season: season) {
+                start(release, episode: episode)
+            } else {
                 pendingEpisode = episode
                 showSources = true
-                return
             }
-            let source = SavedSource(release: best)
-            library.addSource(source, for: item.key)
-            coordinator.play(request(for: episode, link: source.link))
+        }
+    }
+
+    private func start(_ release: TorrentRelease, episode: KPEpisode?) {
+        let source = SavedSource(release: release)
+        library.addSource(source, for: item.key)
+        coordinator.play(request(for: episode, link: source.link))
+    }
+
+    // MARK: Speed-ups
+
+    /// Searches the releases as soon as the page opens, so "Смотреть" starts without waiting.
+    private func prefetchReleases() async {
+        guard let query = searchQuery else { return }
+        let service = TorrentSearchService.shared
+        if releases == nil, let cached = await service.cachedResult(query), searchQuery == query {
+            releases = cached.releases
+        }
+        // Only for a page that stays open, not while flicking through pages (the server limits requests).
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        guard !Task.isCancelled else { return }
+        do {
+            let result = try await service.search(query)
+            guard searchQuery == query else { return }
+            releases = result.releases
+            releasesFailed = false
+        } catch {
+            guard searchQuery == query, !(error is CancellationError) else { return }
+            releasesFailed = true
+        }
+    }
+
+    /// Adds the torrent the button will play to the engine a moment after the page opens
+    /// (not while scrolling through pages) and keeps it connected while the page is open.
+    private func warmUp(_ link: String?) async {
+        guard let link = link, TorrentWarmup.shared.isEnabled else { return }
+        try? await Task.sleep(nanoseconds: 800_000_000)
+        guard !Task.isCancelled else { return }
+        await TorrentWarmup.shared.prepare(link: link, title: current.title, poster: current.posterURL)
+        while !Task.isCancelled {
+            try? await Task.sleep(nanoseconds: 45_000_000_000)
+            guard !Task.isCancelled else { return }
+            await TorrentWarmup.shared.keepAlive()
         }
     }
 
@@ -417,27 +612,43 @@ struct DetailsView: View {
     // MARK: Loading
 
     private func load() async {
-        if film != nil && !staff.isEmpty { return }
+        if film != nil && !staff.isEmpty {
+            filmResolved = true
+            return
+        }
+        let id = item.id
+        // The film, its seasons and people load at the same time.
+        let staffTask = Task { try? await KPClient.shared.staff(id) }
+        var seasonsTask: Task<[KPSeason]?, Never>?
+        if item.kind == .series {
+            seasonsTask = Task { try? await KPClient.shared.seasons(id) }
+        }
         do {
-            let loaded = try await KPClient.shared.film(item.id)
+            let loaded = try await KPClient.shared.film(id)
             film = loaded
             error = nil
+            filmResolved = true
             library.addHistory(loaded.item)
             if loaded.isSeries {
-                if let list = try? await KPClient.shared.seasons(item.id) {
+                var list = await seasonsTask?.value
+                if list == nil {
+                    list = try? await KPClient.shared.seasons(id)
+                }
+                if let list = list {
                     seasons = list.filter { !$0.episodes.isEmpty }.sorted { $0.number < $1.number }
                     if let first = seasons.first, !seasons.contains(where: { $0.number == selectedSeason }) {
                         selectedSeason = first.number
                     }
                 }
             }
-            if let people = try? await KPClient.shared.staff(item.id) {
-                staff = people
-            }
         } catch {
+            filmResolved = true
             if !Task.isCancelled && film == nil {
                 self.error = error.localizedDescription
             }
+        }
+        if let people = await staffTask.value {
+            staff = people
         }
     }
 }

@@ -19,6 +19,7 @@ enum SettingsKeys {
     static let searchApiKey = "torrentSearchApiKey"
     static let preferredQuality = "preferredQuality"
     static let autoPlayBest = "autoPlayBestRelease"
+    static let prepareTorrent = "prepareTorrentInAdvance"
 }
 
 enum TimeFormat {
