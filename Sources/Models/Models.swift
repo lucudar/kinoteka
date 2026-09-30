@@ -363,6 +363,11 @@ struct ContinueEntry: Codable, Hashable, Identifiable {
     var fileId: Int?
     var position: Double
     var updated: Date
+    /// Episode of the file, to find it in another release of the series.
+    var season: Int? = nil
+    var episode: Int? = nil
+    /// Position in milliseconds, to continue in another release (another quality).
+    var time: Int32? = nil
 
     var id: String { itemKey }
 }

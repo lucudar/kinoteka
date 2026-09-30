@@ -60,7 +60,7 @@ struct ContinueWatchingRow: View {
                 LazyHStack(spacing: 12) {
                     ForEach(entries) { entry in
                         Button {
-                            coordinator.play(PlayRequest(title: entry.title, link: entry.link, itemKey: entry.itemKey, item: entry.item, preferredFileId: entry.fileId))
+                            coordinator.play(PlayRequest(continuing: entry))
                         } label: {
                             ContinueCard(entry: entry)
                         }

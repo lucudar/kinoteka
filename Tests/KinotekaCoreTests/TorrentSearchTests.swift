@@ -88,6 +88,21 @@ final class TorrentSearchTests: XCTestCase {
         XCTAssertNil(ReleaseRanking.best(releases.filter { $0.seeders == 0 }, preferred: .fullHD))
     }
 
+    func testHugeRemuxLosesToStreamableRelease() {
+        func release(_ id: String, _ quality: ReleaseQuality, gigabytes: Double, seeders: Int) -> TorrentRelease {
+            TorrentRelease(id: id, title: id, link: "magnet:?xt=urn:btih:\(id)", hash: id, size: Int64(gigabytes * 1_073_741_824),
+                           seeders: seeders, peers: 0, trackers: [], published: nil, quality: quality, isHDR: false,
+                           isCamRip: false, seasons: [], voiceKinds: [.dub], studios: [], audioTracks: [],
+                           year: nil, isSeries: false, detailsURL: nil)
+        }
+        let uhd = [release("remux", .uhd, gigabytes: 90, seeders: 212), release("bdrip", .uhd, gigabytes: 28.8, seeders: 113)]
+        XCTAssertEqual(ReleaseRanking.best(uhd, quality: .uhd)?.id, "bdrip")
+        // A preferred 4K still wins over 1080p even when it is big.
+        let mixed = [release("remux", .uhd, gigabytes: 80, seeders: 40), release("web", .fullHD, gigabytes: 11, seeders: 18_000)]
+        XCTAssertEqual(ReleaseRanking.best(mixed, preferred: .uhd)?.id, "remux")
+        XCTAssertEqual(ReleaseRanking.best(mixed, preferred: .fullHD)?.id, "web")
+    }
+
     func testSeasonAwareBest() {
         func release(_ id: String, seasons: [Int], seeders: Int) -> TorrentRelease {
             TorrentRelease(id: id, title: id, link: "magnet:?xt=urn:btih:\(id)", hash: id, size: 20_000_000_000,
@@ -100,6 +115,41 @@ final class TorrentSearchTests: XCTestCase {
         XCTAssertEqual(ReleaseRanking.best(list, preferred: .fullHD, season: 3)?.id, "c")
         XCTAssertEqual(ReleaseRanking.best(list, preferred: .fullHD, season: 1)?.id, "a")
         XCTAssertEqual(ReleaseRanking.sorted(list, by: .seeders).map { $0.id }, ["a", "c", "b"])
+    }
+
+    func testQualityChoices() throws {
+        let releases = ReleaseBuilder.build(from: try decode(jacredJSON), filter: filter)
+        // 720p exists only without seeders and SD only as a camera copy, so they are not offered.
+        XCTAssertEqual(ReleaseRanking.qualities(releases), [.uhd, .fullHD])
+        XCTAssertEqual(ReleaseRanking.best(releases, quality: .uhd)?.id, "3333333333333333333333333333333333333333")
+        XCTAssertEqual(ReleaseRanking.best(releases, quality: .fullHD)?.id, "da70a96fbfa062fda51a80308dd6a8bf3806dade")
+        XCTAssertNil(ReleaseRanking.best(releases, quality: .hd))
+        XCTAssertNil(ReleaseRanking.best(releases, quality: .sd))
+        XCTAssertEqual(ReleaseRanking.perQuality(releases).map { $0.quality }, [.uhd, .fullHD])
+        // The release that plays now stays in the menu for its quality.
+        var other = releases.first { $0.quality == .fullHD }!
+        other.id = "other"
+        other.seeders = 1
+        XCTAssertEqual(ReleaseRanking.perQuality(releases + [other], current: other).map { $0.id }[1], "other")
+    }
+
+    func testQualityChoicesForSeason() {
+        func release(_ id: String, _ quality: ReleaseQuality, seasons: [Int]) -> TorrentRelease {
+            TorrentRelease(id: id, title: id, link: "magnet:?xt=urn:btih:\(id)", hash: id, size: 1, seeders: 10, peers: 0,
+                           trackers: [], published: nil, quality: quality, isHDR: false, isCamRip: false, seasons: seasons,
+                           voiceKinds: [], studios: [], audioTracks: [], year: nil, isSeries: true, detailsURL: nil)
+        }
+        let list = [release("a", .uhd, seasons: [1]), release("b", .fullHD, seasons: [2]), release("c", .hd, seasons: [])]
+        XCTAssertEqual(ReleaseRanking.qualities(list, season: 2), [.fullHD, .hd])
+        XCTAssertEqual(ReleaseRanking.matching(list, season: 1).map { $0.id }, ["a", "c"])
+        XCTAssertEqual(ReleaseRanking.qualities(list), [.uhd, .fullHD, .hd])
+        XCTAssertNil(ReleaseRanking.best(list, quality: .uhd, season: 2))
+    }
+
+    func testReleaseRoundTrip() throws {
+        let releases = ReleaseBuilder.build(from: try decode(jacredJSON), filter: filter)
+        let data = try JSONEncoder().encode(releases)
+        XCTAssertEqual(try JSONDecoder().decode([TorrentRelease].self, from: data), releases)
     }
 
     func testDecodesPlainArraysAndJackettLinks() throws {

@@ -180,6 +180,7 @@ struct SettingsView: View {
     @AppStorage(SettingsKeys.searchApiKey) private var searchApiKey = ""
     @AppStorage(SettingsKeys.preferredQuality) private var preferredQuality = ReleaseQuality.fullHD.rawValue
     @AppStorage(SettingsKeys.autoPlayBest) private var autoPlayBest = true
+    @AppStorage(SettingsKeys.prepareTorrent) private var prepareTorrent = true
     @State private var checkingSearch = false
     @State private var engineStatus = "Проверка…"
     @State private var cacheSize = ""
@@ -229,11 +230,12 @@ struct SettingsView: View {
 
             Section {
                 Toggle("Сразу включать лучшую раздачу", isOn: $autoPlayBest)
-                Picker("Качество", selection: $preferredQuality) {
+                Picker("Качество по умолчанию", selection: $preferredQuality) {
                     ForEach(ReleaseQuality.choices) { quality in
                         Text(quality.title).tag(quality.rawValue)
                     }
                 }
+                Toggle("Готовить раздачу заранее", isOn: $prepareTorrent)
                 LabeledContent("Сервер") {
                     TextField(TorrentSearchService.defaultServer, text: $searchServer)
                         .multilineTextAlignment(.trailing)
@@ -269,7 +271,7 @@ struct SettingsView: View {
             } header: {
                 Text("Поиск раздач")
             } footer: {
-                Text("Раздачи находятся сами, как в Zona: по названию и году через Jacred (публичный сервер jac.red, ключ не нужен). Можно указать свой Jacred или Jackett — для Jackett нужен API-ключ из его панели. «Смотреть» сразу запускает лучшую раздачу: нужное качество, живые сиды, дубляж. Все варианты — в «Раздачах» на странице фильма.")
+                Text("Раздачи находятся сами, как в Zona: по названию и году через Jacred (публичный сервер jac.red, ключ не нужен). Можно указать свой Jacred или Jackett — для Jackett нужен API-ключ из его панели. «Смотреть» сразу запускает лучшую раздачу: качество по умолчанию, живые сиды, дубляж. Другое качество можно выбрать на странице фильма и прямо в плеере, все варианты — в «Раздачах».\n\n«Готовить раздачу заранее»: пока открыта страница фильма, его раздача уже подключается к пирам, и видео после «Смотреть» начинается быстрее. Тратит немного трафика.")
             }
 
             Section {
@@ -412,7 +414,7 @@ struct AboutView: View {
                     }
                 }
                 Text("Личный медиаплеер в стиле Zona для iPhone.")
-                Text("• Каталог, поиск, описания, рейтинги, сезоны и актёры — из неофициального API Кинопоиска.\n• Раздачи находятся автоматически (Jacred / Jackett), как в Zona: лучшая включается кнопкой «Смотреть», остальные — в «Раздачах». Видео идёт через встроенный TorrServer MatriX без скачивания целиком.\n• Свои источники: magnet-ссылки, .torrent, прямые ссылки и HLS.\n• ТВ-каналы — из вашего M3U-плейлиста.\n• Плеер на VLCKit: MKV, HEVC, AC3/DTS, выбор озвучки и субтитров, скорость, пропорции, перемотка, звук в фоне и управление с экрана блокировки.")
+                Text("• Каталог, поиск, описания, рейтинги, сезоны и актёры — из неофициального API Кинопоиска.\n• Раздачи находятся автоматически (Jacred / Jackett), как в Zona: лучшая включается кнопкой «Смотреть», качество можно выбрать на странице фильма и в плеере, остальные варианты — в «Раздачах». Видео идёт через встроенный TorrServer MatriX без скачивания целиком.\n• Свои источники: magnet-ссылки, .torrent, прямые ссылки и HLS.\n• ТВ-каналы — из вашего M3U-плейлиста.\n• Плеер на VLCKit: MKV, HEVC, AC3/DTS, выбор озвучки и субтитров, скорость, пропорции, перемотка, звук в фоне и управление с экрана блокировки.")
                     .font(.subheadline)
                     .foregroundStyle(Theme.secondary)
                 Text("Приложение не содержит и не распространяет контент.")

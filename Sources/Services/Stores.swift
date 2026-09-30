@@ -334,14 +334,21 @@ struct PlayRequest: Identifiable {
     var isLive: Bool = false
     var userAgent: String? = nil
     var referrer: String? = nil
+    /// Start from this position (ms) instead of the saved one: the same film in another release.
+    var startTime: Int32? = nil
+}
+
+extension PlayRequest {
+    /// "Продолжить": the same file (or the same episode) of the release watched before.
+    init(continuing entry: ContinueEntry, item: MediaItem? = nil) {
+        self.init(title: entry.title, link: entry.link, itemKey: entry.itemKey, item: item ?? entry.item,
+                  preferredFileId: entry.fileId, season: entry.season, episode: entry.episode)
+    }
 }
 
 @MainActor
 final class PlayerCoordinator: ObservableObject {
     @Published var request: PlayRequest?
-    /// Torrent of the last playback. It is kept connected after the player closes
-    /// (so reopening is instant) and dropped when another torrent starts.
-    var lastTorrentHash: String?
 
     func play(_ request: PlayRequest, delay: Double = 0) {
         guard delay > 0 else {
