@@ -175,6 +175,12 @@ struct SettingsView: View {
     @AppStorage(SettingsKeys.playlistURL) private var playlistURL = ""
     @AppStorage(SettingsKeys.autoNext) private var autoNext = true
     @AppStorage(SettingsKeys.savePlayerSettings) private var savePlayerSettings = true
+    @AppStorage(SettingsKeys.backgroundAudio) private var backgroundAudio = true
+    @AppStorage(SettingsKeys.searchServer) private var searchServer = TorrentSearchService.defaultServer
+    @AppStorage(SettingsKeys.searchApiKey) private var searchApiKey = ""
+    @AppStorage(SettingsKeys.preferredQuality) private var preferredQuality = ReleaseQuality.fullHD.rawValue
+    @AppStorage(SettingsKeys.autoPlayBest) private var autoPlayBest = true
+    @State private var checkingSearch = false
     @State private var engineStatus = "Проверка…"
     @State private var cacheSize = ""
     @State private var message: String?
@@ -221,9 +227,59 @@ struct SettingsView: View {
                 Text("ТВ-каналы")
             }
 
-            Section("Плеер") {
+            Section {
+                Toggle("Сразу включать лучшую раздачу", isOn: $autoPlayBest)
+                Picker("Качество", selection: $preferredQuality) {
+                    ForEach(ReleaseQuality.choices) { quality in
+                        Text(quality.title).tag(quality.rawValue)
+                    }
+                }
+                LabeledContent("Сервер") {
+                    TextField(TorrentSearchService.defaultServer, text: $searchServer)
+                        .multilineTextAlignment(.trailing)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .keyboardType(.URL)
+                }
+                LabeledContent("API-ключ") {
+                    SecureField("не нужен для jac.red", text: $searchApiKey)
+                        .multilineTextAlignment(.trailing)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                }
+                Button {
+                    checkSearch()
+                } label: {
+                    HStack {
+                        Text("Проверить поиск")
+                        Spacer()
+                        if checkingSearch {
+                            ProgressView()
+                        }
+                    }
+                }
+                .disabled(checkingSearch)
+                if searchServer.trimmed != TorrentSearchService.defaultServer {
+                    Button("Вернуть сервер по умолчанию") {
+                        searchServer = TorrentSearchService.defaultServer
+                        searchApiKey = ""
+                        TorrentSearchService.shared.clearCache()
+                    }
+                }
+            } header: {
+                Text("Поиск раздач")
+            } footer: {
+                Text("Раздачи находятся сами, как в Zona: по названию и году через Jacred (публичный сервер jac.red, ключ не нужен). Можно указать свой Jacred или Jackett — для Jackett нужен API-ключ из его панели. «Смотреть» сразу запускает лучшую раздачу: нужное качество, живые сиды, дубляж. Все варианты — в «Раздачах» на странице фильма.")
+            }
+
+            Section {
                 Toggle("Автопереход к следующей серии", isOn: $autoNext)
                 Toggle("Запоминать скорость и пропорции", isOn: $savePlayerSettings)
+                Toggle("Звук в фоне", isOn: $backgroundAudio)
+            } header: {
+                Text("Плеер")
+            } footer: {
+                Text("«Звук в фоне»: если свернуть приложение или заблокировать iPhone, фильм продолжит играть звуком; пауза и перемотка — на экране блокировки и в Пункте управления. «Картинка в картинке» недоступна: плеер VLC её не поддерживает.")
             }
 
             Section {
@@ -295,6 +351,24 @@ struct SettingsView: View {
         }
     }
 
+    private func checkSearch() {
+        checkingSearch = true
+        Task {
+            defer { checkingSearch = false }
+            let query = TorrentSearchQuery(title: "Матрица", originalTitle: "The Matrix", year: 1999, isSeries: false)
+            do {
+                let result = try await TorrentSearchService.shared.search(query, force: true)
+                if result.releases.isEmpty {
+                    message = "Сервер ответил, но раздач «Матрицы» не нашёл (результатов: \(result.found)). Проверьте адрес и API-ключ."
+                } else {
+                    message = "Поиск работает. Раздач «Матрицы»: \(result.releases.count)."
+                }
+            } catch {
+                message = error.localizedDescription
+            }
+        }
+    }
+
     private var playlistSummary: String {
         if playlistURL.isEmpty { return "не задан" }
         if playlistURL == ChannelsStore.localMarker { return "файл" }
@@ -338,7 +412,7 @@ struct AboutView: View {
                     }
                 }
                 Text("Личный медиаплеер в стиле Zona для iPhone.")
-                Text("• Каталог, поиск, описания, рейтинги, сезоны и актёры — из неофициального API Кинопоиска.\n• Видео — из ваших источников: magnet-ссылки и .torrent через встроенный TorrServer MatriX, прямые ссылки и HLS.\n• ТВ-каналы — из вашего M3U-плейлиста.\n• Плеер на VLCKit: MKV, HEVC, AC3/DTS, выбор озвучки и субтитров, скорость, пропорции, перемотка.")
+                Text("• Каталог, поиск, описания, рейтинги, сезоны и актёры — из неофициального API Кинопоиска.\n• Раздачи находятся автоматически (Jacred / Jackett), как в Zona: лучшая включается кнопкой «Смотреть», остальные — в «Раздачах». Видео идёт через встроенный TorrServer MatriX без скачивания целиком.\n• Свои источники: magnet-ссылки, .torrent, прямые ссылки и HLS.\n• ТВ-каналы — из вашего M3U-плейлиста.\n• Плеер на VLCKit: MKV, HEVC, AC3/DTS, выбор озвучки и субтитров, скорость, пропорции, перемотка, звук в фоне и управление с экрана блокировки.")
                     .font(.subheadline)
                     .foregroundStyle(Theme.secondary)
                 Text("Приложение не содержит и не распространяет контент.")

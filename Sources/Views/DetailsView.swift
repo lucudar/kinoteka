@@ -6,6 +6,7 @@ struct DetailsView: View {
     @EnvironmentObject private var coordinator: PlayerCoordinator
     @Environment(\.openURL) private var openURL
     @AppStorage(SettingsKeys.kpToken) private var token = ""
+    @AppStorage(SettingsKeys.autoPlayBest) private var autoPlayBest = true
 
     @State private var film: KPFilm?
     @State private var staff: [KPStaff] = []
@@ -17,6 +18,7 @@ struct DetailsView: View {
     @State private var pendingEpisode: KPEpisode?
     @State private var alertText: String?
     @State private var loadingTrailer = false
+    @State private var searchingRelease = false
 
     private var current: MediaItem { film?.item ?? item }
     private var isSeries: Bool { film?.isSeries ?? (item.kind == .series) }
@@ -59,7 +61,7 @@ struct DetailsView: View {
             }
         }
         .sheet(isPresented: $showSources) {
-            SourceSheet(item: current, episode: pendingEpisode)
+            SourcesSheet(item: current, episode: pendingEpisode, seasonNumbers: seasons.map { $0.number })
         }
         .alert(alertText ?? "", isPresented: Binding(get: { alertText != nil }, set: { if !$0 { alertText = nil } })) {
             Button("OK", role: .cancel) {}
@@ -141,19 +143,36 @@ struct DetailsView: View {
             Button {
                 watchTapped()
             } label: {
-                Label(continueEntry != nil ? "Продолжить" : "Смотреть", systemImage: "play.fill")
-                    .font(.headline)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 14)
-                    .background(Theme.accent, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                    .foregroundStyle(.white)
+                Group {
+                    if searchingRelease {
+                        HStack(spacing: 10) {
+                            ProgressView()
+                                .tint(.white)
+                            Text("Ищем раздачу…")
+                        }
+                    } else {
+                        Label(continueEntry != nil ? "Продолжить" : "Смотреть", systemImage: "play.fill")
+                    }
+                }
+                .font(.headline)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 14)
+                .background(Theme.accent, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .foregroundStyle(.white)
             }
             .buttonStyle(.plain)
+            .disabled(searchingRelease)
 
             if let entry = continueEntry, let subtitle = entry.subtitle, !subtitle.isEmpty {
                 Text(subtitle)
                     .font(.caption)
                     .foregroundStyle(Theme.secondary)
+                    .frame(maxWidth: .infinity)
+            } else if continueEntry == nil, !isSeries, let source = sources.first {
+                Text("Раздача: " + (source.info ?? source.title))
+                    .font(.caption)
+                    .foregroundStyle(Theme.secondary)
+                    .lineLimit(1)
                     .frame(maxWidth: .infinity)
             }
 
@@ -171,8 +190,8 @@ struct DetailsView: View {
                              active: library.isWatched(item.id)) {
                     library.toggleWatched(current)
                 }
-                CircleAction(title: sources.isEmpty ? "Источник" : "Источники (\(sources.count))",
-                             systemImage: "link",
+                CircleAction(title: "Раздачи",
+                             systemImage: "list.bullet.rectangle",
                              active: !sources.isEmpty) {
                     pendingEpisode = nil
                     showSources = true
@@ -185,22 +204,61 @@ struct DetailsView: View {
     private func watchTapped() {
         if let entry = continueEntry {
             coordinator.play(PlayRequest(title: entry.title, link: entry.link, itemKey: item.key, item: current, preferredFileId: entry.fileId))
-        } else if sources.count == 1, let source = sources.first {
+        } else if isSeries, let first = (seasons.first(where: { $0.number > 0 }) ?? seasons.first)?.episodes.first {
+            play(first)
+        } else if let source = sources.first {
             coordinator.play(PlayRequest(title: current.title, link: source.link, itemKey: item.key, item: current))
         } else {
-            pendingEpisode = nil
-            showSources = true
+            playBestRelease(for: nil)
         }
     }
 
     private func play(_ episode: KPEpisode) {
-        if sources.count == 1, let source = sources.first {
-            coordinator.play(PlayRequest(title: SeriesTitle.make(current.title, episode.seasonNumber, episode.episodeNumber),
-                                         link: source.link, itemKey: item.key, item: current,
-                                         season: episode.seasonNumber, episode: episode.episodeNumber))
+        let season = episode.seasonNumber
+        let source = sources.first { $0.seasons?.contains(season) == true } ?? sources.first { $0.seasons == nil }
+        if let source = source {
+            coordinator.play(request(for: episode, link: source.link))
         } else {
+            playBestRelease(for: episode)
+        }
+    }
+
+    private func request(for episode: KPEpisode?, link: String) -> PlayRequest {
+        guard let episode = episode else {
+            return PlayRequest(title: current.title, link: link, itemKey: item.key, item: current)
+        }
+        return PlayRequest(title: SeriesTitle.make(current.title, episode.seasonNumber, episode.episodeNumber),
+                           link: link, itemKey: item.key, item: current,
+                           season: episode.seasonNumber, episode: episode.episodeNumber)
+    }
+
+    /// Like Zona: finds the torrents for the title and starts the best one right away.
+    /// The list of all releases opens when nothing suitable is found (or auto start is off).
+    private func playBestRelease(for episode: KPEpisode?) {
+        guard autoPlayBest else {
             pendingEpisode = episode
             showSources = true
+            return
+        }
+        guard !searchingRelease else { return }
+        searchingRelease = true
+        let title = current
+        let query = TorrentSearchQuery(title: title.title, originalTitle: title.originalTitle, year: title.year, isSeries: isSeries)
+        Task {
+            defer { searchingRelease = false }
+            let service = TorrentSearchService.shared
+            var candidates = (try? await service.search(query))?.releases ?? []
+            if let season = episode?.seasonNumber {
+                candidates = candidates.filter { $0.seasons.isEmpty || $0.seasons.contains(season) }
+            }
+            guard let best = ReleaseRanking.best(candidates, preferred: service.preferredQuality, season: episode?.seasonNumber) else {
+                pendingEpisode = episode
+                showSources = true
+                return
+            }
+            let source = SavedSource(release: best)
+            library.addSource(source, for: item.key)
+            coordinator.play(request(for: episode, link: source.link))
         }
     }
 
@@ -455,111 +513,5 @@ struct SimilarBlock: View {
                 loaded = true
             }
         }
-    }
-}
-
-// MARK: - Sources
-
-struct SourceSheet: View {
-    @EnvironmentObject private var library: LibraryStore
-    @EnvironmentObject private var coordinator: PlayerCoordinator
-    @Environment(\.dismiss) private var dismiss
-    let item: MediaItem
-    var episode: KPEpisode? = nil
-
-    @State private var link = ""
-    @State private var name = ""
-
-    private var sources: [SavedSource] { library.sources(for: item.key) }
-
-    var body: some View {
-        NavigationStack {
-            Form {
-                if let episode = episode {
-                    Section {
-                        Label("\(episode.seasonNumber) сезон, \(episode.episodeNumber) серия: выберите источник", systemImage: "play.rectangle")
-                            .font(.subheadline)
-                    }
-                }
-
-                if !sources.isEmpty {
-                    Section("Сохранённые источники") {
-                        ForEach(sources) { source in
-                            Button {
-                                play(source)
-                            } label: {
-                                HStack {
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(source.title)
-                                            .foregroundStyle(.white)
-                                            .lineLimit(2)
-                                        Text(LinkInspector.kindText(source.link))
-                                            .font(.caption)
-                                            .foregroundStyle(Theme.secondary)
-                                    }
-                                    Spacer()
-                                    Image(systemName: "play.fill")
-                                        .foregroundStyle(Theme.accent)
-                                }
-                            }
-                        }
-                        .onDelete { offsets in
-                            library.removeSources(at: offsets, for: item.key)
-                        }
-                    }
-                }
-
-                Section {
-                    TextField("magnet:… или https://…", text: $link, axis: .vertical)
-                        .lineLimit(1...4)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .keyboardType(.URL)
-                    PasteButton(payloadType: String.self) { strings in
-                        Task { @MainActor in
-                            if let first = strings.first { link = first.trimmed }
-                        }
-                    }
-                    TextField("Название (необязательно)", text: $name)
-                    Button {
-                        saveAndPlay()
-                    } label: {
-                        Label("Сохранить и смотреть", systemImage: "play.fill")
-                    }
-                    .disabled(!LinkInspector.isSupported(link))
-                } header: {
-                    Text("Новый источник")
-                } footer: {
-                    Text("Подходят magnet-ссылки, ссылки на .torrent, info-hash и прямые ссылки на видео (mp4, mkv, m3u8 и др.). Источник запоминается для этого фильма или сериала.")
-                }
-            }
-            .navigationTitle("Источники")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Закрыть") { dismiss() }
-                }
-            }
-        }
-    }
-
-    private func saveAndPlay() {
-        let value = link.trimmed
-        guard LinkInspector.isSupported(value) else { return }
-        let title = name.trimmed.isEmpty ? SourceNaming.defaultName(for: value) : name.trimmed
-        let source = SavedSource(title: title, link: value)
-        library.addSource(source, for: item.key)
-        play(source)
-    }
-
-    private func play(_ source: SavedSource) {
-        var request = PlayRequest(title: item.title, link: source.link, itemKey: item.key, item: item)
-        if let episode = episode {
-            request.season = episode.seasonNumber
-            request.episode = episode.episodeNumber
-            request.title = SeriesTitle.make(item.title, episode.seasonNumber, episode.episodeNumber)
-        }
-        dismiss()
-        coordinator.play(request, delay: 0.6)
     }
 }

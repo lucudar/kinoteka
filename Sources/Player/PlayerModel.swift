@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import MediaPlayer
 import VLCKitSPM
 
 enum AspectMode: String, CaseIterable, Identifiable {
@@ -83,6 +84,13 @@ final class VLCPlayerModel: ObservableObject {
     private var tickCount = 0
     private var appliedAspectKey = ""
     private var pendingSlaves: [(URL, VLCMediaPlaybackSlaveType)] = []
+    private var hiddenVideoTrack: Int32?
+    private var videoOff = false
+    private var remoteControlsEnabled = false
+    private var nowPlayingTitle = ""
+    private var nowPlayingSubtitle: String?
+    private var nowPlayingArtwork: MPMediaItemArtwork?
+    private var isLiveStream = false
 
     init() {
         videoView.backgroundColor = .black
@@ -126,10 +134,12 @@ final class VLCPlayerModel: ObservableObject {
         self.aspect = aspect
         appliedAspectKey = ""
         pendingSlaves = slaves
+        hiddenVideoTrack = nil
 
         player.media = media
         player.play()
         startTimer()
+        updateNowPlaying()
     }
 
     private func startTimer() {
@@ -151,7 +161,12 @@ final class VLCPlayerModel: ObservableObject {
         if length > 0 && length != lengthMs { lengthMs = length }
         if t > 0 && t != timeMs { timeMs = t }
         let playing = player.isPlaying
-        if playing != isPlaying { isPlaying = playing }
+        if playing != isPlaying {
+            isPlaying = playing
+            updateNowPlaying()
+        } else if tickCount % 4 == 0 {
+            updateNowPlaying()
+        }
 
         if !started && t > 0 {
             started = true
@@ -196,6 +211,8 @@ final class VLCPlayerModel: ObservableObject {
         appliedAspectKey = ""
         applyAspect()
         refreshTracks()
+        // The next episode started while the app is in the background: sound only.
+        if videoOff { hideVideo() }
     }
 
     func refreshTracks() {
@@ -232,15 +249,29 @@ final class VLCPlayerModel: ObservableObject {
 
     func togglePlay() {
         if player.isPlaying {
-            player.pause()
-            isPlaying = false
+            pause()
         } else {
-            if ended {
-                ended = false
-            }
-            player.play()
-            isPlaying = true
+            resume()
         }
+    }
+
+    func pause() {
+        guard player.isPlaying else { return }
+        player.pause()
+        isPlaying = false
+        updateNowPlaying()
+    }
+
+    func resume() {
+        guard !player.isPlaying else { return }
+        if ended {
+            ended = false
+        }
+        player.play()
+        isPlaying = true
+        // Resumed from the lock screen while the app is in the background: sound only.
+        if videoOff { hideVideo() }
+        updateNowPlaying()
     }
 
     func jump(_ seconds: Int32) {
@@ -250,19 +281,147 @@ final class VLCPlayerModel: ObservableObject {
         player.time = VLCTime(int: target)
         timeMs = target
         stallTicks = 0
+        updateNowPlaying()
     }
 
     func seek(fraction: Double) {
-        guard lengthMs > 0, player.isSeekable else { return }
-        let target = Int32(Double(lengthMs) * min(max(fraction, 0), 0.995))
+        guard lengthMs > 0 else { return }
+        seek(ms: Int32(Double(lengthMs) * min(max(fraction, 0), 0.995)))
+    }
+
+    func seek(ms: Int32) {
+        guard player.isSeekable else { return }
+        var target = max(0, ms)
+        if lengthMs > 0 { target = min(target, Int32(Double(lengthMs) * 0.995)) }
         player.time = VLCTime(int: target)
         timeMs = target
         stallTicks = 0
+        updateNowPlaying()
+    }
+
+    // MARK: Background playback
+
+    /// Turns the video track off while the app is in the background (only the sound keeps
+    /// playing, as in VLC) and back on when the app returns.
+    func setVideoEnabled(_ enabled: Bool) {
+        videoOff = !enabled
+        if enabled {
+            guard let saved = hiddenVideoTrack else { return }
+            hiddenVideoTrack = nil
+            let available = player.videoTrackIndexes.compactMap { ($0 as? NSNumber)?.int32Value }.filter { $0 >= 0 }
+            if available.contains(saved) {
+                player.currentVideoTrackIndex = saved
+            } else if let first = available.first {
+                player.currentVideoTrackIndex = first
+            }
+        } else if player.isPlaying {
+            hideVideo()
+        }
+    }
+
+    private func hideVideo() {
+        guard hiddenVideoTrack == nil else { return }
+        let current = player.currentVideoTrackIndex
+        guard current >= 0 else { return }
+        hiddenVideoTrack = current
+        player.currentVideoTrackIndex = -1
+    }
+
+    // MARK: Lock screen and Control Center
+
+    func enableRemoteControls(title: String, subtitle: String?, isLive: Bool) {
+        nowPlayingTitle = title
+        nowPlayingSubtitle = subtitle
+        isLiveStream = isLive
+        if !remoteControlsEnabled {
+            remoteControlsEnabled = true
+            UIApplication.shared.beginReceivingRemoteControlEvents()
+            let center = MPRemoteCommandCenter.shared()
+            center.togglePlayPauseCommand.addTarget { [weak self] _ in
+                MainActor.assumeIsolated { self?.togglePlay() }
+                return .success
+            }
+            center.playCommand.addTarget { [weak self] _ in
+                MainActor.assumeIsolated { self?.resume() }
+                return .success
+            }
+            center.pauseCommand.addTarget { [weak self] _ in
+                MainActor.assumeIsolated { self?.pause() }
+                return .success
+            }
+            center.skipForwardCommand.preferredIntervals = [10]
+            center.skipForwardCommand.addTarget { [weak self] _ in
+                MainActor.assumeIsolated { self?.jump(10) }
+                return .success
+            }
+            center.skipBackwardCommand.preferredIntervals = [10]
+            center.skipBackwardCommand.addTarget { [weak self] _ in
+                MainActor.assumeIsolated { self?.jump(-10) }
+                return .success
+            }
+            center.changePlaybackPositionCommand.addTarget { [weak self] event in
+                guard let position = event as? MPChangePlaybackPositionCommandEvent,
+                      position.positionTime.isFinite else { return .commandFailed }
+                let ms = Int32(max(0, min(position.positionTime * 1000, Double(Int32.max))))
+                MainActor.assumeIsolated { self?.seek(ms: ms) }
+                return .success
+            }
+        }
+        let center = MPRemoteCommandCenter.shared()
+        center.skipForwardCommand.isEnabled = !isLive
+        center.skipBackwardCommand.isEnabled = !isLive
+        center.changePlaybackPositionCommand.isEnabled = !isLive
+        updateNowPlaying()
+    }
+
+    func setNowPlayingArtwork(_ image: UIImage) {
+        nowPlayingArtwork = VLCPlayerModel.artwork(image)
+        updateNowPlaying()
+    }
+
+    private nonisolated static func artwork(_ image: UIImage) -> MPMediaItemArtwork {
+        MPMediaItemArtwork(boundsSize: image.size) { _ in image }
+    }
+
+    func disableRemoteControls() {
+        guard remoteControlsEnabled else { return }
+        remoteControlsEnabled = false
+        let center = MPRemoteCommandCenter.shared()
+        let commands: [MPRemoteCommand] = [center.togglePlayPauseCommand, center.playCommand, center.pauseCommand,
+                                           center.skipForwardCommand, center.skipBackwardCommand,
+                                           center.changePlaybackPositionCommand]
+        for command in commands {
+            command.removeTarget(nil)
+        }
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+        UIApplication.shared.endReceivingRemoteControlEvents()
+    }
+
+    private func updateNowPlaying() {
+        guard remoteControlsEnabled else { return }
+        var info: [String: Any] = [
+            MPMediaItemPropertyTitle: nowPlayingTitle,
+            MPNowPlayingInfoPropertyIsLiveStream: isLiveStream,
+            MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? Double(rate) : 0.0,
+            MPNowPlayingInfoPropertyDefaultPlaybackRate: 1.0
+        ]
+        if let subtitle = nowPlayingSubtitle {
+            info[MPMediaItemPropertyArtist] = subtitle
+        }
+        if let artwork = nowPlayingArtwork {
+            info[MPMediaItemPropertyArtwork] = artwork
+        }
+        if !isLiveStream && lengthMs > 0 {
+            info[MPMediaItemPropertyPlaybackDuration] = Double(lengthMs) / 1000
+            info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = Double(timeMs) / 1000
+        }
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
     }
 
     func setRate(_ value: Float) {
         rate = value
         player.rate = value
+        updateNowPlaying()
     }
 
     func setAspect(_ mode: AspectMode) {
@@ -329,6 +488,7 @@ final class VLCPlayerModel: ObservableObject {
     func stop() {
         timer?.invalidate()
         timer = nil
+        disableRemoteControls()
         let p = player
         DispatchQueue.global(qos: .userInitiated).async {
             p.stop()

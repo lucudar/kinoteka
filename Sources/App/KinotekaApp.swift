@@ -12,7 +12,11 @@ struct KinotekaApp: App {
             SettingsKeys.autoNext: true,
             SettingsKeys.savePlayerSettings: true,
             SettingsKeys.playerRate: 1.0,
-            SettingsKeys.playerAspect: AspectMode.fit.rawValue
+            SettingsKeys.playerAspect: AspectMode.fit.rawValue,
+            SettingsKeys.backgroundAudio: true,
+            SettingsKeys.searchServer: TorrentSearchService.defaultServer,
+            SettingsKeys.preferredQuality: ReleaseQuality.fullHD.rawValue,
+            SettingsKeys.autoPlayBest: true
         ])
         URLCache.shared = URLCache(memoryCapacity: 64 * 1024 * 1024, diskCapacity: 512 * 1024 * 1024)
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)

@@ -38,22 +38,6 @@ struct TSStatus: Decodable {
     }
 }
 
-struct TorrentFile: Identifiable, Hashable {
-    let id: Int
-    let path: String
-    let length: Int64
-
-    var name: String { (path as NSString).lastPathComponent }
-    var ext: String { (path as NSString).pathExtension.lowercased() }
-    var isVideo: Bool { TorrentFile.videoExtensions.contains(ext) }
-    var sizeText: String { ByteCountFormatter.string(fromByteCount: length, countStyle: .file) }
-
-    static let videoExtensions: Set<String> = [
-        "mkv", "mp4", "m4v", "avi", "mov", "ts", "m2ts", "mts", "wmv", "flv", "webm",
-        "mpg", "mpeg", "vob", "3gp", "ogv", "divx", "rmvb", "asf"
-    ]
-}
-
 enum TorrServerError: LocalizedError {
     case notRunning(String)
     case server(String)
@@ -157,6 +141,11 @@ final class TorrServer {
 
     /// Makes sure the local HTTP server answers (iOS may break the socket after a long suspension).
     func ensureRunning() async throws {
+        try await startIfNeeded()
+        await applyPreferredSettings()
+    }
+
+    private func startIfNeeded() async throws {
         if await waitForPing(attempts: 6) { return }
         await onQueue {
             if !TorrserverkitIsRunning() { self.startOnQueue() }
@@ -171,8 +160,51 @@ final class TorrServer {
         throw TorrServerError.notRunning(startError ?? "сервер не отвечает")
     }
 
-    private func post(_ body: [String: Any]) async throws -> Data {
-        guard let url = URL(string: base + "/torrents") else { throw TorrServerError.server("bad url") }
+    // MARK: Engine settings
+
+    /// Seconds a torrent stays connected after the player stops reading it (TorrServer default: 30).
+    /// Long enough to reopen the film or pick another episode without reconnecting to peers.
+    static let keepAliveSeconds = 180
+
+    private var settingsState = 0 // 0: not checked, 1: checking, 2: done
+
+    private func beginSettingsCheck() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard settingsState == 0 else { return false }
+        settingsState = 1
+        return true
+    }
+
+    private func endSettingsCheck(done: Bool) {
+        lock.lock()
+        settingsState = done ? 2 : 0
+        lock.unlock()
+    }
+
+    /// Applied once: TorrServer keeps its settings in its own database.
+    /// Changing settings restarts the engine's torrents, so it is done only when needed.
+    private func applyPreferredSettings() async {
+        guard beginSettingsCheck() else { return }
+        var done = false
+        defer { endSettingsCheck(done: done) }
+        guard let data = try? await post(["action": "get"], path: "/settings"),
+              var sets = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
+        let timeout = (sets["TorrentDisconnectTimeout"] as? NSNumber)?.intValue ?? 0
+        guard timeout < TorrServer.keepAliveSeconds else {
+            done = true
+            return
+        }
+        sets["TorrentDisconnectTimeout"] = TorrServer.keepAliveSeconds
+        if (try? await post(["action": "set", "sets": sets], path: "/settings")) != nil {
+            done = true
+        }
+    }
+
+    // MARK: Torrents
+
+    private func post(_ body: [String: Any], path: String = "/torrents") async throws -> Data {
+        guard let url = URL(string: base + path) else { throw TorrServerError.server("bad url") }
         var request = URLRequest(url: url, timeoutInterval: 60)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -233,148 +265,5 @@ final class TorrServer {
             URLQueryItem(name: "play", value: nil)
         ]
         return comps?.url
-    }
-}
-
-// MARK: - Links
-
-enum LinkKind {
-    case torrent
-    case direct
-}
-
-enum LinkInspector {
-    static func isInfoHash(_ text: String) -> Bool {
-        let s = text.trimmed
-        return s.count == 40 && s.allSatisfy { $0.isHexDigit }
-    }
-
-    static func kind(of link: String) -> LinkKind {
-        let s = link.trimmed
-        let lower = s.lowercased()
-        if lower.hasPrefix("magnet:") || isInfoHash(s) { return .torrent }
-        if let url = URL(string: s), url.pathExtension.lowercased() == "torrent" { return .torrent }
-        if lower.contains(".torrent?") { return .torrent }
-        return .direct
-    }
-
-    static func isSupported(_ link: String) -> Bool {
-        let s = link.trimmed
-        if s.lowercased().hasPrefix("magnet:") || isInfoHash(s) { return true }
-        guard let url = URL(string: s), let scheme = url.scheme?.lowercased() else { return false }
-        return ["http", "https", "rtmp", "rtsp", "rtp", "udp", "ftp", "smb", "mms"].contains(scheme)
-    }
-
-    static func kindText(_ link: String) -> String {
-        switch kind(of: link) {
-        case .torrent: return "Торрент"
-        case .direct:
-            let lower = link.lowercased()
-            if lower.contains(".m3u8") { return "HLS-поток" }
-            return "Прямая ссылка"
-        }
-    }
-}
-
-enum SourceNaming {
-    static func defaultName(for link: String) -> String {
-        let s = link.trimmed
-        if s.lowercased().hasPrefix("magnet:") {
-            if let comps = URLComponents(string: s),
-               let dn = comps.queryItems?.first(where: { $0.name.lowercased() == "dn" })?.value,
-               !dn.isEmpty {
-                return dn.replacingOccurrences(of: "+", with: " ")
-            }
-            return "Торрент"
-        }
-        if LinkInspector.isInfoHash(s) {
-            return "Торрент " + String(s.prefix(8)).lowercased()
-        }
-        if let url = URL(string: s) {
-            let file = url.lastPathComponent
-            let host = url.host ?? ""
-            if !file.isEmpty && file != "/" {
-                return host.isEmpty ? file : "\(file) · \(host)"
-            }
-            if !host.isEmpty { return host }
-        }
-        return "Источник"
-    }
-}
-
-// MARK: - Episode matching in torrent file names
-
-enum EpisodeMatcher {
-    private static func firstMatch(_ pattern: String, in text: String) -> [String]? {
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return nil }
-        let ns = text as NSString
-        guard let match = regex.firstMatch(in: text, range: NSRange(location: 0, length: ns.length)) else { return nil }
-        var groups: [String] = []
-        for index in 1..<match.numberOfRanges {
-            let range = match.range(at: index)
-            groups.append(range.location == NSNotFound ? "" : ns.substring(with: range))
-        }
-        return groups
-    }
-
-    /// Season and episode numbers parsed from a file name.
-    static func parse(_ path: String) -> (season: Int?, episode: Int)? {
-        let name = (path as NSString).lastPathComponent
-        let paired = [
-            "s(\\d{1,2})[ ._-]*e(\\d{1,3})",
-            "(?<!\\d)(\\d{1,2})x(\\d{1,3})(?!\\d)",
-            "season[ ._-]*(\\d{1,2}).*?episode[ ._-]*(\\d{1,3})",
-            "(\\d{1,2})[ ._-]*сезон.*?(\\d{1,3})[ ._-]*сери",
-            "сезон[ ._-]*(\\d{1,2}).*?(\\d{1,3})[ ._-]*сери",
-            "сезон[ ._-]*(\\d{1,2}).*?сери[яи]?[ ._-]*(\\d{1,3})"
-        ]
-        for pattern in paired {
-            if let g = firstMatch(pattern, in: name), g.count >= 2, let s = Int(g[0]), let e = Int(g[1]) {
-                return (s, e)
-            }
-        }
-        let single = [
-            "(?<![a-zа-я])(?:ep|e)[ ._-]?(\\d{1,3})(?!\\d)",
-            "(\\d{1,3})[ ._-]*(?:серия|seriya|series)",
-            "(?:серия|seriya|episode)[ ._-]*(\\d{1,3})",
-            "^(\\d{1,3})(?!\\d)"
-        ]
-        for pattern in single {
-            if let g = firstMatch(pattern, in: name), let first = g.first, let e = Int(first) {
-                return (nil, e)
-            }
-        }
-        return nil
-    }
-
-    /// Season number mentioned in the folder part of the path ("Season 2", "S02", "2 сезон").
-    static func folderSeason(_ path: String) -> Int? {
-        let folder = (path as NSString).deletingLastPathComponent
-        guard !folder.isEmpty else { return nil }
-        let patterns = ["season[ ._-]*(\\d{1,2})", "(?<![a-z])s(\\d{1,2})(?!\\d)", "(\\d{1,2})[ ._-]*сезон", "сезон[ ._-]*(\\d{1,2})"]
-        for pattern in patterns {
-            if let g = firstMatch(pattern, in: folder), let first = g.first, let s = Int(first) { return s }
-        }
-        return nil
-    }
-
-    static func find(in files: [TorrentFile], season: Int?, episode: Int) -> TorrentFile? {
-        let parsed = files.map { file -> (TorrentFile, Int?, Int?) in
-            let p = parse(file.path)
-            return (file, p?.season ?? folderSeason(file.path), p?.episode)
-        }
-        if let season = season,
-           let exact = parsed.first(where: { $0.1 == season && $0.2 == episode }) {
-            return exact.0
-        }
-        let seasons = Set(parsed.compactMap { $0.1 })
-        if seasons.count <= 1, let loose = parsed.first(where: { $0.2 == episode }) {
-            return loose.0
-        }
-        return nil
-    }
-
-    static func sorted(_ files: [TorrentFile]) -> [TorrentFile] {
-        files.sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
     }
 }
