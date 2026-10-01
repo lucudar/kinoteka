@@ -39,13 +39,18 @@ struct DetailsView: View {
     private var sources: [SavedSource] { library.sources(for: item.key) }
     private var continueEntry: ContinueEntry? { library.continueEntry(for: item.key) }
     private var shareURL: URL {
-        URL(string: film?.webUrl ?? "") ?? URL(string: "https://www.kinopoisk.ru/film/\(item.id)/")!
+        URL(string: film?.webUrl ?? "")
+            ?? URL(string: "https://www.kinopoisk.ru/film/\(item.id)/")
+            ?? URL(fileURLWithPath: "/")
     }
     private var preferredQuality: ReleaseQuality {
         let configured = ReleaseQuality(rawValue: preferredRaw) ?? .fullHD
         return PlaybackPolicy.effectiveQuality(configured, connection: network.connection, smart: smartQuality)
     }
     private var defaultVoice: ReleaseVoiceOption? { ReleaseVoiceOption.fromSetting(preferredVoiceRaw) }
+    private var availableReleases: [TorrentRelease] {
+        library.allowedReleases(releases ?? [])
+    }
 
     private var searchQuery: TorrentSearchQuery? {
         filmResolved ? TorrentSearchQuery(item: current) : nil
@@ -74,7 +79,7 @@ struct DetailsView: View {
 
     private func foundRelease(for link: String) -> TorrentRelease? {
         let marked = LinkInspector.markTorrent(link)
-        return releases?.first { LinkInspector.markTorrent($0.link) == marked }
+        return availableReleases.first { LinkInspector.markTorrent($0.link) == marked }
     }
 
     /// On a constrained/mobile connection, "Авто" may replace a previously
@@ -90,7 +95,8 @@ struct DetailsView: View {
 
     /// The found release for the season: the best one of the chosen quality, or of the preferred one.
     private func plannedRelease(season: Int?) -> TorrentRelease? {
-        guard let list = releases else { return nil }
+        let list = availableReleases
+        guard !list.isEmpty else { return nil }
         let matchingVoice = ReleaseRanking.matching(ReleaseRanking.matching(list, season: season), voice: chosenVoice)
         if let quality = chosenQuality {
             let exact = matchingVoice.filter { $0.quality == quality && !$0.isCamRip }
@@ -100,12 +106,14 @@ struct DetailsView: View {
     }
 
     private var qualityOptions: [ReleaseQuality] {
-        guard let list = releases else { return [] }
+        let list = availableReleases
+        guard !list.isEmpty else { return [] }
         return ReleaseRanking.qualities(ReleaseRanking.matching(list, voice: chosenVoice), season: planSeason)
     }
 
     private var voiceOptions: [ReleaseVoiceOption] {
-        guard var list = releases else { return [] }
+        var list = availableReleases
+        guard !list.isEmpty else { return [] }
         list = ReleaseRanking.matching(list, season: planSeason)
         if let quality = chosenQuality {
             list = list.filter { $0.quality == quality }
@@ -344,6 +352,11 @@ struct DetailsView: View {
                              systemImage: library.isFavorite(item) ? "heart.fill" : "heart",
                              active: library.isFavorite(item)) {
                     library.toggleFavorite(current)
+                }
+                CircleAction(title: library.isWatchLater(item) ? "Отложено" : "Позже",
+                             systemImage: library.isWatchLater(item) ? "bookmark.fill" : "bookmark",
+                             active: library.isWatchLater(item)) {
+                    library.toggleWatchLater(current)
                 }
                 CircleAction(title: "Просмотрено",
                              systemImage: library.isWatched(item.id) ? "eye.fill" : "eye",

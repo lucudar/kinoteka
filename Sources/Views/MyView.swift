@@ -1,15 +1,35 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 enum LibraryListKind: Hashable {
     case favorites(MediaKind)
+    case watchLater
     case watched(MediaKind)
     case history
 
     var title: String {
         switch self {
         case .favorites(let kind): return kind == .movie ? "Избранные фильмы" : "Избранные сериалы"
+        case .watchLater: return "Смотреть позже"
         case .watched(let kind): return kind == .movie ? "Просмотренные фильмы" : "Просмотренные сериалы"
         case .history: return "Недавно открывали"
+        }
+    }
+}
+
+private enum LibrarySort: String, CaseIterable, Identifiable {
+    case added
+    case title
+    case year
+    case rating
+
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .added: return "Сначала новые"
+        case .title: return "По названию"
+        case .year: return "По году"
+        case .rating: return "По рейтингу"
         }
     }
 }
@@ -35,6 +55,14 @@ struct MyView: View {
                         FavoriteChannelsScreen()
                     } label: {
                         row("ТВ-каналы", "tv", library.data.favoriteChannels.count)
+                    }
+                }
+
+                Section("Мой список") {
+                    NavigationLink {
+                        ItemsGridScreen(kind: .watchLater)
+                    } label: {
+                        row("Смотреть позже", "bookmark", library.data.watchLater.count)
                     }
                 }
 
@@ -92,19 +120,46 @@ struct ItemsGridScreen: View {
     @EnvironmentObject private var library: LibraryStore
     let kind: LibraryListKind
     @State private var confirmClear = false
+    @State private var searchText = ""
+    @State private var sort: LibrarySort = .added
 
-    private var items: [MediaItem] {
+    private var sourceItems: [MediaItem] {
         switch kind {
         case .favorites(let type): return library.favorites(type)
+        case .watchLater: return library.data.watchLater
         case .watched(let type): return library.watched(type)
         case .history: return library.data.history
         }
     }
 
+    private var items: [MediaItem] {
+        let query = searchText.trimmed.lowercased()
+        var result = query.isEmpty ? sourceItems : sourceItems.filter {
+            $0.title.lowercased().contains(query) ||
+            ($0.originalTitle?.lowercased().contains(query) == true) ||
+            $0.genres.contains { $0.lowercased().contains(query) }
+        }
+        switch sort {
+        case .added:
+            break
+        case .title:
+            result.sort { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+        case .year:
+            result.sort { ($0.year ?? 0) > ($1.year ?? 0) }
+        case .rating:
+            result.sort { ($0.ratingKP ?? $0.ratingIMDb ?? 0) > ($1.ratingKP ?? $1.ratingIMDb ?? 0) }
+        }
+        return result
+    }
+
     var body: some View {
         ScrollView {
             if items.isEmpty {
-                ContentUnavailableView("Пока пусто", systemImage: "tray", description: Text("Здесь появятся фильмы и сериалы"))
+                ContentUnavailableView(searchText.trimmed.isEmpty ? "Пока пусто" : "Ничего не найдено",
+                                       systemImage: searchText.trimmed.isEmpty ? "tray" : "magnifyingglass",
+                                       description: Text(searchText.trimmed.isEmpty
+                                                         ? "Здесь появятся фильмы и сериалы"
+                                                         : "Попробуйте другое название или жанр"))
                     .padding(.top, 80)
             } else {
                 MediaGrid(items: items)
@@ -114,9 +169,21 @@ struct ItemsGridScreen: View {
         .background(Theme.background)
         .navigationTitle(kind.title)
         .navigationBarTitleDisplayMode(.inline)
+        .searchable(text: $searchText, prompt: "Название или жанр")
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                if kind == .history && !items.isEmpty {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                if !sourceItems.isEmpty {
+                    Menu {
+                        Picker("Сортировка", selection: $sort) {
+                            ForEach(LibrarySort.allCases) { option in
+                                Text(option.title).tag(option)
+                            }
+                        }
+                    } label: {
+                        Image(systemName: "arrow.up.arrow.down")
+                    }
+                }
+                if kind == .history && !sourceItems.isEmpty {
                     Button("Очистить") { confirmClear = true }
                 }
             }
@@ -139,6 +206,7 @@ struct FavoriteChannelsScreen: View {
             }
             ForEach(library.data.favoriteChannels) { channel in
                 Button {
+                    library.addRecentChannel(channel)
                     coordinator.play(PlayRequest(title: channel.name, link: channel.url, isLive: true, userAgent: channel.userAgent, referrer: channel.referrer))
                 } label: {
                     HStack(spacing: 12) {
@@ -170,6 +238,7 @@ struct FavoriteChannelsScreen: View {
 }
 
 struct SettingsView: View {
+    @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var channels: ChannelsStore
     @ObservedObject private var network = NetworkMonitor.shared
     @AppStorage(SettingsKeys.kpToken) private var token = ""
@@ -187,11 +256,14 @@ struct SettingsView: View {
     @AppStorage(SettingsKeys.automaticFallback) private var automaticFallback = true
     @AppStorage(SettingsKeys.automaticRecovery) private var automaticRecovery = true
     @AppStorage(SettingsKeys.preloadNextEpisode) private var preloadNextEpisode = true
+    @AppStorage(SettingsKeys.playerGestures) private var playerGestures = true
     @State private var checkingSearch = false
     @State private var engineStatus = "Проверка…"
     @State private var cacheSize = ""
     @State private var diagnosticsSize = ""
     @State private var message: String?
+    @State private var importingBackup = false
+    @State private var backupURL: URL?
 
     var body: some View {
         Form {
@@ -296,10 +368,11 @@ struct SettingsView: View {
                 Toggle("Звук в фоне", isOn: $backgroundAudio)
                 Toggle("Восстанавливать после зависания", isOn: $automaticRecovery)
                 Toggle("Готовить следующую серию", isOn: $preloadNextEpisode)
+                Toggle("Жесты в плеере", isOn: $playerGestures)
             } header: {
                 Text("Плеер")
             } footer: {
-                Text("При зависании поток переподключится с сохранённого места, затем попробует более лёгкую раздачу. Следующая серия заранее получает небольшой начальный буфер только не в мобильной сети.")
+                Text("При зависании поток переподключится с сохранённого места, затем попробует более лёгкую раздачу. Следующая серия заранее получает небольшой начальный буфер только не в мобильной сети.\n\nЖесты: по горизонтали — перемотка, слева по вертикали — яркость, справа — громкость.")
             }
 
             Section {
@@ -345,8 +418,31 @@ struct SettingsView: View {
                     cacheSize = KPClient.shared.cacheSizeText
                     message = "Кэш очищен"
                 }
+                if !library.data.blockedReleaseIDs.isEmpty {
+                    Button("Вернуть скрытые раздачи (\(library.data.blockedReleaseIDs.count))") {
+                        library.clearBlockedReleases()
+                        message = "Скрытые раздачи снова будут предлагаться"
+                    }
+                }
             } header: {
                 Text("Данные")
+            }
+
+            Section {
+                if let backupURL = backupURL {
+                    ShareLink(item: backupURL) {
+                        Label("Экспортировать резервную копию", systemImage: "square.and.arrow.up")
+                    }
+                }
+                Button {
+                    importingBackup = true
+                } label: {
+                    Label("Восстановить из файла", systemImage: "square.and.arrow.down")
+                }
+            } header: {
+                Text("Резервная копия")
+            } footer: {
+                Text("Сохраняются медиатека, прогресс, история, свои раздачи и обычные настройки. Ключи API и адрес плейлиста в файл не попадают.")
             }
 
             Section {
@@ -386,9 +482,26 @@ struct SettingsView: View {
         .alert(message ?? "", isPresented: Binding(get: { message != nil }, set: { if !$0 { message = nil } })) {
             Button("OK", role: .cancel) {}
         }
+        .fileImporter(isPresented: $importingBackup, allowedContentTypes: [.json]) { result in
+            switch result {
+            case .success(let url):
+                do {
+                    let backup = try BackupService.load(from: url)
+                    backup.settings.apply()
+                    library.replaceData(backup.library)
+                    backupURL = BackupService.exportURL(library: library.data)
+                    message = "Резервная копия восстановлена"
+                } catch {
+                    message = error.localizedDescription
+                }
+            case .failure(let error):
+                message = error.localizedDescription
+            }
+        }
         .task {
             cacheSize = KPClient.shared.cacheSizeText
             diagnosticsSize = AppDiagnostics.shared.sizeText
+            backupURL = BackupService.exportURL(library: library.data)
             await refreshStatus()
         }
     }
@@ -454,7 +567,7 @@ struct AboutView: View {
                     }
                 }
                 Text("Личный медиаплеер в стиле Zona для iPhone.")
-                Text("• Каталог, поиск, описания, рейтинги, сезоны и актёры — из неофициального API Кинопоиска.\n• Раздачи находятся автоматически через Jacred / Jackett. Можно выбрать качество и озвучку; нерабочая раздача заменяется автоматически.\n• Автокачество учитывает тип сети, удачные раздачи запоминаются, следующая серия готовится заранее.\n• Плеер VLCKit восстанавливает зависший поток с сохранённого места.\n• Локальный журнал и системные отчёты о сбоях экспортируются только вручную из настроек.\n• Свои magnet, .torrent, прямые ссылки, HLS и M3U-телеканалы.")
+                Text("• Каталог, поиск, описания, рейтинги, сезоны и актёры — из неофициального API Кинопоиска.\n• Раздачи находятся автоматически через Jacred / Jackett. Можно выбрать качество и озвучку; нерабочая раздача заменяется автоматически.\n• «Смотреть позже», персональные рекомендации, недавние ТВ-каналы и сортировка медиатеки.\n• Плеер VLCKit: жесты, блокировка управления, таймер сна, запоминание дорожек и обратный отсчёт до следующей серии.\n• Медиатеку и прогресс можно экспортировать и восстановить; секретные ключи в копию не попадают.\n• Локальный журнал и системные отчёты о сбоях экспортируются только вручную из настроек.\n• Свои magnet, .torrent, прямые ссылки, HLS и M3U-телеканалы.")
                     .font(.subheadline)
                     .foregroundStyle(Theme.secondary)
                 Text("Приложение не содержит и не распространяет контент.")

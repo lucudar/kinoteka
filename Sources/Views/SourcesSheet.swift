@@ -64,19 +64,23 @@ struct SourcesSheet: View {
     }
 
     private var qualityOptions: [ReleaseQuality] {
-        let candidates = ReleaseRanking.matching(releases, voice: voice)
+        let candidates = ReleaseRanking.matching(availableReleases, voice: voice)
         let present = Set(candidates.map { $0.quality })
         return ReleaseQuality.choices.filter { present.contains($0) }
     }
 
     private var voiceOptions: [ReleaseVoiceOption] {
-        var candidates = ReleaseRanking.matching(releases, season: season)
+        var candidates = ReleaseRanking.matching(availableReleases, season: season)
         if let quality = quality { candidates = candidates.filter { $0.quality == quality } }
         return ReleaseRanking.voiceOptions(candidates)
     }
 
+    private var availableReleases: [TorrentRelease] {
+        library.allowedReleases(releases)
+    }
+
     private var filtered: [TorrentRelease] {
-        var list = releases
+        var list = availableReleases
         if let season = season {
             list = list.filter { $0.seasons.isEmpty || $0.seasons.contains(season) }
         }
@@ -108,7 +112,7 @@ struct SourcesSheet: View {
                 if customQuery == nil && !sources.isEmpty {
                     savedSection
                 }
-                if !releases.isEmpty && (seasonOptions.count > 1 || qualityOptions.count > 1 || !voiceOptions.isEmpty) {
+                if !availableReleases.isEmpty && (seasonOptions.count > 1 || qualityOptions.count > 1 || !voiceOptions.isEmpty) {
                     filtersSection
                 }
                 results(list: list, best: best, saved: saved)
@@ -306,12 +310,20 @@ struct SourcesSheet: View {
                 }
             } else if list.isEmpty {
                 Section {
-                    Text("Нет раздач с выбранными фильтрами.")
-                        .foregroundStyle(Theme.secondary)
-                    Button("Сбросить фильтры") {
-                        season = nil
-                        quality = nil
-                        voice = nil
+                    if availableReleases.isEmpty && !releases.isEmpty {
+                        Text("Все найденные раздачи скрыты.")
+                            .foregroundStyle(Theme.secondary)
+                        Button("Вернуть скрытые раздачи") {
+                            library.clearBlockedReleases()
+                        }
+                    } else {
+                        Text("Нет раздач с выбранными фильтрами.")
+                            .foregroundStyle(Theme.secondary)
+                        Button("Сбросить фильтры") {
+                            season = nil
+                            quality = nil
+                            voice = nil
+                        }
                     }
                 }
             } else {
@@ -358,6 +370,16 @@ struct SourcesSheet: View {
             } label: {
                 Label("Скопировать ссылку", systemImage: "doc.on.doc")
             }
+            Button(role: .destructive) {
+                library.blockRelease(release)
+                if let source = library.sources(for: item.key).first(where: {
+                    LinkInspector.markTorrent($0.link) == LinkInspector.markTorrent(release.link)
+                }) {
+                    library.removeSource(source.id, for: item.key)
+                }
+            } label: {
+                Label("Не предлагать эту раздачу", systemImage: "hand.thumbsdown")
+            }
         }
     }
 
@@ -376,7 +398,8 @@ struct SourcesSheet: View {
     private var footerText: String {
         var text = "Раздачи ищутся на \(serverHost) по названию и году. Потяните список вниз, чтобы обновить."
         if state == .loaded && !releases.isEmpty {
-            text = "Найдено: \(releases.count). " + text
+            let hidden = releases.count - availableReleases.count
+            text = "Найдено: \(releases.count)." + (hidden > 0 ? " Скрыто: \(hidden)." : "") + " " + text
         }
         return text + " Подходят и свои magnet-ссылки, .torrent и прямые ссылки на видео."
     }

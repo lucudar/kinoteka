@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import AVFoundation
 import MediaPlayer
 import VLCKitSPM
 
@@ -43,6 +44,35 @@ enum PlaybackRates {
         RateOption(value: 1.5, title: "1.5× — ускоренная"),
         RateOption(value: 2.0, title: "2×")
     ]
+}
+
+/// Uses the system volume slider, so the gesture changes the same level as the
+/// physical volume buttons and other media apps.
+@MainActor
+final class SystemVolumeController {
+    static let shared = SystemVolumeController()
+
+    private let volumeView = MPVolumeView(frame: .zero)
+
+    private init() {
+        volumeView.showsRouteButton = false
+        volumeView.showsVolumeSlider = true
+        volumeView.layoutIfNeeded()
+    }
+
+    private var slider: UISlider? {
+        volumeView.subviews.compactMap { $0 as? UISlider }.first
+    }
+
+    var volume: Float {
+        AVAudioSession.sharedInstance().outputVolume
+    }
+
+    func setVolume(_ value: Float) {
+        guard let slider = slider else { return }
+        slider.value = min(1, max(0, value))
+        slider.sendActions(for: .valueChanged)
+    }
 }
 
 /// UIView used as VLC drawable; reports size changes so the aspect mode can be re-applied.

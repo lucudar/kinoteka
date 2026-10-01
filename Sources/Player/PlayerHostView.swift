@@ -21,12 +21,40 @@ struct PlayerHostView: View {
     @AppStorage(SettingsKeys.automaticFallback) private var automaticFallback = true
     @AppStorage(SettingsKeys.automaticRecovery) private var automaticRecovery = true
     @AppStorage(SettingsKeys.preloadNextEpisode) private var preloadNextEpisode = true
+    @AppStorage(SettingsKeys.playerGestures) private var playerGestures = true
 
     enum Phase: Equatable {
         case resolving
         case choosing
         case playing
         case failed(String)
+    }
+
+    private enum GestureMode: Equatable {
+        case seek
+        case brightness
+        case volume
+    }
+
+    private enum SleepChoice: Int, CaseIterable, Identifiable {
+        case off = 0
+        case minutes15 = 15
+        case minutes30 = 30
+        case minutes45 = 45
+        case minutes60 = 60
+        case endOfVideo = -1
+
+        var id: Int { rawValue }
+        var title: String {
+            switch self {
+            case .off: return "Выключен"
+            case .minutes15: return "Через 15 минут"
+            case .minutes30: return "Через 30 минут"
+            case .minutes45: return "Через 45 минут"
+            case .minutes60: return "Через 60 минут"
+            case .endOfVideo: return "До конца фильма или серии"
+            }
+        }
     }
 
     @State private var phase: Phase = .resolving
@@ -39,6 +67,7 @@ struct PlayerHostView: View {
     @State private var streamKey = ""
     @State private var streamURL: URL?
     @State private var showControls = true
+    @State private var controlsLocked = false
     @State private var hideToken = 0
     @State private var showFiles = false
     @State private var showOptions = false
@@ -51,6 +80,7 @@ struct PlayerHostView: View {
     @State private var closing = false
     @State private var addedAudio: Set<Int> = []
     @State private var preferredAudioApplied = false
+    @State private var preferredSubtitleApplied = false
     @State private var desiredAudioName: String?
     @State private var desiredQuality: ReleaseQuality?
     @State private var desiredVoice: ReleaseVoiceOption?
@@ -83,6 +113,20 @@ struct PlayerHostView: View {
     @State private var switchTask: Task<Void, Never>?
     @State private var switchError: String?
     @State private var showQuality = false
+    @State private var gestureMode: GestureMode?
+    @State private var gestureStartTime: Int32 = 0
+    @State private var gestureTargetTime: Int32?
+    @State private var gestureStartLevel: CGFloat = 0
+    @State private var gestureIcon = ""
+    @State private var gestureText = ""
+    @State private var gestureHUDToken = 0
+    @State private var sleepChoice: SleepChoice = .off
+    @State private var sleepDeadline: Date?
+    @State private var sleepTask: Task<Void, Never>?
+    @State private var playerNotice: String?
+    @State private var noticeToken = 0
+    @State private var showNextEpisodePrompt = false
+    @State private var autoNextCancelled = false
 
     init(request: PlayRequest) {
         self.request = request
@@ -140,12 +184,18 @@ struct PlayerHostView: View {
         .onChange(of: model.timeMs) { _, _ in
             periodicSave()
             prepareNextEpisodeIfNeeded()
+            updateNextEpisodePrompt()
         }
         .onChange(of: model.ended) { _, ended in
             if ended { handleEnded() }
         }
         .onChange(of: model.isPlaying) { _, playing in
-            if playing { bumpControls() } else { withAnimation { showControls = true } }
+            if playing {
+                UIApplication.shared.isIdleTimerDisabled = true
+                bumpControls()
+            } else if !controlsLocked {
+                withAnimation { showControls = true }
+            }
         }
         .onChange(of: model.started) { _, started in
             if started { playbackDidStart() }
@@ -164,6 +214,9 @@ struct PlayerHostView: View {
         }
         .onChange(of: model.audioTracks) { _, _ in
             applyPreferredAudio()
+        }
+        .onChange(of: model.subtitleTracks) { _, _ in
+            applyPreferredSubtitle()
         }
         .onChange(of: showOptions) { _, open in
             if !open { bumpControls() }
@@ -351,7 +404,7 @@ struct PlayerHostView: View {
               let item = request.item,
               let result = await TorrentSearchService.shared.cachedResult(TorrentSearchQuery(item: item))
         else { return }
-        alternatives = result.releases
+        alternatives = library.allowedReleases(result.releases)
         guard let current = release(matching: link),
               current.quality > effectivePreferredQuality else { return }
         let candidates = PlaybackLearning.shared.candidates(alternatives,
@@ -394,6 +447,8 @@ struct PlayerHostView: View {
         preloadTask?.cancel()
         preloadTask = nil
         nextPreparedID = nil
+        showNextEpisodePrompt = false
+        autoNextCancelled = false
         currentFile = file
         streamKey = "\(h):\(file.id)"
         addedAudio = []
@@ -433,6 +488,7 @@ struct PlayerHostView: View {
         phase = .playing
         recoveryText = nil
         preferredAudioApplied = false
+        preferredSubtitleApplied = false
         var position: Int32 = 0
         if !request.isLive {
             if let wanted = startAt {
@@ -489,6 +545,32 @@ struct PlayerHostView: View {
         }
     }
 
+    private func applyPreferredSubtitle() {
+        guard !preferredSubtitleApplied,
+              let preferred = PlaybackLearning.shared.preferredSubtitle(for: request.itemKey),
+              !model.subtitleTracks.isEmpty else { return }
+        let track: MediaTrack?
+        if preferred == "__OFF__" {
+            track = model.subtitleTracks.first { $0.id == -1 }
+        } else {
+            track = model.subtitleTracks.first {
+                $0.name.compare(preferred, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame
+            }
+        }
+        guard let track = track else { return }
+        preferredSubtitleApplied = true
+        selectSubtitle(track, remember: false)
+    }
+
+    private func selectSubtitle(_ track: MediaTrack, remember: Bool) {
+        model.setSubtitle(track.id)
+        if remember {
+            PlaybackLearning.shared.rememberSubtitle(track.id == -1 ? nil : track.name,
+                                                      for: request.itemKey)
+            AppDiagnostics.shared.log("subtitles", track.id == -1 ? "Субтитры выключены" : "Выбраны \(track.name)")
+        }
+    }
+
     private func retryPlayback() {
         recoveryAttempts = 0
         if model.timeMs > 0 && !request.isLive { pendingStart = model.timeMs }
@@ -519,6 +601,9 @@ struct PlayerHostView: View {
             AppDiagnostics.shared.log("player", "Первый кадр за \(Int(elapsed)) мс")
         }
         if model.isBuffering { scheduleRecovery(reason: "поток завис при запуске", delay: 12) }
+        if let item = request.item {
+            library.removeWatchLater(item)
+        }
         recordPlaybackSuccessIfPossible()
     }
 
@@ -668,7 +753,12 @@ struct PlayerHostView: View {
         preloadTask?.cancel()
         saveProgress(final: true)
         if request.isLive { return }
-        if autoNext, let next = nextFile {
+        if sleepChoice == .endOfVideo {
+            cancelSleepTimer()
+            close()
+            return
+        }
+        if autoNext, !autoNextCancelled, let next = nextFile {
             play(next)
         } else {
             close()
@@ -681,6 +771,7 @@ struct PlayerHostView: View {
         recoveryTask?.cancel()
         startupWatchdogTask?.cancel()
         preloadTask?.cancel()
+        cancelSleepTimer()
         saveProgress(final: true)
         model.stop()
         coordinator.request = nil
@@ -692,6 +783,7 @@ struct PlayerHostView: View {
         recoveryTask?.cancel()
         startupWatchdogTask?.cancel()
         preloadTask?.cancel()
+        cancelSleepTimer()
         if !closing {
             closing = true
             saveProgress(final: true)
@@ -724,6 +816,7 @@ struct PlayerHostView: View {
     // MARK: - Controls visibility
 
     private func bumpControls() {
+        guard !controlsLocked else { return }
         withAnimation(.easeInOut(duration: 0.2)) { showControls = true }
         hideToken += 1
         let token = hideToken
@@ -735,12 +828,72 @@ struct PlayerHostView: View {
     }
 
     private func toggleControls() {
+        guard !controlsLocked else { return }
         if showControls {
             hideToken += 1
             withAnimation(.easeInOut(duration: 0.2)) { showControls = false }
         } else {
             bumpControls()
         }
+    }
+
+    private func setSleepTimer(_ choice: SleepChoice) {
+        sleepTask?.cancel()
+        sleepTask = nil
+        sleepChoice = choice
+        sleepDeadline = nil
+        guard choice.rawValue > 0 else { return }
+        let seconds = TimeInterval(choice.rawValue * 60)
+        sleepDeadline = Date().addingTimeInterval(seconds)
+        sleepTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            guard !Task.isCancelled, !closing else { return }
+            sleepChoice = .off
+            sleepDeadline = nil
+            sleepTask = nil
+            model.pause()
+            UIApplication.shared.isIdleTimerDisabled = false
+            showNotice("Таймер сна остановил воспроизведение")
+        }
+    }
+
+    private func cancelSleepTimer() {
+        sleepTask?.cancel()
+        sleepTask = nil
+        sleepChoice = .off
+        sleepDeadline = nil
+    }
+
+    private var sleepStatusText: String? {
+        if sleepChoice == .endOfVideo { return "до конца" }
+        guard let deadline = sleepDeadline else { return nil }
+        let minutes = max(1, Int(ceil(deadline.timeIntervalSinceNow / 60)))
+        return "\(minutes) мин"
+    }
+
+    private func showNotice(_ text: String) {
+        playerNotice = text
+        noticeToken += 1
+        let token = noticeToken
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard token == noticeToken else { return }
+            withAnimation { playerNotice = nil }
+        }
+    }
+
+    private func updateNextEpisodePrompt() {
+        let remaining = model.lengthMs - model.timeMs
+        let shouldShow = autoNext && !autoNextCancelled && model.started &&
+            model.lengthMs > 0 && remaining > 0 && remaining <= 15_000 && nextFile != nil
+        guard shouldShow != showNextEpisodePrompt else { return }
+        withAnimation(.easeInOut(duration: 0.2)) {
+            showNextEpisodePrompt = shouldShow
+        }
+    }
+
+    private var nextEpisodeCountdown: Int {
+        max(1, Int(ceil(Double(max(0, model.lengthMs - model.timeMs)) / 1_000)))
     }
 
     // MARK: - Screens
@@ -853,56 +1006,233 @@ struct PlayerHostView: View {
     }
 
     private var playerView: some View {
-        ZStack {
-            VLCVideoView(model: model)
-                .ignoresSafeArea()
-            Color.clear
-                .contentShape(Rectangle())
-                .ignoresSafeArea()
-                .onTapGesture { toggleControls() }
-            if model.failed {
-                playbackFailedOverlay
-            } else if model.isBuffering {
-                VStack(spacing: 10) {
-                    ProgressView()
-                        .controlSize(.large)
-                        .tint(.white)
-                    if hash != nil && !bufferInfo.isEmpty {
-                        Text(bufferInfo)
-                            .font(.caption)
-                            .foregroundStyle(.white.opacity(0.85))
+        GeometryReader { proxy in
+            ZStack {
+                VLCVideoView(model: model)
+                    .ignoresSafeArea()
+                if controlsLocked {
+                    Color.clear
+                        .contentShape(Rectangle())
+                        .ignoresSafeArea()
+                } else if playerGestures {
+                    playerGestureLayer(size: proxy.size)
+                } else {
+                    Color.clear
+                        .contentShape(Rectangle())
+                        .ignoresSafeArea()
+                        .onTapGesture { toggleControls() }
+                }
+                if model.failed {
+                    playbackFailedOverlay
+                } else if model.isBuffering {
+                    VStack(spacing: 10) {
+                        ProgressView()
+                            .controlSize(.large)
+                            .tint(.white)
+                        if hash != nil && !bufferInfo.isEmpty {
+                            Text(bufferInfo)
+                                .font(.caption)
+                                .foregroundStyle(.white.opacity(0.85))
+                        }
                     }
+                    .allowsHitTesting(false)
                 }
-                .allowsHitTesting(false)
-            }
-            if showControls && !model.failed {
-                controls
-                    .transition(.opacity)
-            }
-            if let release = switching {
-                VStack {
-                    switchBanner(release)
-                    Spacer()
-                }
-                .padding(.top, showControls ? 64 : 16)
-                .padding(.horizontal, 20)
-                .transition(.opacity)
-            }
-            if let recoveryText = recoveryText, switching == nil {
-                VStack {
-                    HStack(spacing: 10) {
-                        ProgressView().tint(.white)
-                        Text(recoveryText)
-                            .font(.subheadline.weight(.semibold))
+                if !gestureText.isEmpty {
+                    VStack(spacing: 8) {
+                        Image(systemName: gestureIcon)
+                            .font(.title2.weight(.semibold))
+                        Text(gestureText)
+                            .font(.headline.monospacedDigit())
                     }
                     .foregroundStyle(.white)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 10)
-                    .background(Color.black.opacity(0.75), in: Capsule())
-                    Spacer()
+                    .padding(.horizontal, 22)
+                    .padding(.vertical, 14)
+                    .background(Color.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    .allowsHitTesting(false)
                 }
-                .padding(.top, showControls ? 64 : 16)
-                .padding(.horizontal, 20)
+                if showControls && !controlsLocked && !model.failed {
+                    controls
+                        .transition(.opacity)
+                }
+                if controlsLocked {
+                    VStack {
+                        HStack {
+                            Spacer()
+                            Button {
+                                controlsLocked = false
+                                bumpControls()
+                            } label: {
+                                Label("Разблокировать", systemImage: "lock.open.fill")
+                                    .font(.subheadline.weight(.semibold))
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 9)
+                                    .background(Color.black.opacity(0.68), in: Capsule())
+                            }
+                        }
+                        Spacer()
+                    }
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 12)
+                }
+                if let release = switching {
+                    VStack {
+                        switchBanner(release)
+                        Spacer()
+                    }
+                    .padding(.top, showControls && !controlsLocked ? 64 : 16)
+                    .padding(.horizontal, 20)
+                    .transition(.opacity)
+                }
+                if let recoveryText = recoveryText, switching == nil {
+                    VStack {
+                        HStack(spacing: 10) {
+                            ProgressView().tint(.white)
+                            Text(recoveryText)
+                                .font(.subheadline.weight(.semibold))
+                        }
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 10)
+                        .background(Color.black.opacity(0.75), in: Capsule())
+                        Spacer()
+                    }
+                    .padding(.top, showControls && !controlsLocked ? 64 : 16)
+                    .padding(.horizontal, 20)
+                }
+                if let playerNotice = playerNotice {
+                    VStack {
+                        Spacer()
+                        Text(playerNotice)
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 10)
+                            .background(Color.black.opacity(0.75), in: Capsule())
+                    }
+                    .padding(.bottom, 24)
+                    .transition(.opacity)
+                    .allowsHitTesting(false)
+                }
+                if showNextEpisodePrompt, let next = nextFile, !controlsLocked {
+                    VStack {
+                        Spacer()
+                        HStack {
+                            Spacer()
+                            VStack(alignment: .leading, spacing: 7) {
+                                Text("Следующая серия через \(nextEpisodeCountdown) сек.")
+                                    .font(.headline)
+                                Text(fileLabel(next))
+                                    .font(.caption)
+                                    .foregroundStyle(.white.opacity(0.75))
+                                HStack(spacing: 10) {
+                                    Button("Сейчас") {
+                                        showNextEpisodePrompt = false
+                                        switchTo(next)
+                                    }
+                                    .buttonStyle(.borderedProminent)
+                                    Button("Отмена") {
+                                        autoNextCancelled = true
+                                        showNextEpisodePrompt = false
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .tint(.white)
+                                }
+                            }
+                            .foregroundStyle(.white)
+                            .padding(16)
+                            .background(Color.black.opacity(0.82), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        }
+                    }
+                    .padding(.horizontal, 22)
+                    .padding(.bottom, showControls ? 72 : 22)
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
+                }
+            }
+        }
+    }
+
+    private func playerGestureLayer(size: CGSize) -> some View {
+        Color.clear
+            .contentShape(Rectangle())
+            .ignoresSafeArea()
+            .onTapGesture { toggleControls() }
+            .gesture(
+                DragGesture(minimumDistance: 18, coordinateSpace: .local)
+                    .onChanged { value in
+                        updatePlayerGesture(value, size: size)
+                    }
+                    .onEnded { _ in
+                        finishPlayerGesture()
+                    }
+            )
+    }
+
+    private func updatePlayerGesture(_ value: DragGesture.Value, size: CGSize) {
+        guard !controlsLocked, size.width > 0, size.height > 0 else { return }
+        let horizontal = abs(value.translation.width)
+        let vertical = abs(value.translation.height)
+        if gestureMode == nil {
+            if horizontal > vertical * 1.15, !request.isLive, model.isSeekable {
+                gestureMode = .seek
+                gestureStartTime = model.timeMs
+            } else if vertical > horizontal * 1.15 {
+                if value.startLocation.x < size.width / 2 {
+                    gestureMode = .brightness
+                    gestureStartLevel = UIScreen.main.brightness
+                } else {
+                    gestureMode = .volume
+                    gestureStartLevel = CGFloat(SystemVolumeController.shared.volume)
+                }
+            } else {
+                return
+            }
+            hideToken += 1
+            withAnimation(.easeInOut(duration: 0.15)) { showControls = false }
+        }
+
+        switch gestureMode {
+        case .seek:
+            let duration = max(1, Double(model.lengthMs))
+            let range = min(max(duration * 0.18, 180_000), 900_000)
+            let delta = Double(value.translation.width / size.width) * range
+            let raw = Double(gestureStartTime) + delta
+            let maximum = model.lengthMs > 0 ? Double(model.lengthMs) * 0.995 : Double(Int32.max)
+            let target = Int32(min(max(raw, 0), maximum))
+            gestureTargetTime = target
+            let difference = abs(Int64(target) - Int64(gestureStartTime))
+            let amount = TimeFormat.string(ms: Int32(min(difference, Int64(Int32.max))))
+            gestureIcon = delta >= 0 ? "goforward" : "gobackward"
+            gestureText = "\(delta >= 0 ? "+" : "−")\(amount) · \(TimeFormat.string(ms: target))"
+        case .brightness:
+            let level = min(1, max(0, gestureStartLevel - value.translation.height / size.height))
+            UIScreen.main.brightness = level
+            gestureIcon = "sun.max.fill"
+            gestureText = "Яркость \(Int((level * 100).rounded()))%"
+        case .volume:
+            let level = min(1, max(0, gestureStartLevel - value.translation.height / size.height))
+            SystemVolumeController.shared.setVolume(Float(level))
+            gestureIcon = level == 0 ? "speaker.slash.fill" : "speaker.wave.2.fill"
+            gestureText = "Громкость \(Int((level * 100).rounded()))%"
+        case nil:
+            break
+        }
+    }
+
+    private func finishPlayerGesture() {
+        if gestureMode == .seek, let target = gestureTargetTime {
+            model.seek(ms: target)
+        }
+        gestureMode = nil
+        gestureTargetTime = nil
+        gestureHUDToken += 1
+        let token = gestureHUDToken
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 650_000_000)
+            guard token == gestureHUDToken, gestureMode == nil else { return }
+            withAnimation {
+                gestureText = ""
+                gestureIcon = ""
             }
         }
     }
@@ -992,6 +1322,14 @@ struct PlayerHostView: View {
                 }
             }
             Spacer(minLength: 8)
+            if let sleepStatusText = sleepStatusText {
+                Button {
+                    showOptions = true
+                } label: {
+                    Label(sleepStatusText, systemImage: "moon.zzz.fill")
+                        .font(.caption.weight(.semibold))
+                }
+            }
             if files.count > 1 {
                 Button {
                     showFiles = true
@@ -1003,6 +1341,13 @@ struct PlayerHostView: View {
                 showOptions = true
             } label: {
                 Image(systemName: "slider.horizontal.3")
+            }
+            Button {
+                hideToken += 1
+                controlsLocked = true
+                withAnimation(.easeInOut(duration: 0.2)) { showControls = false }
+            } label: {
+                Image(systemName: "lock.fill")
             }
             if OrientationHelper.isPhone {
                 Button {
@@ -1158,8 +1503,16 @@ struct PlayerHostView: View {
                     Section("Субтитры") {
                         ForEach(model.subtitleTracks) { track in
                             checkRow(track.name, selected: track.id == model.currentSubtitle) {
-                                model.setSubtitle(track.id)
+                                selectSubtitle(track, remember: true)
                             }
+                        }
+                    }
+                }
+
+                Section("Таймер сна") {
+                    ForEach(SleepChoice.allCases.filter { !request.isLive || $0 != .endOfVideo }) { choice in
+                        checkRow(choice.title, selected: sleepChoice == choice) {
+                            setSleepTimer(choice)
                         }
                     }
                 }
@@ -1184,7 +1537,7 @@ struct PlayerHostView: View {
                     }
                 }
             }
-            .navigationTitle("Качество и озвучка")
+            .navigationTitle("Настройки плеера")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
@@ -1224,8 +1577,8 @@ struct PlayerHostView: View {
         guard canSwitchRelease, !alternativesLoaded, let item = request.item else { return }
         // Usually instant: the film page has searched already.
         if let result = try? await TorrentSearchService.shared.search(TorrentSearchQuery(item: item)) {
-            alternatives = result.releases
-            AppDiagnostics.shared.log("search", "Для плеера доступно раздач: \(result.releases.count)")
+            alternatives = library.allowedReleases(result.releases)
+            AppDiagnostics.shared.log("search", "Для плеера доступно раздач: \(alternatives.count)")
             if model.started { recordPlaybackSuccessIfPossible() }
         }
         alternativesLoaded = true
@@ -1304,6 +1657,16 @@ struct PlayerHostView: View {
                 }
             }
             .contentShape(Rectangle())
+        }
+        .contextMenu {
+            if !selected {
+                Button(role: .destructive) {
+                    library.blockRelease(release)
+                    alternatives.removeAll { $0.id == release.id }
+                } label: {
+                    Label("Не предлагать эту раздачу", systemImage: "hand.thumbsdown")
+                }
+            }
         }
     }
 

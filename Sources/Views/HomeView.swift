@@ -32,7 +32,16 @@ struct HomeView: View {
                     if !library.data.continueWatching.isEmpty {
                         ContinueWatchingRow(entries: library.data.continueWatching)
                     }
+                    if !library.data.watchLater.isEmpty {
+                        VStack(alignment: .leading, spacing: 10) {
+                            SectionHeader(title: "Смотреть позже")
+                            MediaRow(items: Array(library.data.watchLater.prefix(12)))
+                        }
+                    }
                     if !token.trimmed.isEmpty {
+                        if RecommendationService.hasProfile(library.data) {
+                            PersonalizedRow(data: library.data, token: token)
+                        }
                         ForEach(HomeSection.all) { section in
                             CollectionRow(section: section, token: token)
                         }
@@ -44,6 +53,48 @@ struct HomeView: View {
             .navigationTitle("Кинотека")
             .navigationDestination(for: MediaItem.self) { DetailsView(item: $0) }
             .navigationDestination(for: HomeSection.self) { CollectionGridView(section: $0) }
+        }
+    }
+}
+
+struct PersonalizedRow: View {
+    let data: LibraryData
+    let token: String
+    @State private var items: [MediaItem] = []
+    @State private var reason = ""
+    @State private var loaded = false
+
+    private var key: String {
+        token + "|" + RecommendationService.profileKey(data)
+    }
+
+    var body: some View {
+        Group {
+            if !items.isEmpty || !loaded {
+                VStack(alignment: .leading, spacing: 8) {
+                    SectionHeader(title: "Для вас")
+                    if !reason.isEmpty {
+                        Text(reason)
+                            .font(.caption)
+                            .foregroundStyle(Theme.secondary)
+                            .padding(.horizontal, 16)
+                    }
+                    if items.isEmpty {
+                        PlaceholderRow()
+                    } else {
+                        MediaRow(items: items)
+                    }
+                }
+            }
+        }
+        .task(id: key) {
+            loaded = false
+            if let result = try? await RecommendationService.recommendations(for: data),
+               !Task.isCancelled {
+                items = result.items
+                reason = result.reason
+            }
+            loaded = true
         }
     }
 }

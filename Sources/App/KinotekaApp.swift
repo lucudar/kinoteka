@@ -22,7 +22,8 @@ struct KinotekaApp: App {
             SettingsKeys.smartQuality: true,
             SettingsKeys.automaticFallback: true,
             SettingsKeys.automaticRecovery: true,
-            SettingsKeys.preloadNextEpisode: true
+            SettingsKeys.preloadNextEpisode: true,
+            SettingsKeys.playerGestures: true
         ])
         URLCache.shared = URLCache(memoryCapacity: 64 * 1024 * 1024, diskCapacity: 512 * 1024 * 1024)
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
