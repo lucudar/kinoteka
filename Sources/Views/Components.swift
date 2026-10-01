@@ -143,14 +143,23 @@ struct PosterCard: View {
                     }
                 }
                 .overlay(alignment: .topTrailing) {
-                    if library.isWatched(item.id) {
-                        Image(systemName: "eye.fill")
-                            .font(.caption2.weight(.bold))
-                            .foregroundStyle(.white)
-                            .padding(5)
-                            .background(Circle().fill(Theme.accent))
-                            .padding(6)
+                    VStack(spacing: 5) {
+                        if library.isWatched(item.id) {
+                            Image(systemName: "eye.fill")
+                                .font(.caption2.weight(.bold))
+                                .foregroundStyle(.white)
+                                .padding(5)
+                                .background(Circle().fill(Theme.accent))
+                        }
+                        if library.isWatchLater(item) {
+                            Image(systemName: "bookmark.fill")
+                                .font(.caption2.weight(.bold))
+                                .foregroundStyle(.white)
+                                .padding(5)
+                                .background(Circle().fill(Color.black.opacity(0.7)))
+                        }
                     }
+                    .padding(6)
                 }
                 .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
             Text(item.title)
@@ -166,6 +175,26 @@ struct PosterCard: View {
         .frame(width: width)
         .frame(maxWidth: width == nil ? .infinity : nil, alignment: .leading)
         .contentShape(Rectangle())
+        .contextMenu {
+            Button {
+                library.toggleWatchLater(item)
+            } label: {
+                Label(library.isWatchLater(item) ? "Убрать из «Смотреть позже»" : "Смотреть позже",
+                      systemImage: library.isWatchLater(item) ? "bookmark.slash" : "bookmark")
+            }
+            Button {
+                library.toggleFavorite(item)
+            } label: {
+                Label(library.isFavorite(item) ? "Убрать из избранного" : "В избранное",
+                      systemImage: library.isFavorite(item) ? "heart.slash" : "heart")
+            }
+            Button {
+                library.toggleWatched(item)
+            } label: {
+                Label(library.isWatched(item.id) ? "Отметить непросмотренным" : "Отметить просмотренным",
+                      systemImage: library.isWatched(item.id) ? "eye.slash" : "eye")
+            }
+        }
     }
 }
 

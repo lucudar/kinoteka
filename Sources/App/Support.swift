@@ -25,6 +25,7 @@ enum SettingsKeys {
     static let automaticFallback = "automaticTorrentFallback"
     static let automaticRecovery = "automaticPlaybackRecovery"
     static let preloadNextEpisode = "preloadNextEpisode"
+    static let playerGestures = "playerGestures"
 }
 
 enum TimeFormat {

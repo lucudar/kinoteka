@@ -30,6 +30,21 @@ private struct PlaybackLearningData: Codable {
     var releases: [String: PlaybackStat] = [:]
     var trackers: [String: PlaybackStat] = [:]
     var audioByTitle: [String: String] = [:]
+    var subtitleByTitle: [String: String] = [:]
+
+    enum CodingKeys: String, CodingKey {
+        case releases, trackers, audioByTitle, subtitleByTitle
+    }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        releases = (try? c.decodeIfPresent([String: PlaybackStat].self, forKey: .releases)) ?? [:]
+        trackers = (try? c.decodeIfPresent([String: PlaybackStat].self, forKey: .trackers)) ?? [:]
+        audioByTitle = (try? c.decodeIfPresent([String: String].self, forKey: .audioByTitle)) ?? [:]
+        subtitleByTitle = (try? c.decodeIfPresent([String: String].self, forKey: .subtitleByTitle)) ?? [:]
+    }
 }
 
 /// Learns only from playback on this device. No history or diagnostics leave the iPhone.
@@ -59,6 +74,17 @@ final class PlaybackLearning {
     func rememberAudio(_ name: String, for itemKey: String?) {
         guard let itemKey = itemKey, let value = name.nonEmpty else { return }
         data.audioByTitle[itemKey] = value
+        scheduleSave()
+    }
+
+    func preferredSubtitle(for itemKey: String?) -> String? {
+        guard let itemKey = itemKey else { return nil }
+        return data.subtitleByTitle[itemKey]
+    }
+
+    func rememberSubtitle(_ name: String?, for itemKey: String?) {
+        guard let itemKey = itemKey else { return }
+        data.subtitleByTitle[itemKey] = name?.nonEmpty ?? "__OFF__"
         scheduleSave()
     }
 

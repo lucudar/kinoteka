@@ -1,13 +1,16 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 enum LibraryListKind: Hashable {
     case favorites(MediaKind)
+    case watchLater
     case watched(MediaKind)
     case history
 
     var title: String {
         switch self {
         case .favorites(let kind): return kind == .movie ? "Избранные фильмы" : "Избранные сериалы"
+        case .watchLater: return "Смотреть позже"
         case .watched(let kind): return kind == .movie ? "Просмотренные фильмы" : "Просмотренные сериалы"
         case .history: return "Недавно открывали"
         }
@@ -35,6 +38,14 @@ struct MyView: View {
                         FavoriteChannelsScreen()
                     } label: {
                         row("ТВ-каналы", "tv", library.data.favoriteChannels.count)
+                    }
+                }
+
+                Section("Мой список") {
+                    NavigationLink {
+                        ItemsGridScreen(kind: .watchLater)
+                    } label: {
+                        row("Смотреть позже", "bookmark", library.data.watchLater.count)
                     }
                 }
 
@@ -96,6 +107,7 @@ struct ItemsGridScreen: View {
     private var items: [MediaItem] {
         switch kind {
         case .favorites(let type): return library.favorites(type)
+        case .watchLater: return library.data.watchLater
         case .watched(let type): return library.watched(type)
         case .history: return library.data.history
         }
@@ -139,6 +151,7 @@ struct FavoriteChannelsScreen: View {
             }
             ForEach(library.data.favoriteChannels) { channel in
                 Button {
+                    library.addRecentChannel(channel)
                     coordinator.play(PlayRequest(title: channel.name, link: channel.url, isLive: true, userAgent: channel.userAgent, referrer: channel.referrer))
                 } label: {
                     HStack(spacing: 12) {
@@ -170,6 +183,7 @@ struct FavoriteChannelsScreen: View {
 }
 
 struct SettingsView: View {
+    @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var channels: ChannelsStore
     @ObservedObject private var network = NetworkMonitor.shared
     @AppStorage(SettingsKeys.kpToken) private var token = ""
@@ -187,11 +201,14 @@ struct SettingsView: View {
     @AppStorage(SettingsKeys.automaticFallback) private var automaticFallback = true
     @AppStorage(SettingsKeys.automaticRecovery) private var automaticRecovery = true
     @AppStorage(SettingsKeys.preloadNextEpisode) private var preloadNextEpisode = true
+    @AppStorage(SettingsKeys.playerGestures) private var playerGestures = true
     @State private var checkingSearch = false
     @State private var engineStatus = "Проверка…"
     @State private var cacheSize = ""
     @State private var diagnosticsSize = ""
     @State private var message: String?
+    @State private var importingBackup = false
+    @State private var backupURL: URL?
 
     var body: some View {
         Form {
@@ -296,10 +313,11 @@ struct SettingsView: View {
                 Toggle("Звук в фоне", isOn: $backgroundAudio)
                 Toggle("Восстанавливать после зависания", isOn: $automaticRecovery)
                 Toggle("Готовить следующую серию", isOn: $preloadNextEpisode)
+                Toggle("Жесты в плеере", isOn: $playerGestures)
             } header: {
                 Text("Плеер")
             } footer: {
-                Text("При зависании поток переподключится с сохранённого места, затем попробует более лёгкую раздачу. Следующая серия заранее получает небольшой начальный буфер только не в мобильной сети.")
+                Text("При зависании поток переподключится с сохранённого места, затем попробует более лёгкую раздачу. Следующая серия заранее получает небольшой начальный буфер только не в мобильной сети.\n\nЖесты: по горизонтали — перемотка, слева по вертикали — яркость, справа — громкость.")
             }
 
             Section {
@@ -345,8 +363,31 @@ struct SettingsView: View {
                     cacheSize = KPClient.shared.cacheSizeText
                     message = "Кэш очищен"
                 }
+                if !library.data.blockedReleaseIDs.isEmpty {
+                    Button("Вернуть скрытые раздачи (\(library.data.blockedReleaseIDs.count))") {
+                        library.clearBlockedReleases()
+                        message = "Скрытые раздачи снова будут предлагаться"
+                    }
+                }
             } header: {
                 Text("Данные")
+            }
+
+            Section {
+                if let backupURL = backupURL {
+                    ShareLink(item: backupURL) {
+                        Label("Экспортировать резервную копию", systemImage: "square.and.arrow.up")
+                    }
+                }
+                Button {
+                    importingBackup = true
+                } label: {
+                    Label("Восстановить из файла", systemImage: "square.and.arrow.down")
+                }
+            } header: {
+                Text("Резервная копия")
+            } footer: {
+                Text("Сохраняются медиатека, прогресс, история, свои раздачи и обычные настройки. Ключи API и адрес плейлиста в файл не попадают.")
             }
 
             Section {
@@ -386,9 +427,26 @@ struct SettingsView: View {
         .alert(message ?? "", isPresented: Binding(get: { message != nil }, set: { if !$0 { message = nil } })) {
             Button("OK", role: .cancel) {}
         }
+        .fileImporter(isPresented: $importingBackup, allowedContentTypes: [.json]) { result in
+            switch result {
+            case .success(let url):
+                do {
+                    let backup = try BackupService.load(from: url)
+                    backup.settings.apply()
+                    library.replaceData(backup.library)
+                    backupURL = BackupService.exportURL(library: library.data)
+                    message = "Резервная копия восстановлена"
+                } catch {
+                    message = error.localizedDescription
+                }
+            case .failure(let error):
+                message = error.localizedDescription
+            }
+        }
         .task {
             cacheSize = KPClient.shared.cacheSizeText
             diagnosticsSize = AppDiagnostics.shared.sizeText
+            backupURL = BackupService.exportURL(library: library.data)
             await refreshStatus()
         }
     }

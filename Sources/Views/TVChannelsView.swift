@@ -12,6 +12,7 @@ struct TVChannelsView: View {
 
     static let allTag = "__all__"
     static let favoritesTag = "__favorites__"
+    static let recentTag = "__recent__"
 
     private var hasPlaylist: Bool { !playlistURL.trimmed.isEmpty }
 
@@ -80,6 +81,8 @@ struct TVChannelsView: View {
             list = channels.channels
         case TVChannelsView.favoritesTag:
             list = library.data.favoriteChannels
+        case TVChannelsView.recentTag:
+            list = library.data.recentChannels
         default:
             list = channels.channels.filter { $0.group == group }
         }
@@ -96,6 +99,9 @@ struct TVChannelsView: View {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
                         Chip(title: "Все", selected: group == TVChannelsView.allTag) { group = TVChannelsView.allTag }
+                        if !library.data.recentChannels.isEmpty {
+                            Chip(title: "Недавние", selected: group == TVChannelsView.recentTag) { group = TVChannelsView.recentTag }
+                        }
                         Chip(title: "Избранные", selected: group == TVChannelsView.favoritesTag) { group = TVChannelsView.favoritesTag }
                         ForEach(channels.groups, id: \.self) { name in
                             Chip(title: name, selected: group == name) { group = name }
@@ -105,7 +111,8 @@ struct TVChannelsView: View {
                 }
 
                 if filtered.isEmpty {
-                    ContentUnavailableView(group == TVChannelsView.favoritesTag ? "Нет избранных каналов" : "Каналы не найдены",
+                    ContentUnavailableView(group == TVChannelsView.favoritesTag ? "Нет избранных каналов" :
+                                           (group == TVChannelsView.recentTag ? "Нет недавних каналов" : "Каналы не найдены"),
                                            systemImage: "tv",
                                            description: Text(group == TVChannelsView.favoritesTag ? "Удерживайте канал и выберите «В избранное»" : ""))
                         .padding(.top, 40)
@@ -140,6 +147,7 @@ struct TVChannelsView: View {
     }
 
     private func play(_ channel: Channel) {
+        library.addRecentChannel(channel)
         coordinator.play(PlayRequest(title: channel.name, link: channel.url, isLive: true, userAgent: channel.userAgent, referrer: channel.referrer))
     }
 }

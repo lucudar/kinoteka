@@ -58,6 +58,26 @@ final class LibraryStore: ObservableObject {
         data.favorites.filter { $0.kind == kind }
     }
 
+    // Watch later
+    func isWatchLater(_ item: MediaItem) -> Bool {
+        data.watchLater.contains { $0.id == item.id }
+    }
+
+    func toggleWatchLater(_ item: MediaItem) {
+        mutate { d in
+            if let index = d.watchLater.firstIndex(where: { $0.id == item.id }) {
+                d.watchLater.remove(at: index)
+            } else {
+                d.watchLater.insert(item, at: 0)
+            }
+        }
+    }
+
+    func removeWatchLater(_ item: MediaItem) {
+        guard isWatchLater(item) else { return }
+        mutate { d in d.watchLater.removeAll { $0.id == item.id } }
+    }
+
     // Watched
     func isWatched(_ id: Int) -> Bool {
         data.watched.contains { $0.id == id }
@@ -69,13 +89,17 @@ final class LibraryStore: ObservableObject {
                 d.watched.remove(at: index)
             } else {
                 d.watched.insert(item, at: 0)
+                d.watchLater.removeAll { $0.id == item.id }
             }
         }
     }
 
     func markWatched(_ item: MediaItem) {
         guard !isWatched(item.id) else { return }
-        mutate { d in d.watched.insert(item, at: 0) }
+        mutate { d in
+            d.watched.insert(item, at: 0)
+            d.watchLater.removeAll { $0.id == item.id }
+        }
     }
 
     func watched(_ kind: MediaKind) -> [MediaItem] {
@@ -175,6 +199,48 @@ final class LibraryStore: ObservableObject {
 
     func removeFavoriteChannels(at offsets: IndexSet) {
         mutate { d in d.favoriteChannels.remove(atOffsets: offsets) }
+    }
+
+    func addRecentChannel(_ channel: Channel) {
+        mutate { d in
+            d.recentChannels.removeAll { $0.url == channel.url }
+            d.recentChannels.insert(channel, at: 0)
+            if d.recentChannels.count > 20 {
+                d.recentChannels.removeLast(d.recentChannels.count - 20)
+            }
+        }
+    }
+
+    // Releases hidden by the user
+    func isReleaseBlocked(_ release: TorrentRelease) -> Bool {
+        data.blockedReleaseIDs.contains(release.id)
+    }
+
+    func blockRelease(_ release: TorrentRelease) {
+        guard !isReleaseBlocked(release) else { return }
+        mutate { d in
+            d.blockedReleaseIDs.insert(release.id, at: 0)
+            if d.blockedReleaseIDs.count > 300 {
+                d.blockedReleaseIDs.removeLast(d.blockedReleaseIDs.count - 300)
+            }
+        }
+    }
+
+    func clearBlockedReleases() {
+        guard !data.blockedReleaseIDs.isEmpty else { return }
+        mutate { d in d.blockedReleaseIDs.removeAll() }
+    }
+
+    func allowedReleases(_ releases: [TorrentRelease]) -> [TorrentRelease] {
+        let blocked = Set(data.blockedReleaseIDs)
+        return releases.filter { !blocked.contains($0.id) }
+    }
+
+    func replaceData(_ replacement: LibraryData) {
+        saveTask?.cancel()
+        objectWillChange.send()
+        data = replacement
+        persist()
     }
 
     // Search queries

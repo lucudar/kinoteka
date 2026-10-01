@@ -375,16 +375,21 @@ struct ContinueEntry: Codable, Hashable, Identifiable {
 
 struct LibraryData: Codable {
     var favorites: [MediaItem] = []
+    var watchLater: [MediaItem] = []
     var watched: [MediaItem] = []
     var history: [MediaItem] = []
     var sources: [String: [SavedSource]] = [:]
     var resume: [String: Int32] = [:]
     var continueWatching: [ContinueEntry] = []
     var favoriteChannels: [Channel] = []
+    var recentChannels: [Channel] = []
     var recentQueries: [String] = []
+    /// Search-result IDs the user marked as broken or unwanted.
+    var blockedReleaseIDs: [String] = []
 
     enum CodingKeys: String, CodingKey {
-        case favorites, watched, history, sources, resume, continueWatching, favoriteChannels, recentQueries
+        case favorites, watchLater, watched, history, sources, resume, continueWatching
+        case favoriteChannels, recentChannels, recentQueries, blockedReleaseIDs
     }
 
     init() {}
@@ -392,12 +397,15 @@ struct LibraryData: Codable {
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         favorites = (try? c.decodeIfPresent([MediaItem].self, forKey: .favorites)) ?? []
+        watchLater = (try? c.decodeIfPresent([MediaItem].self, forKey: .watchLater)) ?? []
         watched = (try? c.decodeIfPresent([MediaItem].self, forKey: .watched)) ?? []
         history = (try? c.decodeIfPresent([MediaItem].self, forKey: .history)) ?? []
         sources = (try? c.decodeIfPresent([String: [SavedSource]].self, forKey: .sources)) ?? [:]
         resume = (try? c.decodeIfPresent([String: Int32].self, forKey: .resume)) ?? [:]
         continueWatching = (try? c.decodeIfPresent([ContinueEntry].self, forKey: .continueWatching)) ?? []
         favoriteChannels = (try? c.decodeIfPresent([Channel].self, forKey: .favoriteChannels)) ?? []
+        recentChannels = (try? c.decodeIfPresent([Channel].self, forKey: .recentChannels)) ?? []
         recentQueries = (try? c.decodeIfPresent([String].self, forKey: .recentQueries)) ?? []
+        blockedReleaseIDs = (try? c.decodeIfPresent([String].self, forKey: .blockedReleaseIDs)) ?? []
     }
 }

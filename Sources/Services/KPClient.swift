@@ -23,6 +23,38 @@ enum APIError: LocalizedError {
     }
 }
 
+/// Coalesces identical requests made by several rows/screens at the same time.
+private actor KPRequestPool {
+    private struct Payload: Sendable {
+        let data: Data
+        let statusCode: Int
+    }
+
+    private var tasks: [String: Task<Payload, Error>] = [:]
+
+    func fetch(_ request: URLRequest, using session: URLSession) async throws -> (Data, Int) {
+        let key = request.url?.absoluteString ?? UUID().uuidString
+        if let task = tasks[key] {
+            let payload = try await task.value
+            return (payload.data, payload.statusCode)
+        }
+
+        let task = Task<Payload, Error> {
+            let (data, response) = try await session.data(for: request)
+            return Payload(data: data, statusCode: (response as? HTTPURLResponse)?.statusCode ?? 0)
+        }
+        tasks[key] = task
+        do {
+            let payload = try await task.value
+            tasks.removeValue(forKey: key)
+            return (payload.data, payload.statusCode)
+        } catch {
+            tasks.removeValue(forKey: key)
+            throw error
+        }
+    }
+}
+
 /// Client for kinopoiskapiunofficial.tech with a simple on-disk cache
 /// (the free plan allows 500 requests per day).
 final class KPClient {
@@ -37,6 +69,7 @@ final class KPClient {
 
     private let base = "https://kinopoiskapiunofficial.tech"
     private let session: URLSession
+    private let requests = KPRequestPool()
     private let cacheDir: URL
 
     init() {
@@ -93,8 +126,7 @@ final class KPClient {
         request.setValue(key, forHTTPHeaderField: "X-API-KEY")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         do {
-            let (data, response) = try await session.data(for: request)
-            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let (data, code) = try await requests.fetch(request, using: session)
             if code == 402 || code == 429 { throw APIError.limit }
             guard (200..<300).contains(code) else { throw APIError.http(code) }
             let value = try JSONDecoder().decode(T.self, from: data)
