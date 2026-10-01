@@ -51,6 +51,7 @@ struct PlayerHostView: View {
     @State private var closing = false
     @State private var addedAudio: Set<Int> = []
     @State private var preferredAudioApplied = false
+    @State private var desiredAudioName: String?
     @State private var desiredQuality: ReleaseQuality?
     @State private var desiredVoice: ReleaseVoiceOption?
     /// The link that plays: the requested one, or another release picked in "Качество".
@@ -90,6 +91,7 @@ struct PlayerHostView: View {
         _pendingStart = State(initialValue: request.startTime)
         _desiredQuality = State(initialValue: request.requestedQuality)
         _desiredVoice = State(initialValue: request.requestedVoice)
+        _desiredAudioName = State(initialValue: request.preferredAudio)
     }
 
     private static let audioExtensions: Set<String> = ["mka", "ac3", "eac3", "dts", "aac", "mp3", "flac", "ogg", "opus", "m4a", "wav"]
@@ -149,7 +151,7 @@ struct PlayerHostView: View {
         .onChange(of: model.isBuffering) { _, buffering in
             if buffering && model.started {
                 scheduleRecovery(reason: "поток завис", delay: 12)
-            } else if !buffering {
+            } else if !buffering && !model.failed {
                 recoveryTask?.cancel()
                 recoveryTask = nil
                 recoveryText = nil
@@ -311,7 +313,7 @@ struct PlayerHostView: View {
     private func selectAutomaticFallback(preferLowerQuality: Bool) async -> Bool {
         guard automaticFallback, canSwitchRelease, fallbackCount < 3 else { return false }
         await loadAlternatives()
-        guard !alternatives.isEmpty else { return false }
+        guard !Task.isCancelled, !closing, !alternatives.isEmpty else { return false }
 
         let currentQuality = release(matching: link)?.quality ?? effectivePreferredQuality
         let ceiling = preferLowerQuality ? PlaybackPolicy.lowerQuality(than: currentQuality) : nil
@@ -434,8 +436,8 @@ struct PlayerHostView: View {
     /// Selects the VLC track matching the voice-over chosen on the film page.
     /// If a torrent does not label its tracks, VLC's default remains unchanged.
     private func applyPreferredAudio() {
-        let preferred = desiredVoice?.title
-            ?? request.preferredAudio?.nonEmpty
+        let preferred = desiredAudioName?.nonEmpty
+            ?? desiredVoice?.title
             ?? PlaybackLearning.shared.preferredAudio(for: request.itemKey)
         guard !preferredAudioApplied, let preferred = preferred else { return }
         let names = model.audioTracks.map(\.name)
@@ -448,6 +450,7 @@ struct PlayerHostView: View {
     private func selectAudio(_ track: MediaTrack, remember: Bool) {
         model.setAudio(track.id)
         if remember {
+            desiredAudioName = track.name
             PlaybackLearning.shared.rememberAudio(track.name, for: request.itemKey)
             AppDiagnostics.shared.log("audio", "Выбрана дорожка \(track.name)")
         }

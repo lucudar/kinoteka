@@ -74,6 +74,7 @@ struct RootView: View {
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
+                AppDiagnostics.shared.log("app", "Приложение активно")
                 TorrServer.shared.start()
             } else {
                 library.persist()

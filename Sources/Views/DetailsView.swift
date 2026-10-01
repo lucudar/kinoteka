@@ -509,7 +509,7 @@ struct DetailsView: View {
     }
 
     private func applyDefaultVoiceIfNeeded(_ list: [TorrentRelease]) {
-        guard !appliedDefaultVoice else { return }
+        guard !appliedDefaultVoice, !list.isEmpty else { return }
         appliedDefaultVoice = true
         chosenVoice = availableDefaultVoice(in: list)
     }

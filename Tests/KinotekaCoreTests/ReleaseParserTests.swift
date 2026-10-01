@@ -84,6 +84,16 @@ final class ReleaseParserTests: XCTestCase {
         XCTAssertEqual(PlaybackPolicy.lowerQuality(than: .fullHD), .hd)
     }
 
+    func testVoiceSettingRoundTrip() {
+        for kind in VoiceKind.audioChoices {
+            let value = ReleaseVoiceOption.kind(kind)
+            XCTAssertEqual(ReleaseVoiceOption.fromSetting(value.settingValue), value)
+        }
+        XCTAssertEqual(ReleaseVoiceOption.fromSetting("studio:LostFilm"), .studio("LostFilm"))
+        XCTAssertNil(ReleaseVoiceOption.fromSetting("auto"))
+        XCTAssertNil(ReleaseVoiceOption.fromSetting("kind:999"))
+    }
+
     func testYear() {
         XCTAssertEqual(ReleaseParser.year(in: "Бегущий по лезвию 2049 / Blade Runner 2049 (2017) BDRip"), 2017)
         XCTAssertEqual(ReleaseParser.year(in: "1917 / 1917 / 2019 / ДБ / BDRip"), 2019)
