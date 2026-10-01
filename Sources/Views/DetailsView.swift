@@ -27,6 +27,8 @@ struct DetailsView: View {
     @State private var releasesFailed = false
     /// Quality picked on the page for the next playback; nil means "Авто".
     @State private var chosenQuality: ReleaseQuality?
+    /// Voice-over picked on the page for the next playback; nil means "Авто".
+    @State private var chosenVoice: ReleaseVoiceOption?
 
     private var current: MediaItem { film?.item ?? item }
     private var isSeries: Bool { film?.isSeries ?? (item.kind == .series) }
@@ -65,15 +67,25 @@ struct DetailsView: View {
     /// The found release for the season: the best one of the chosen quality, or of the preferred one.
     private func plannedRelease(season: Int?) -> TorrentRelease? {
         guard let list = releases else { return nil }
+        let matchingVoice = ReleaseRanking.matching(ReleaseRanking.matching(list, season: season), voice: chosenVoice)
         if let quality = chosenQuality {
-            return ReleaseRanking.best(list, quality: quality, season: season)
+            return ReleaseRanking.best(matchingVoice, quality: quality, season: season)
         }
-        return ReleaseRanking.best(ReleaseRanking.matching(list, season: season), preferred: preferredQuality, season: season)
+        return ReleaseRanking.best(matchingVoice, preferred: preferredQuality, season: season)
     }
 
     private var qualityOptions: [ReleaseQuality] {
         guard let list = releases else { return [] }
-        return ReleaseRanking.qualities(list, season: planSeason)
+        return ReleaseRanking.qualities(ReleaseRanking.matching(list, voice: chosenVoice), season: planSeason)
+    }
+
+    private var voiceOptions: [ReleaseVoiceOption] {
+        guard var list = releases else { return [] }
+        list = ReleaseRanking.matching(list, season: planSeason)
+        if let quality = chosenQuality {
+            list = list.filter { $0.quality == quality }
+        }
+        return ReleaseRanking.voiceOptions(list)
     }
 
     private enum Plan {
@@ -86,7 +98,7 @@ struct DetailsView: View {
     private var plan: Plan? {
         let season = planSeason
         if let entry = continueEntry {
-            if chosenQuality != nil, let release = plannedRelease(season: season),
+            if (chosenQuality != nil || chosenVoice != nil), let release = plannedRelease(season: season),
                LinkInspector.markTorrent(release.link) != entry.link {
                 return .release(release)
             }
@@ -110,8 +122,8 @@ struct DetailsView: View {
 
     private var watchTitle: String {
         let title = continueEntry != nil ? "Продолжить" : "Смотреть"
-        guard let quality = chosenQuality else { return title }
-        return title + " в " + quality.title
+        let choices = [chosenQuality?.title, chosenVoice?.title].compactMap { $0 }
+        return choices.isEmpty ? title : title + " · " + choices.joined(separator: " · ")
     }
 
     private var captionText: String? {
@@ -179,9 +191,15 @@ struct DetailsView: View {
         .onChange(of: qualityOptions) { _, options in
             if let quality = chosenQuality, !options.contains(quality) { chosenQuality = nil }
         }
+        .onChange(of: voiceOptions) { _, options in
+            if let voice = chosenVoice, !options.contains(voice) { chosenVoice = nil }
+        }
         .onChange(of: coordinator.request?.id) { _, id in
             // The choice is for one playback: next time the page continues what was watched.
-            if id != nil { chosenQuality = nil }
+            if id != nil {
+                chosenQuality = nil
+                chosenVoice = nil
+            }
         }
         .onAppear { library.addHistory(current) }
     }
@@ -280,6 +298,7 @@ struct DetailsView: View {
             .disabled(searchingRelease)
 
             qualityChips
+            voiceChips
 
             if let text = captionText {
                 Text(text)
@@ -337,6 +356,26 @@ struct DetailsView: View {
         }
     }
 
+    /// Voice-over filters releases before the automatic quality/seeders ranking.
+    @ViewBuilder
+    private var voiceChips: some View {
+        let options = voiceOptions
+        if autoPlayBest && !options.isEmpty {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    Text("Озвучка")
+                        .font(.subheadline)
+                        .foregroundStyle(Theme.secondary)
+                        .padding(.trailing, 2)
+                    Chip(title: "Авто", selected: chosenVoice == nil) { chosenVoice = nil }
+                    ForEach(options) { voice in
+                        Chip(title: voice.title, selected: chosenVoice == voice) { chosenVoice = voice }
+                    }
+                }
+            }
+        }
+    }
+
     private func watchTapped() {
         if let entry = continueEntry {
             continueWatching(entry)
@@ -350,6 +389,7 @@ struct DetailsView: View {
     private func continueWatching(_ entry: ContinueEntry) {
         var request = PlayRequest(continuing: entry, item: current)
         request.itemKey = item.key
+        request.preferredAudio = chosenVoice?.title
         if case .release(let release) = plan {
             // Another quality is chosen: the same episode and place in that release.
             let source = SavedSource(release: release)
@@ -362,7 +402,7 @@ struct DetailsView: View {
     }
 
     private func play(_ episode: KPEpisode) {
-        if chosenQuality == nil, let source = savedSource(season: episode.seasonNumber) {
+        if chosenQuality == nil, chosenVoice == nil, let source = savedSource(season: episode.seasonNumber) {
             coordinator.play(request(for: episode, link: source.link))
         } else {
             playRelease(for: episode)
@@ -371,11 +411,13 @@ struct DetailsView: View {
 
     private func request(for episode: KPEpisode?, link: String) -> PlayRequest {
         guard let episode = episode else {
-            return PlayRequest(title: current.title, link: link, itemKey: item.key, item: current)
+            return PlayRequest(title: current.title, link: link, itemKey: item.key, item: current,
+                               preferredAudio: chosenVoice?.title)
         }
         return PlayRequest(title: SeriesTitle.make(current.title, episode.seasonNumber, episode.episodeNumber),
                            link: link, itemKey: item.key, item: current,
-                           season: episode.seasonNumber, episode: episode.episodeNumber)
+                           season: episode.seasonNumber, episode: episode.episodeNumber,
+                           preferredAudio: chosenVoice?.title)
     }
 
     /// Like Zona: starts the release watched before or the best found one right away (the search
@@ -383,7 +425,7 @@ struct DetailsView: View {
     /// suitable is found or auto start is off.
     private func playRelease(for episode: KPEpisode?) {
         let season = episode?.seasonNumber
-        if chosenQuality == nil, episode == nil, let source = sources.first {
+        if chosenQuality == nil, chosenVoice == nil, episode == nil, let source = sources.first {
             coordinator.play(request(for: nil, link: source.link))
             return
         }

@@ -53,6 +53,28 @@ final class ReleaseParserTests: XCTestCase {
         XCTAssertEqual(ReleaseParser.voiceKinds(in: "Movie 2020 1080p WEB-DL"), [])
     }
 
+    func testVoiceChoiceFiltersReleasesAndStudios() {
+        let dubbed = release(id: "dub", seeders: 20, voices: [.dub], studios: ["LostFilm"])
+        let multi = release(id: "multi", seeders: 100, voices: [.multi], studios: ["NewStudio"])
+        let options = ReleaseRanking.voiceOptions([dubbed, multi])
+
+        XCTAssertTrue(options.contains(.kind(.dub)))
+        XCTAssertTrue(options.contains(.kind(.multi)))
+        XCTAssertFalse(options.contains(.kind(.subtitles)))
+        XCTAssertTrue(options.contains(.studio("LostFilm")))
+        XCTAssertEqual(ReleaseRanking.matching([dubbed, multi], voice: .kind(.dub)).map(\.id), ["dub"])
+        XCTAssertEqual(ReleaseRanking.matching([dubbed, multi], voice: .studio("lostfilm")).map(\.id), ["dub"])
+        XCTAssertEqual(ReleaseRanking.best(ReleaseRanking.matching([dubbed, multi], voice: .kind(.dub)),
+                                           preferred: .fullHD)?.id, "dub")
+    }
+
+    func testPreferredVoiceMatchesVLCTrackName() {
+        let tracks = ["Track 1 — English", "Track 2 — MVO NewStudio", "LostFilm Russian"]
+        XCTAssertEqual(AudioTrackMatcher.best(in: tracks, preferred: "Многоголосый"), 1)
+        XCTAssertEqual(AudioTrackMatcher.best(in: tracks, preferred: "lostfilm"), 2)
+        XCTAssertNil(AudioTrackMatcher.best(in: tracks, preferred: "Дубляж"))
+    }
+
     func testYear() {
         XCTAssertEqual(ReleaseParser.year(in: "Бегущий по лезвию 2049 / Blade Runner 2049 (2017) BDRip"), 2017)
         XCTAssertEqual(ReleaseParser.year(in: "1917 / 1917 / 2019 / ДБ / BDRip"), 2019)
@@ -67,5 +89,13 @@ final class ReleaseParserTests: XCTestCase {
         XCTAssertTrue(TextMatch.containsPhrase("Dune.Part.Two.2024.1080p", "Dune: Part Two"))
         XCTAssertTrue(TextMatch.containsPhrase("Брат 2 / Brother 2 (2000)", "Брат 2"))
         XCTAssertFalse(TextMatch.containsPhrase("Братья Гримм (2005)", "Брат"))
+    }
+
+    private func release(id: String, seeders: Int, voices: [VoiceKind], studios: [String]) -> TorrentRelease {
+        TorrentRelease(id: id, title: id, link: "magnet:?\(id)", hash: id, size: 1_000_000_000,
+                       seeders: seeders, peers: 0, trackers: [], published: nil,
+                       quality: .fullHD, isHDR: false, isCamRip: false, seasons: [],
+                       voiceKinds: voices, studios: studios, audioTracks: [], year: 2024,
+                       isSeries: false, detailsURL: nil)
     }
 }

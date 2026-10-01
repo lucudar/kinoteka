@@ -65,6 +65,36 @@ enum VoiceKind: Int, Codable, CaseIterable, Comparable, Sendable {
     static func < (lhs: VoiceKind, rhs: VoiceKind) -> Bool { lhs.rawValue < rhs.rawValue }
 }
 
+/// A voice-over the user can request before playback. A kind covers releases
+/// marked as dubbed/multi-voice/etc.; a studio selects a specific translation.
+enum ReleaseVoiceOption: Hashable, Identifiable, Sendable {
+    case kind(VoiceKind)
+    case studio(String)
+
+    var id: String {
+        switch self {
+        case .kind(let kind): return "kind:\(kind.rawValue)"
+        case .studio(let name): return "studio:" + name.trimmed.lowercased()
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .kind(let kind): return kind.title
+        case .studio(let name): return name
+        }
+    }
+
+    func matches(_ release: TorrentRelease) -> Bool {
+        switch self {
+        case .kind(let kind):
+            return release.voiceKinds.contains(kind)
+        case .studio(let name):
+            return release.studios.contains { $0.compare(name, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame }
+        }
+    }
+}
+
 /// One torrent found by the search (a "раздача").
 struct TorrentRelease: Identifiable, Hashable, Codable, Sendable {
     var id: String
@@ -344,6 +374,12 @@ enum ReleaseRanking {
         return list.filter { $0.seasons.isEmpty || $0.seasons.contains(season) }
     }
 
+    /// Releases with the requested voice-over. Nil is the automatic choice.
+    static func matching(_ list: [TorrentRelease], voice: ReleaseVoiceOption?) -> [TorrentRelease] {
+        guard let voice = voice else { return list }
+        return list.filter { voice.matches($0) }
+    }
+
     /// Qualities that have a live release for the season, best first: the "Качество" choices.
     /// Camera copies are not offered.
     static func qualities(_ list: [TorrentRelease], season: Int? = nil) -> [ReleaseQuality] {
@@ -355,6 +391,39 @@ enum ReleaseRanking {
     static func best(_ list: [TorrentRelease], quality: ReleaseQuality, season: Int? = nil) -> TorrentRelease? {
         let same = matching(list, season: season).filter { $0.quality == quality && !$0.isCamRip }
         return best(same, preferred: quality, season: season)
+    }
+
+    /// Available voice-over choices among live, non-camera releases.
+    /// Kinds stay in their natural priority order; studios are ordered by seeders.
+    static func voiceOptions(_ list: [TorrentRelease], season: Int? = nil) -> [ReleaseVoiceOption] {
+        let live = matching(list, season: season).filter { $0.seeders > 0 && !$0.isCamRip }
+        let kinds = VoiceKind.allCases
+            .filter { kind in kind != .subtitles && live.contains { $0.voiceKinds.contains(kind) } }
+            .map { ReleaseVoiceOption.kind($0) }
+
+        var studioMap: [String: (title: String, seeders: Int)] = [:]
+        for release in live {
+            for raw in release.studios {
+                let title = raw.trimmed
+                guard !title.isEmpty else { continue }
+                let key = title.lowercased()
+                if let current = studioMap[key] {
+                    if release.seeders > current.seeders {
+                        studioMap[key] = (title, release.seeders)
+                    }
+                } else {
+                    studioMap[key] = (title, release.seeders)
+                }
+            }
+        }
+        let studios = studioMap.values
+            .sorted {
+                if $0.seeders != $1.seeders { return $0.seeders > $1.seeders }
+                return $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending
+            }
+            .prefix(8)
+            .map { ReleaseVoiceOption.studio($0.title) }
+        return kinds + studios
     }
 
     /// One release per available quality (best first), with `current` kept for its own quality.
