@@ -9,6 +9,8 @@ final class ImageCache {
 
     private let memory = NSCache<NSURL, UIImage>()
     private let session: URLSession
+    private let lock = NSLock()
+    private var inFlight: [URL: Task<UIImage?, Never>] = [:]
 
     init() {
         memory.countLimit = 400
@@ -27,9 +29,26 @@ final class ImageCache {
 
     func load(_ url: URL) async -> UIImage? {
         if let image = cached(url) { return image }
-        guard let (data, _) = try? await session.data(from: url),
-              let image = ImageCache.downsample(data, maxPixel: 1400) else { return nil }
-        let prepared = await image.byPreparingForDisplay() ?? image
+        let task: Task<UIImage?, Never>
+        lock.lock()
+        if let existing = inFlight[url] {
+            task = existing
+        } else {
+            let session = session
+            task = Task {
+                guard let (data, _) = try? await session.data(from: url),
+                      let image = ImageCache.downsample(data, maxPixel: 1400) else { return nil }
+                return await image.byPreparingForDisplay() ?? image
+            }
+            inFlight[url] = task
+        }
+        lock.unlock()
+
+        let prepared = await task.value
+        lock.lock()
+        inFlight[url] = nil
+        lock.unlock()
+        guard let prepared = prepared else { return nil }
         let cost = Int(prepared.size.width * prepared.scale * prepared.size.height * prepared.scale * 4)
         memory.setObject(prepared, forKey: url as NSURL, cost: cost)
         return prepared

@@ -346,8 +346,12 @@ struct PlayRequest: Identifiable {
 extension PlayRequest {
     /// "Продолжить": the same file (or the same episode) of the release watched before.
     init(continuing entry: ContinueEntry, item: MediaItem? = nil) {
+        let voice = ReleaseVoiceOption.fromSetting(
+            UserDefaults.standard.string(forKey: SettingsKeys.preferredVoice) ?? "auto"
+        )
         self.init(title: entry.title, link: entry.link, itemKey: entry.itemKey, item: item ?? entry.item,
-                  preferredFileId: entry.fileId, season: entry.season, episode: entry.episode)
+                  preferredFileId: entry.fileId, season: entry.season, episode: entry.episode,
+                  preferredAudio: voice?.title, requestedVoice: voice)
     }
 }
 

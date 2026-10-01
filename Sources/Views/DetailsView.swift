@@ -72,6 +72,22 @@ struct DetailsView: View {
         return sources.first { $0.seasons?.contains(season) == true } ?? sources.first { $0.seasons == nil }
     }
 
+    private func foundRelease(for link: String) -> TorrentRelease? {
+        let marked = LinkInspector.markTorrent(link)
+        return releases?.first { LinkInspector.markTorrent($0.link) == marked }
+    }
+
+    /// On a constrained/mobile connection, "Авто" may replace a previously
+    /// watched 4K/1080p source with the network-safe quality.
+    private func shouldReplaceSaved(link: String, season: Int?) -> Bool {
+        guard smartQuality,
+              network.connection == .cellular || network.isConstrained || network.isExpensive,
+              let currentRelease = foundRelease(for: link),
+              currentRelease.quality > preferredQuality,
+              let replacement = plannedRelease(season: season) else { return false }
+        return LinkInspector.markTorrent(replacement.link) != LinkInspector.markTorrent(link)
+    }
+
     /// The found release for the season: the best one of the chosen quality, or of the preferred one.
     private func plannedRelease(season: Int?) -> TorrentRelease? {
         guard let list = releases else { return nil }
@@ -107,13 +123,15 @@ struct DetailsView: View {
     private var plan: Plan? {
         let season = planSeason
         if let entry = continueEntry {
-            if (chosenQuality != nil || chosenVoice != nil), let release = plannedRelease(season: season),
+            if (chosenQuality != nil || chosenVoice != nil || shouldReplaceSaved(link: entry.link, season: season)),
+               let release = plannedRelease(season: season),
                LinkInspector.markTorrent(release.link) != entry.link {
                 return .release(release)
             }
             return .resume(entry)
         }
-        if chosenQuality == nil, chosenVoice == nil, let source = savedSource(season: season) {
+        if chosenQuality == nil, chosenVoice == nil, let source = savedSource(season: season),
+           !shouldReplaceSaved(link: source.link, season: season) {
             return .source(source)
         }
         return plannedRelease(season: season).map { Plan.release($0) }
@@ -414,7 +432,9 @@ struct DetailsView: View {
     }
 
     private func play(_ episode: KPEpisode) {
-        if chosenQuality == nil, chosenVoice == nil, let source = savedSource(season: episode.seasonNumber) {
+        if chosenQuality == nil, chosenVoice == nil,
+           let source = savedSource(season: episode.seasonNumber),
+           !shouldReplaceSaved(link: source.link, season: episode.seasonNumber) {
             coordinator.play(request(for: episode, link: source.link))
         } else {
             playRelease(for: episode)
@@ -439,7 +459,8 @@ struct DetailsView: View {
     /// suitable is found or auto start is off.
     private func playRelease(for episode: KPEpisode?) {
         let season = episode?.seasonNumber
-        if chosenQuality == nil, chosenVoice == nil, episode == nil, let source = sources.first {
+        if chosenQuality == nil, chosenVoice == nil, episode == nil, let source = sources.first,
+           !shouldReplaceSaved(link: source.link, season: season) {
             coordinator.play(request(for: nil, link: source.link))
             return
         }

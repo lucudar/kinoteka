@@ -67,6 +67,8 @@ struct PlayerHostView: View {
     @State private var attemptStartedAt = Date()
     @State private var playbackBeganAt = Date.distantPast
     @State private var playbackSuccessRecorded = false
+    @State private var firstFrameLogged = false
+    @State private var startupMs: Double?
     @State private var recoveryAttempts = 0
     @State private var recoveryTask: Task<Void, Never>?
     @State private var startupWatchdogTask: Task<Void, Never>?
@@ -114,7 +116,10 @@ struct PlayerHostView: View {
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
         .task {
-            if resolveTask == nil { startResolve() }
+            if resolveTask == nil {
+                await adaptInitialLinkForNetworkFromCache()
+                startResolve()
+            }
             await loadAlternatives()
         }
         .task { await loadArtwork() }
@@ -219,6 +224,8 @@ struct PlayerHostView: View {
             attemptedLinks.insert(canonicalLink(target))
             attemptStartedAt = Date()
             playbackSuccessRecorded = false
+            firstFrameLogged = false
+            startupMs = nil
             let release = release(matching: target)
             AppDiagnostics.shared.log("player", "Попытка запуска: \(release?.qualityText ?? "ссылка"), сеть \(network.title)")
             do {
@@ -333,6 +340,32 @@ struct PlayerHostView: View {
         if let key = request.itemKey { library.addSource(SavedSource(release: next), for: key) }
         AppDiagnostics.shared.log("fallback", "Автовыбор \(next.qualityText), сиды \(next.seeders), попытка \(fallbackCount)")
         return true
+    }
+
+    /// Continuing from Home does not open the film page first. Use only an
+    /// already cached search result here, so mobile-network adaptation is instant
+    /// and never delays playback with a new web request.
+    private func adaptInitialLinkForNetworkFromCache() async {
+        guard smartQuality, desiredQuality == nil,
+              network.connection == .cellular || network.isConstrained || network.isExpensive,
+              let item = request.item,
+              let result = await TorrentSearchService.shared.cachedResult(TorrentSearchQuery(item: item))
+        else { return }
+        alternatives = result.releases
+        guard let current = release(matching: link),
+              current.quality > effectivePreferredQuality else { return }
+        let candidates = PlaybackLearning.shared.candidates(alternatives,
+                                                             preferred: effectivePreferredQuality,
+                                                             season: releaseSeason,
+                                                             voice: desiredVoice,
+                                                             ceiling: effectivePreferredQuality)
+        guard let replacement = candidates.first(where: {
+            canonicalLink($0.link) != canonicalLink(link)
+        }) else { return }
+        link = LinkInspector.markTorrent(replacement.link)
+        wantedFileId = nil
+        if let key = request.itemKey { library.addSource(SavedSource(release: replacement), for: key) }
+        AppDiagnostics.shared.log("network", "Мобильная сеть: \(current.qualityText) → \(replacement.qualityText)")
     }
 
     /// Video files of the torrent without samples, in name order.
@@ -479,6 +512,12 @@ struct PlayerHostView: View {
         startupWatchdogTask?.cancel()
         startupWatchdogTask = nil
         playbackBeganAt = Date()
+        if !firstFrameLogged {
+            firstFrameLogged = true
+            let elapsed = Date().timeIntervalSince(attemptStartedAt) * 1_000
+            startupMs = elapsed
+            AppDiagnostics.shared.log("player", "Первый кадр за \(Int(elapsed)) мс")
+        }
         if model.isBuffering { scheduleRecovery(reason: "поток завис при запуске", delay: 12) }
         recordPlaybackSuccessIfPossible()
     }
@@ -486,9 +525,9 @@ struct PlayerHostView: View {
     private func recordPlaybackSuccessIfPossible() {
         guard !playbackSuccessRecorded, let current = release(matching: link) else { return }
         playbackSuccessRecorded = true
-        let startup = Date().timeIntervalSince(attemptStartedAt) * 1_000
+        let startup = startupMs ?? Date().timeIntervalSince(attemptStartedAt) * 1_000
         PlaybackLearning.shared.recordSuccess(current, startupMs: startup)
-        AppDiagnostics.shared.log("player", "Первый кадр за \(Int(startup)) мс, \(current.qualityText)")
+        AppDiagnostics.shared.log("learning", "Успешная раздача \(current.qualityText), \(Int(startup)) мс")
     }
 
     private func scheduleRecovery(reason: String, delay: TimeInterval) {
@@ -1301,6 +1340,8 @@ struct PlayerHostView: View {
         switchStatus = "Подключение…"
         attemptStartedAt = Date()
         playbackSuccessRecorded = false
+        firstFrameLogged = false
+        startupMs = nil
         let title = request.item?.title ?? request.title
         let poster = request.item?.posterURL
         let isEpisode = request.item?.kind == .series || files.count > 1
