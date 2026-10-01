@@ -39,7 +39,9 @@ struct DetailsView: View {
     private var sources: [SavedSource] { library.sources(for: item.key) }
     private var continueEntry: ContinueEntry? { library.continueEntry(for: item.key) }
     private var shareURL: URL {
-        URL(string: film?.webUrl ?? "") ?? URL(string: "https://www.kinopoisk.ru/film/\(item.id)/")!
+        URL(string: film?.webUrl ?? "")
+            ?? URL(string: "https://www.kinopoisk.ru/film/\(item.id)/")
+            ?? URL(fileURLWithPath: "/")
     }
     private var preferredQuality: ReleaseQuality {
         let configured = ReleaseQuality(rawValue: preferredRaw) ?? .fullHD
