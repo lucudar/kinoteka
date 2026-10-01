@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import ImageIO
 
 // MARK: - Image loading with memory + disk cache
 
@@ -8,9 +9,12 @@ final class ImageCache {
 
     private let memory = NSCache<NSURL, UIImage>()
     private let session: URLSession
+    private let lock = NSLock()
+    private var inFlight: [URL: Task<UIImage?, Never>] = [:]
 
     init() {
         memory.countLimit = 400
+        memory.totalCostLimit = 120 * 1024 * 1024
         let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("images", isDirectory: true)
         let config = URLSessionConfiguration.default
         config.urlCache = URLCache(memoryCapacity: 16 * 1024 * 1024, diskCapacity: 300 * 1024 * 1024, directory: dir)
@@ -25,10 +29,44 @@ final class ImageCache {
 
     func load(_ url: URL) async -> UIImage? {
         if let image = cached(url) { return image }
-        guard let (data, _) = try? await session.data(from: url), let image = UIImage(data: data) else { return nil }
-        let prepared = await image.byPreparingForDisplay() ?? image
-        memory.setObject(prepared, forKey: url as NSURL)
+        let task: Task<UIImage?, Never>
+        lock.lock()
+        if let existing = inFlight[url] {
+            task = existing
+        } else {
+            let session = session
+            task = Task {
+                guard let (data, _) = try? await session.data(from: url),
+                      let image = ImageCache.downsample(data, maxPixel: 1400) else { return nil }
+                return await image.byPreparingForDisplay() ?? image
+            }
+            inFlight[url] = task
+        }
+        lock.unlock()
+
+        let prepared = await task.value
+        lock.lock()
+        inFlight[url] = nil
+        lock.unlock()
+        guard let prepared = prepared else { return nil }
+        let cost = Int(prepared.size.width * prepared.scale * prepared.size.height * prepared.scale * 4)
+        memory.setObject(prepared, forKey: url as NSURL, cost: cost)
         return prepared
+    }
+
+    /// Posters from Kinopoisk can be several thousand pixels wide. Decoding them
+    /// at display size avoids large memory spikes while quickly scrolling.
+    private static func downsample(_ data: Data, maxPixel: Int) -> UIImage? {
+        let options = [kCGImageSourceShouldCache: false] as CFDictionary
+        guard let source = CGImageSourceCreateWithData(data as CFData, options) else { return nil }
+        let thumbnailOptions = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixel
+        ] as CFDictionary
+        guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbnailOptions) else { return nil }
+        return UIImage(cgImage: image)
     }
 }
 

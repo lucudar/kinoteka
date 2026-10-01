@@ -171,6 +171,7 @@ struct FavoriteChannelsScreen: View {
 
 struct SettingsView: View {
     @EnvironmentObject private var channels: ChannelsStore
+    @ObservedObject private var network = NetworkMonitor.shared
     @AppStorage(SettingsKeys.kpToken) private var token = ""
     @AppStorage(SettingsKeys.playlistURL) private var playlistURL = ""
     @AppStorage(SettingsKeys.autoNext) private var autoNext = true
@@ -179,11 +180,17 @@ struct SettingsView: View {
     @AppStorage(SettingsKeys.searchServer) private var searchServer = TorrentSearchService.defaultServer
     @AppStorage(SettingsKeys.searchApiKey) private var searchApiKey = ""
     @AppStorage(SettingsKeys.preferredQuality) private var preferredQuality = ReleaseQuality.fullHD.rawValue
+    @AppStorage(SettingsKeys.preferredVoice) private var preferredVoice = "auto"
     @AppStorage(SettingsKeys.autoPlayBest) private var autoPlayBest = true
     @AppStorage(SettingsKeys.prepareTorrent) private var prepareTorrent = true
+    @AppStorage(SettingsKeys.smartQuality) private var smartQuality = true
+    @AppStorage(SettingsKeys.automaticFallback) private var automaticFallback = true
+    @AppStorage(SettingsKeys.automaticRecovery) private var automaticRecovery = true
+    @AppStorage(SettingsKeys.preloadNextEpisode) private var preloadNextEpisode = true
     @State private var checkingSearch = false
     @State private var engineStatus = "Проверка…"
     @State private var cacheSize = ""
+    @State private var diagnosticsSize = ""
     @State private var message: String?
 
     var body: some View {
@@ -235,7 +242,16 @@ struct SettingsView: View {
                         Text(quality.title).tag(quality.rawValue)
                     }
                 }
+                Picker("Озвучка по умолчанию", selection: $preferredVoice) {
+                    Text("Авто").tag("auto")
+                    ForEach(VoiceKind.audioChoices, id: \.rawValue) { voice in
+                        Text(voice.title).tag(ReleaseVoiceOption.kind(voice).settingValue)
+                    }
+                }
+                Toggle("Автокачество по сети", isOn: $smartQuality)
                 Toggle("Готовить раздачу заранее", isOn: $prepareTorrent)
+                Toggle("Автоматически менять нерабочую раздачу", isOn: $automaticFallback)
+                LabeledContent("Текущая сеть", value: network.title)
                 LabeledContent("Сервер") {
                     TextField(TorrentSearchService.defaultServer, text: $searchServer)
                         .multilineTextAlignment(.trailing)
@@ -271,17 +287,19 @@ struct SettingsView: View {
             } header: {
                 Text("Поиск раздач")
             } footer: {
-                Text("Раздачи находятся сами, как в Zona: по названию и году через Jacred (публичный сервер jac.red, ключ не нужен). Можно указать свой Jacred или Jackett — для Jackett нужен API-ключ из его панели. «Смотреть» сразу запускает лучшую раздачу: качество по умолчанию, живые сиды, дубляж. Другое качество можно выбрать на странице фильма и прямо в плеере, все варианты — в «Раздачах».\n\n«Готовить раздачу заранее»: пока открыта страница фильма, его раздача уже подключается к пирам, и видео после «Смотреть» начинается быстрее. Тратит немного трафика.")
+                Text("«Автокачество по сети» ограничивает мобильную сеть до 720p; Wi‑Fi использует выбранное качество. При нерабочей раздаче приложение само попробует следующую подходящую. Запросы Jacred выполняются по очереди и повторяются после ограничения сервера.\n\n«Готовить раздачу заранее»: пока открыта страница фильма, его раздача уже подключается к пирам. Тратит немного трафика.")
             }
 
             Section {
                 Toggle("Автопереход к следующей серии", isOn: $autoNext)
                 Toggle("Запоминать скорость и пропорции", isOn: $savePlayerSettings)
                 Toggle("Звук в фоне", isOn: $backgroundAudio)
+                Toggle("Восстанавливать после зависания", isOn: $automaticRecovery)
+                Toggle("Готовить следующую серию", isOn: $preloadNextEpisode)
             } header: {
                 Text("Плеер")
             } footer: {
-                Text("«Звук в фоне»: если свернуть приложение или заблокировать iPhone, фильм продолжит играть звуком; пауза и перемотка — на экране блокировки и в Пункте управления. «Картинка в картинке» недоступна: плеер VLC её не поддерживает.")
+                Text("При зависании поток переподключится с сохранённого места, затем попробует более лёгкую раздачу. Следующая серия заранее получает небольшой начальный буфер только не в мобильной сети.")
             }
 
             Section {
@@ -333,6 +351,27 @@ struct SettingsView: View {
 
             Section {
                 HStack {
+                    Text("Размер журнала")
+                    Spacer()
+                    Text(diagnosticsSize)
+                        .foregroundStyle(Theme.secondary)
+                }
+                ShareLink(item: AppDiagnostics.shared.exportURL()) {
+                    Label("Поделиться отчётом", systemImage: "square.and.arrow.up")
+                }
+                Button("Очистить журнал", role: .destructive) {
+                    AppDiagnostics.shared.clear()
+                    diagnosticsSize = AppDiagnostics.shared.sizeText
+                    message = "Журнал диагностики очищен"
+                }
+            } header: {
+                Text("Диагностика")
+            } footer: {
+                Text("Отчёт хранится только на iPhone: последние этапы запуска, восстановления и системные отчёты о сбоях MetricKit. Он отправляется только через кнопку выше.")
+            }
+
+            Section {
+                HStack {
                     Text("Версия")
                     Spacer()
                     Text(AppInfo.version)
@@ -349,6 +388,7 @@ struct SettingsView: View {
         }
         .task {
             cacheSize = KPClient.shared.cacheSizeText
+            diagnosticsSize = AppDiagnostics.shared.sizeText
             await refreshStatus()
         }
     }
@@ -414,7 +454,7 @@ struct AboutView: View {
                     }
                 }
                 Text("Личный медиаплеер в стиле Zona для iPhone.")
-                Text("• Каталог, поиск, описания, рейтинги, сезоны и актёры — из неофициального API Кинопоиска.\n• Раздачи находятся автоматически (Jacred / Jackett), как в Zona: лучшая включается кнопкой «Смотреть», качество можно выбрать на странице фильма и в плеере, остальные варианты — в «Раздачах». Видео идёт через встроенный TorrServer MatriX без скачивания целиком.\n• Свои источники: magnet-ссылки, .torrent, прямые ссылки и HLS.\n• ТВ-каналы — из вашего M3U-плейлиста.\n• Плеер на VLCKit: MKV, HEVC, AC3/DTS, выбор озвучки и субтитров, скорость, пропорции, перемотка, звук в фоне и управление с экрана блокировки.")
+                Text("• Каталог, поиск, описания, рейтинги, сезоны и актёры — из неофициального API Кинопоиска.\n• Раздачи находятся автоматически через Jacred / Jackett. Можно выбрать качество и озвучку; нерабочая раздача заменяется автоматически.\n• Автокачество учитывает тип сети, удачные раздачи запоминаются, следующая серия готовится заранее.\n• Плеер VLCKit восстанавливает зависший поток с сохранённого места.\n• Локальный журнал и системные отчёты о сбоях экспортируются только вручную из настроек.\n• Свои magnet, .torrent, прямые ссылки, HLS и M3U-телеканалы.")
                     .font(.subheadline)
                     .foregroundStyle(Theme.secondary)
                 Text("Приложение не содержит и не распространяет контент.")

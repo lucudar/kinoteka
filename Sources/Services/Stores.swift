@@ -338,13 +338,20 @@ struct PlayRequest: Identifiable {
     var startTime: Int32? = nil
     /// Release-level voice choice to apply to a matching VLC audio track after startup.
     var preferredAudio: String? = nil
+    /// Requested release quality and voice, used by automatic fallback.
+    var requestedQuality: ReleaseQuality? = nil
+    var requestedVoice: ReleaseVoiceOption? = nil
 }
 
 extension PlayRequest {
     /// "Продолжить": the same file (or the same episode) of the release watched before.
     init(continuing entry: ContinueEntry, item: MediaItem? = nil) {
+        let voice = ReleaseVoiceOption.fromSetting(
+            UserDefaults.standard.string(forKey: SettingsKeys.preferredVoice) ?? "auto"
+        )
         self.init(title: entry.title, link: entry.link, itemKey: entry.itemKey, item: item ?? entry.item,
-                  preferredFileId: entry.fileId, season: entry.season, episode: entry.episode)
+                  preferredFileId: entry.fileId, season: entry.season, episode: entry.episode,
+                  preferredAudio: voice?.title, requestedVoice: voice)
     }
 }
 

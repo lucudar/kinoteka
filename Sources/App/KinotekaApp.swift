@@ -16,11 +16,18 @@ struct KinotekaApp: App {
             SettingsKeys.backgroundAudio: true,
             SettingsKeys.searchServer: TorrentSearchService.defaultServer,
             SettingsKeys.preferredQuality: ReleaseQuality.fullHD.rawValue,
+            SettingsKeys.preferredVoice: "auto",
             SettingsKeys.autoPlayBest: true,
-            SettingsKeys.prepareTorrent: true
+            SettingsKeys.prepareTorrent: true,
+            SettingsKeys.smartQuality: true,
+            SettingsKeys.automaticFallback: true,
+            SettingsKeys.automaticRecovery: true,
+            SettingsKeys.preloadNextEpisode: true
         ])
         URLCache.shared = URLCache(memoryCapacity: 64 * 1024 * 1024, diskCapacity: 512 * 1024 * 1024)
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
+        AppDiagnostics.shared.start()
+        _ = NetworkMonitor.shared
         TorrServer.shared.start()
     }
 
@@ -67,9 +74,11 @@ struct RootView: View {
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
+                AppDiagnostics.shared.log("app", "Приложение активно")
                 TorrServer.shared.start()
             } else {
                 library.persist()
+                AppDiagnostics.shared.log("app", "Приложение ушло в фон")
             }
         }
         .fullScreenCover(item: $coordinator.request) { request in
