@@ -44,6 +44,7 @@ struct PlayerHostView: View {
     @State private var bufferInfo = ""
     @State private var closing = false
     @State private var addedAudio: Set<Int> = []
+    @State private var preferredAudioApplied = false
     /// The link that plays: the requested one, or another release picked in "Качество".
     @State private var link: String
     @State private var wantedFileId: Int?
@@ -116,6 +117,9 @@ struct PlayerHostView: View {
         }
         .onChange(of: model.isPlaying) { _, playing in
             if playing { bumpControls() } else { withAnimation { showControls = true } }
+        }
+        .onChange(of: model.audioTracks) { _, _ in
+            applyPreferredAudio()
         }
         .onChange(of: showOptions) { _, open in
             if !open { bumpControls() }
@@ -275,6 +279,7 @@ struct PlayerHostView: View {
     private func start(url: URL, slaves: [(URL, VLCMediaPlaybackSlaveType)], startAt: Int32? = nil) {
         streamURL = url
         phase = .playing
+        preferredAudioApplied = false
         var position: Int32 = 0
         if !request.isLive {
             if let wanted = startAt {
@@ -298,6 +303,17 @@ struct PlayerHostView: View {
         lastResumeSave = Date()
         lastContinueSave = Date.distantPast
         bumpControls()
+    }
+
+    /// Selects the VLC track matching the voice-over chosen on the film page.
+    /// If a torrent does not label its tracks, VLC's default remains unchanged.
+    private func applyPreferredAudio() {
+        guard !preferredAudioApplied, let preferred = request.preferredAudio?.nonEmpty else { return }
+        let names = model.audioTracks.map(\.name)
+        guard let index = AudioTrackMatcher.best(in: names, preferred: preferred),
+              model.audioTracks.indices.contains(index) else { return }
+        preferredAudioApplied = true
+        model.setAudio(model.audioTracks[index].id)
     }
 
     private func retryPlayback() {

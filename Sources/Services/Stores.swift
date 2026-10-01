@@ -336,6 +336,8 @@ struct PlayRequest: Identifiable {
     var referrer: String? = nil
     /// Start from this position (ms) instead of the saved one: the same film in another release.
     var startTime: Int32? = nil
+    /// Release-level voice choice to apply to a matching VLC audio track after startup.
+    var preferredAudio: String? = nil
 }
 
 extension PlayRequest {

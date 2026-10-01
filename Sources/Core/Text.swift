@@ -89,3 +89,44 @@ enum TextMatch {
         return (" " + normalized(text) + " ").contains(" " + needle + " ")
     }
 }
+
+/// Matches a release-level voice choice to VLC's audio-track names.
+enum AudioTrackMatcher {
+    static func best(in tracks: [String], preferred: String) -> Int? {
+        let wanted = TextMatch.normalized(preferred)
+        guard !wanted.isEmpty else { return nil }
+        let aliases = aliasWords(for: wanted)
+        return tracks.enumerated().max { lhs, rhs in
+            score(lhs.element, wanted: wanted, aliases: aliases) < score(rhs.element, wanted: wanted, aliases: aliases)
+        }.flatMap { score($0.element, wanted: wanted, aliases: aliases) > 0 ? $0.offset : nil }
+    }
+
+    private static func score(_ track: String, wanted: String, aliases: [String]) -> Int {
+        let normalized = TextMatch.normalized(track)
+        if normalized == wanted { return 100 }
+        if normalized.contains(wanted) { return 80 }
+        for alias in aliases where TextMatch.containsPhrase(normalized, alias) {
+            return 60
+        }
+        return 0
+    }
+
+    private static func aliasWords(for wanted: String) -> [String] {
+        switch wanted {
+        case TextMatch.normalized(VoiceKind.dub.title):
+            return ["дуб", "дублированный", "dub"]
+        case TextMatch.normalized(VoiceKind.multi.title):
+            return ["многоголосый", "многоголосный", "mvo", "multi voice"]
+        case TextMatch.normalized(VoiceKind.two.title):
+            return ["двухголосый", "двухголосный", "dvo", "two voice"]
+        case TextMatch.normalized(VoiceKind.single.title):
+            return ["одноголосый", "одноголосный", "vo", "single voice"]
+        case TextMatch.normalized(VoiceKind.author.title):
+            return ["авторский", "avo", "author"]
+        case TextMatch.normalized(VoiceKind.amateur.title):
+            return ["любительский", "amateur"]
+        default:
+            return []
+        }
+    }
+}

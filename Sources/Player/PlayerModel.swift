@@ -145,7 +145,7 @@ final class VLCPlayerModel: ObservableObject {
     private func startTimer() {
         timer?.invalidate()
         let t = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated {
+            Task { @MainActor [weak self] in
                 self?.tick()
             }
         }
@@ -338,32 +338,32 @@ final class VLCPlayerModel: ObservableObject {
             UIApplication.shared.beginReceivingRemoteControlEvents()
             let center = MPRemoteCommandCenter.shared()
             center.togglePlayPauseCommand.addTarget { [weak self] _ in
-                MainActor.assumeIsolated { self?.togglePlay() }
+                Task { @MainActor [weak self] in self?.togglePlay() }
                 return .success
             }
             center.playCommand.addTarget { [weak self] _ in
-                MainActor.assumeIsolated { self?.resume() }
+                Task { @MainActor [weak self] in self?.resume() }
                 return .success
             }
             center.pauseCommand.addTarget { [weak self] _ in
-                MainActor.assumeIsolated { self?.pause() }
+                Task { @MainActor [weak self] in self?.pause() }
                 return .success
             }
             center.skipForwardCommand.preferredIntervals = [10]
             center.skipForwardCommand.addTarget { [weak self] _ in
-                MainActor.assumeIsolated { self?.jump(10) }
+                Task { @MainActor [weak self] in self?.jump(10) }
                 return .success
             }
             center.skipBackwardCommand.preferredIntervals = [10]
             center.skipBackwardCommand.addTarget { [weak self] _ in
-                MainActor.assumeIsolated { self?.jump(-10) }
+                Task { @MainActor [weak self] in self?.jump(-10) }
                 return .success
             }
             center.changePlaybackPositionCommand.addTarget { [weak self] event in
                 guard let position = event as? MPChangePlaybackPositionCommandEvent,
                       position.positionTime.isFinite else { return .commandFailed }
                 let ms = Int32(max(0, min(position.positionTime * 1000, Double(Int32.max))))
-                MainActor.assumeIsolated { self?.seek(ms: ms) }
+                Task { @MainActor [weak self] in self?.seek(ms: ms) }
                 return .success
             }
         }
@@ -489,10 +489,9 @@ final class VLCPlayerModel: ObservableObject {
         timer?.invalidate()
         timer = nil
         disableRemoteControls()
-        let p = player
-        DispatchQueue.global(qos: .userInitiated).async {
-            p.stop()
-        }
+        // VLCKit is also read from this actor by the timer and track controls.
+        // Stopping it on another queue could race those reads and crash on close.
+        player.stop()
     }
 }
 

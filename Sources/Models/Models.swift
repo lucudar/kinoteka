@@ -59,7 +59,8 @@ extension KeyedDecodingContainer where K == AnyKey {
         for name in keys {
             let key = AnyKey(name)
             if let value = try? decodeIfPresent(Int.self, forKey: key) { return value }
-            if let value = try? decodeIfPresent(Double.self, forKey: key) { return Int(value) }
+            if let value = try? decodeIfPresent(Double.self, forKey: key),
+               value.isFinite, abs(value) < 9.0e15 { return Int(value) }
             if let text = try? decodeIfPresent(String.self, forKey: key), let value = Int(text.prefix(4)) { return value }
         }
         return nil

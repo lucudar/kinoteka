@@ -34,7 +34,16 @@ struct TSStatus: Decodable {
     }
 
     var speedText: String {
-        ByteCountFormatter.string(fromByteCount: Int64(downloadSpeed ?? 0), countStyle: .file) + "/с"
+        let value = downloadSpeed ?? 0
+        let bytes: Int64
+        if !value.isFinite || value <= 0 {
+            bytes = 0
+        } else if value >= Double(Int64.max) {
+            bytes = Int64.max
+        } else {
+            bytes = Int64(value)
+        }
+        return ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file) + "/с"
     }
 }
 
