@@ -9,12 +9,18 @@ struct PlayerHostView: View {
     @EnvironmentObject private var coordinator: PlayerCoordinator
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var model = VLCPlayerModel()
+    @ObservedObject private var network = NetworkMonitor.shared
 
     @AppStorage(SettingsKeys.autoNext) private var autoNext = true
     @AppStorage(SettingsKeys.savePlayerSettings) private var savePlayerSettings = true
     @AppStorage(SettingsKeys.playerRate) private var savedRate = 1.0
     @AppStorage(SettingsKeys.playerAspect) private var savedAspect = AspectMode.fit.rawValue
     @AppStorage(SettingsKeys.backgroundAudio) private var backgroundAudio = true
+    @AppStorage(SettingsKeys.preferredQuality) private var preferredQualityRaw = ReleaseQuality.fullHD.rawValue
+    @AppStorage(SettingsKeys.smartQuality) private var smartQuality = true
+    @AppStorage(SettingsKeys.automaticFallback) private var automaticFallback = true
+    @AppStorage(SettingsKeys.automaticRecovery) private var automaticRecovery = true
+    @AppStorage(SettingsKeys.preloadNextEpisode) private var preloadNextEpisode = true
 
     enum Phase: Equatable {
         case resolving
@@ -45,6 +51,8 @@ struct PlayerHostView: View {
     @State private var closing = false
     @State private var addedAudio: Set<Int> = []
     @State private var preferredAudioApplied = false
+    @State private var desiredQuality: ReleaseQuality?
+    @State private var desiredVoice: ReleaseVoiceOption?
     /// The link that plays: the requested one, or another release picked in "Качество".
     @State private var link: String
     @State private var wantedFileId: Int?
@@ -53,6 +61,17 @@ struct PlayerHostView: View {
     /// Where to start the first file (continuing in another release).
     @State private var pendingStart: Int32?
     @State private var resolveTask: Task<Void, Never>?
+    @State private var attemptedLinks: Set<String> = []
+    @State private var fallbackCount = 0
+    @State private var attemptStartedAt = Date()
+    @State private var playbackBeganAt = Date.distantPast
+    @State private var playbackSuccessRecorded = false
+    @State private var recoveryAttempts = 0
+    @State private var recoveryTask: Task<Void, Never>?
+    @State private var startupWatchdogTask: Task<Void, Never>?
+    @State private var recoveryText: String?
+    @State private var nextPreparedID: Int?
+    @State private var preloadTask: Task<Void, Never>?
     /// Releases found for the film: the choices of "Качество".
     @State private var alternatives: [TorrentRelease] = []
     @State private var alternativesLoaded = false
@@ -69,6 +88,8 @@ struct PlayerHostView: View {
         _wantedSeason = State(initialValue: request.season)
         _wantedEpisode = State(initialValue: request.episode)
         _pendingStart = State(initialValue: request.startTime)
+        _desiredQuality = State(initialValue: request.requestedQuality)
+        _desiredVoice = State(initialValue: request.requestedVoice)
     }
 
     private static let audioExtensions: Set<String> = ["mka", "ac3", "eac3", "dts", "aac", "mp3", "flac", "ogg", "opus", "m4a", "wav"]
@@ -111,12 +132,28 @@ struct PlayerHostView: View {
         }
         .onChange(of: model.timeMs) { _, _ in
             periodicSave()
+            prepareNextEpisodeIfNeeded()
         }
         .onChange(of: model.ended) { _, ended in
             if ended { handleEnded() }
         }
         .onChange(of: model.isPlaying) { _, playing in
             if playing { bumpControls() } else { withAnimation { showControls = true } }
+        }
+        .onChange(of: model.started) { _, started in
+            if started { playbackDidStart() }
+        }
+        .onChange(of: model.failed) { _, failed in
+            if failed { scheduleRecovery(reason: "ошибка VLC", delay: 1) }
+        }
+        .onChange(of: model.isBuffering) { _, buffering in
+            if buffering && model.started {
+                scheduleRecovery(reason: "поток завис", delay: 12)
+            } else if !buffering {
+                recoveryTask?.cancel()
+                recoveryTask = nil
+                recoveryText = nil
+            }
         }
         .onChange(of: model.audioTracks) { _, _ in
             applyPreferredAudio()
@@ -132,6 +169,8 @@ struct PlayerHostView: View {
             case .active:
                 model.setVideoEnabled(true)
             case .background:
+                recoveryTask?.cancel()
+                startupWatchdogTask?.cancel()
                 saveProgress(final: true)
                 if backgroundAudio && phase == .playing {
                     // Keep the sound playing (lock screen, other apps); the picture is not needed.
@@ -156,67 +195,142 @@ struct PlayerHostView: View {
 
     // MARK: - Resolving the link
 
-    private func startResolve() {
-        resolveTask?.cancel()
-        resolveTask = Task { await resolve() }
+    private var effectivePreferredQuality: ReleaseQuality {
+        if let desiredQuality = desiredQuality { return desiredQuality }
+        let configured = ReleaseQuality(rawValue: preferredQualityRaw) ?? .fullHD
+        return PlaybackPolicy.effectiveQuality(configured, connection: network.connection, smart: smartQuality)
     }
 
-    private func resolve() async {
-        let target = link.trimmed
+    private func startResolve(resetAttempts: Bool = true) {
+        resolveTask?.cancel()
+        if resetAttempts {
+            attemptedLinks.removeAll()
+            fallbackCount = 0
+        }
+        resolveTask = Task { await resolveWithFallback() }
+    }
+
+    private func resolveWithFallback() async {
+        phase = .resolving
+        while !Task.isCancelled && !closing {
+            let target = link.trimmed
+            attemptedLinks.insert(canonicalLink(target))
+            attemptStartedAt = Date()
+            playbackSuccessRecorded = false
+            let release = release(matching: target)
+            AppDiagnostics.shared.log("player", "Попытка запуска: \(release?.qualityText ?? "ссылка"), сеть \(network.title)")
+            do {
+                try await resolve(target)
+                return
+            } catch {
+                if Task.isCancelled || closing { return }
+                PlaybackLearning.shared.recordFailure(release)
+                AppDiagnostics.shared.log("player", "Запуск не удался: \(error.localizedDescription)")
+                guard await selectAutomaticFallback(preferLowerQuality: false) else {
+                    phase = .failed(error.localizedDescription)
+                    return
+                }
+            }
+        }
+    }
+
+    private func resolve(_ target: String) async throws {
         switch LinkInspector.kind(of: target) {
         case .direct:
-            guard let url = URL(string: target) else {
-                phase = .failed("Некорректная ссылка.")
-                return
-            }
+            guard let url = URL(string: target) else { throw TorrServerError.server("Некорректная ссылка.") }
             streamKey = target
             start(url: url, slaves: [])
         case .torrent:
-            await resolveTorrent(LinkInspector.stripMarker(target))
+            try await resolveTorrent(LinkInspector.stripMarker(target))
         }
     }
 
-    private func resolveTorrent(_ torrent: String) async {
+    private func resolveTorrent(_ torrent: String) async throws {
         phase = .resolving
-        do {
-            statusText = "Запуск торрент-движка…"
-            detailText = ""
-            try await TorrServer.shared.ensureRunning()
-            statusText = "Получение данных торрента…"
-            let status = try await TorrServer.shared.add(link: torrent, title: request.item?.title ?? request.title, poster: request.item?.posterURL)
-            try Task.checkCancellation()
-            guard let h = status.hash, !h.isEmpty else {
-                throw TorrServerError.server("не удалось добавить торрент")
-            }
-            hash = h
-            // Torrents that are not needed now (played before, prepared for another film) are freed.
-            TorrentWarmup.shared.playbackStarted(hash: h)
-            let all = try await TorrServer.shared.waitForFiles(hash: h) { s in
+        statusText = fallbackCount > 0 ? "Пробуем запасную раздачу…" : "Запуск торрент-движка…"
+        detailText = ""
+        try await TorrServer.shared.ensureRunning()
+        statusText = "Получение данных торрента…"
+        let status = try await TorrServer.shared.add(link: torrent, title: request.item?.title ?? request.title, poster: request.item?.posterURL)
+        try Task.checkCancellation()
+        guard let h = status.hash, !h.isEmpty else {
+            throw TorrServerError.server("не удалось добавить торрент")
+        }
+        hash = h
+        // Torrents that are not needed now (played before, prepared for another film) are freed.
+        TorrentWarmup.shared.playbackStarted(hash: h)
+        let timeout: TimeInterval = automaticFallback && canSwitchRelease ? (fallbackCount == 0 ? 10 : 18) : 120
+        let all: [TorrentFile]
+        if !status.files.isEmpty {
+            all = status.files
+        } else {
+            all = try await TorrServer.shared.waitForFiles(hash: h, timeout: timeout) { s in
                 statusText = "Подключение к пирам…"
                 detailText = s.peersText
             }
-            try Task.checkCancellation()
-            allFiles = all
-            let list = videoFiles(all)
-            guard !list.isEmpty else { throw TorrServerError.noVideo }
-            files = list
-
-            if let id = wantedFileId, let file = list.first(where: { $0.id == id }) {
-                play(file, startAt: takePendingStart())
-            } else if let episode = wantedEpisode, let file = EpisodeMatcher.find(in: list, season: wantedSeason, episode: episode) {
-                play(file, startAt: takePendingStart())
-            } else if list.count == 1 {
-                play(list[0], startAt: takePendingStart())
-            } else if wantedEpisode == nil, request.item?.kind != .series, let largest = dominantFile(list) {
-                play(largest, startAt: takePendingStart())
-            } else {
-                chooserNote = wantedEpisode != nil ? "Не удалось найти серию автоматически — выберите файл." : nil
-                phase = .choosing
-            }
-        } catch {
-            if Task.isCancelled || closing { return }
-            phase = .failed(error.localizedDescription)
         }
+        try Task.checkCancellation()
+        allFiles = all
+        let list = videoFiles(all)
+        guard !list.isEmpty else { throw TorrServerError.noVideo }
+        files = list
+
+        if let id = wantedFileId, let file = list.first(where: { $0.id == id }) {
+            play(file, startAt: takePendingStart())
+        } else if let episode = wantedEpisode,
+                  let file = EpisodeMatcher.find(in: list, season: wantedSeason, episode: episode) {
+            play(file, startAt: takePendingStart())
+        } else if wantedEpisode != nil {
+            throw SwitchFailure.noSameFile
+        } else if list.count == 1 {
+            play(list[0], startAt: takePendingStart())
+        } else if request.item?.kind != .series, let largest = dominantFile(list) {
+            play(largest, startAt: takePendingStart())
+        } else {
+            chooserNote = nil
+            phase = .choosing
+        }
+    }
+
+    private func canonicalLink(_ value: String) -> String {
+        let text = value.trimmed
+        return LinkInspector.kind(of: text) == .torrent ? LinkInspector.markTorrent(LinkInspector.stripMarker(text)) : text
+    }
+
+    private func release(matching value: String) -> TorrentRelease? {
+        let key = canonicalLink(value)
+        if let hash = LinkInspector.infoHash(of: LinkInspector.stripMarker(value))?.lowercased(),
+           let match = alternatives.first(where: { $0.hash?.lowercased() == hash }) {
+            return match
+        }
+        return alternatives.first { canonicalLink($0.link) == key }
+    }
+
+    /// Picks the next learned, live release. After repeated stalls it first tries
+    /// a lower quality, but falls back to any working candidate if necessary.
+    private func selectAutomaticFallback(preferLowerQuality: Bool) async -> Bool {
+        guard automaticFallback, canSwitchRelease, fallbackCount < 3 else { return false }
+        await loadAlternatives()
+        guard !alternatives.isEmpty else { return false }
+
+        let currentQuality = release(matching: link)?.quality ?? effectivePreferredQuality
+        let ceiling = preferLowerQuality ? PlaybackPolicy.lowerQuality(than: currentQuality) : nil
+        let candidates = PlaybackLearning.shared.candidates(alternatives,
+                                                             preferred: effectivePreferredQuality,
+                                                             season: releaseSeason,
+                                                             voice: desiredVoice,
+                                                             ceiling: ceiling)
+        guard let next = candidates.first(where: { !attemptedLinks.contains(canonicalLink($0.link)) }) else {
+            return false
+        }
+        fallbackCount += 1
+        link = LinkInspector.markTorrent(next.link)
+        wantedFileId = nil
+        statusText = preferLowerQuality ? "Пробуем более лёгкую раздачу…" : "Пробуем запасную раздачу…"
+        detailText = next.summary
+        if let key = request.itemKey { library.addSource(SavedSource(release: next), for: key) }
+        AppDiagnostics.shared.log("fallback", "Автовыбор \(next.qualityText), сиды \(next.seeders), попытка \(fallbackCount)")
+        return true
     }
 
     /// Video files of the torrent without samples, in name order.
@@ -242,6 +356,9 @@ struct PlayerHostView: View {
     /// `startAt`: position in the file (another release of what played); otherwise the saved one.
     private func play(_ file: TorrentFile, startAt: Int32? = nil) {
         guard let h = hash, let url = TorrServer.shared.streamURL(hash: h, file: file) else { return }
+        preloadTask?.cancel()
+        preloadTask = nil
+        nextPreparedID = nil
         currentFile = file
         streamKey = "\(h):\(file.id)"
         addedAudio = []
@@ -279,6 +396,7 @@ struct PlayerHostView: View {
     private func start(url: URL, slaves: [(URL, VLCMediaPlaybackSlaveType)], startAt: Int32? = nil) {
         streamURL = url
         phase = .playing
+        recoveryText = nil
         preferredAudioApplied = false
         var position: Int32 = 0
         if !request.isLive {
@@ -302,29 +420,45 @@ struct PlayerHostView: View {
                                    isLive: request.isLive)
         lastResumeSave = Date()
         lastContinueSave = Date.distantPast
+        startupWatchdogTask?.cancel()
+        if automaticRecovery && !request.isLive {
+            startupWatchdogTask = Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 12_000_000_000)
+                guard !Task.isCancelled, phase == .playing, !model.started, !closing else { return }
+                await recoverPlayback(reason: "видео не началось")
+            }
+        }
         bumpControls()
     }
 
     /// Selects the VLC track matching the voice-over chosen on the film page.
     /// If a torrent does not label its tracks, VLC's default remains unchanged.
     private func applyPreferredAudio() {
-        guard !preferredAudioApplied, let preferred = request.preferredAudio?.nonEmpty else { return }
+        let preferred = desiredVoice?.title
+            ?? request.preferredAudio?.nonEmpty
+            ?? PlaybackLearning.shared.preferredAudio(for: request.itemKey)
+        guard !preferredAudioApplied, let preferred = preferred else { return }
         let names = model.audioTracks.map(\.name)
         guard let index = AudioTrackMatcher.best(in: names, preferred: preferred),
               model.audioTracks.indices.contains(index) else { return }
         preferredAudioApplied = true
-        model.setAudio(model.audioTracks[index].id)
+        selectAudio(model.audioTracks[index], remember: true)
+    }
+
+    private func selectAudio(_ track: MediaTrack, remember: Bool) {
+        model.setAudio(track.id)
+        if remember {
+            PlaybackLearning.shared.rememberAudio(track.name, for: request.itemKey)
+            AppDiagnostics.shared.log("audio", "Выбрана дорожка \(track.name)")
+        }
     }
 
     private func retryPlayback() {
-        guard let url = streamURL else {
-            startResolve()
-            return
-        }
-        if model.timeMs > 0 && !request.isLive {
-            library.setResume(model.timeMs, for: streamKey)
-        }
-        start(url: url, slaves: currentFile.map { subtitleSlaves(for: $0) } ?? [])
+        recoveryAttempts = 0
+        if model.timeMs > 0 && !request.isLive { pendingStart = model.timeMs }
+        wantedFileId = currentFile?.id
+        model.stop()
+        startResolve()
     }
 
     private func switchTo(_ file: TorrentFile) {
@@ -336,6 +470,87 @@ struct PlayerHostView: View {
     private var nextFile: TorrentFile? {
         guard let current = currentFile, files.count > 1 else { return nil }
         return EpisodeMatcher.next(after: current, in: files)
+    }
+
+    private func playbackDidStart() {
+        startupWatchdogTask?.cancel()
+        startupWatchdogTask = nil
+        playbackBeganAt = Date()
+        if model.isBuffering { scheduleRecovery(reason: "поток завис при запуске", delay: 12) }
+        recordPlaybackSuccessIfPossible()
+    }
+
+    private func recordPlaybackSuccessIfPossible() {
+        guard !playbackSuccessRecorded, let current = release(matching: link) else { return }
+        playbackSuccessRecorded = true
+        let startup = Date().timeIntervalSince(attemptStartedAt) * 1_000
+        PlaybackLearning.shared.recordSuccess(current, startupMs: startup)
+        AppDiagnostics.shared.log("player", "Первый кадр за \(Int(startup)) мс, \(current.qualityText)")
+    }
+
+    private func scheduleRecovery(reason: String, delay: TimeInterval) {
+        guard automaticRecovery, !request.isLive, phase == .playing, !closing else { return }
+        recoveryTask?.cancel()
+        recoveryTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard !Task.isCancelled, !closing, phase == .playing,
+                  model.failed || model.isBuffering else { return }
+            await recoverPlayback(reason: reason)
+        }
+    }
+
+    private func recoverPlayback(reason: String) async {
+        guard automaticRecovery, !request.isLive, !closing else { return }
+        recoveryAttempts += 1
+        let position = model.timeMs
+        saveProgress(final: true)
+        if recoveryAttempts == 1 {
+            PlaybackLearning.shared.recordFailure(release(matching: link))
+        }
+        AppDiagnostics.shared.log("recovery", "\(reason), попытка \(recoveryAttempts), позиция \(position)")
+
+        if !model.started, await selectAutomaticFallback(preferLowerQuality: false) {
+            recoveryText = "Пробуем запасную раздачу…"
+            pendingStart = position
+            wantedFileId = nil
+            model.stop()
+            startResolve(resetAttempts: false)
+            return
+        }
+
+        if recoveryAttempts <= 2 {
+            recoveryText = "Восстанавливаем поток…"
+            pendingStart = position
+            wantedFileId = currentFile?.id
+            model.stop()
+            startResolve(resetAttempts: false)
+            return
+        }
+
+        if await selectAutomaticFallback(preferLowerQuality: true) {
+            recoveryText = "Подбираем более стабильную раздачу…"
+            pendingStart = position
+            wantedFileId = nil
+            model.stop()
+            startResolve(resetAttempts: false)
+        } else {
+            recoveryText = nil
+        }
+    }
+
+    private func prepareNextEpisodeIfNeeded() {
+        guard preloadNextEpisode, !request.isLive, model.started,
+              network.connection != .cellular, network.connection != .offline,
+              !network.isExpensive, !network.isConstrained,
+              model.lengthMs > 0, model.lengthMs - model.timeMs < 90_000,
+              let next = nextFile, nextPreparedID != next.id,
+              let h = hash else { return }
+        nextPreparedID = next.id
+        preloadTask?.cancel()
+        preloadTask = Task {
+            AppDiagnostics.shared.log("series", "Подготовка \(fileLabel(next))")
+            await TorrServer.shared.prefetch(hash: h, file: next)
+        }
     }
 
     private func fileLabel(_ file: TorrentFile) -> String {
@@ -351,6 +566,10 @@ struct PlayerHostView: View {
     private func periodicSave() {
         guard !request.isLive, model.started, !streamKey.isEmpty else { return }
         let now = Date()
+        if !model.isBuffering, recoveryAttempts > 0,
+           now.timeIntervalSince(playbackBeganAt) > 60 {
+            recoveryAttempts = 0
+        }
         if now.timeIntervalSince(lastResumeSave) >= 5 {
             lastResumeSave = now
             library.setResume(model.timeMs, for: streamKey)
@@ -402,6 +621,9 @@ struct PlayerHostView: View {
 
     private func handleEnded() {
         cancelSwitch()
+        recoveryTask?.cancel()
+        startupWatchdogTask?.cancel()
+        preloadTask?.cancel()
         saveProgress(final: true)
         if request.isLive { return }
         if autoNext, let next = nextFile {
@@ -414,6 +636,9 @@ struct PlayerHostView: View {
     private func close() {
         guard !closing else { return }
         closing = true
+        recoveryTask?.cancel()
+        startupWatchdogTask?.cancel()
+        preloadTask?.cancel()
         saveProgress(final: true)
         model.stop()
         coordinator.request = nil
@@ -422,6 +647,9 @@ struct PlayerHostView: View {
     private func finish() {
         resolveTask?.cancel()
         switchTask?.cancel()
+        recoveryTask?.cancel()
+        startupWatchdogTask?.cancel()
+        preloadTask?.cancel()
         if !closing {
             closing = true
             saveProgress(final: true)
@@ -617,6 +845,22 @@ struct PlayerHostView: View {
                 .padding(.top, showControls ? 64 : 16)
                 .padding(.horizontal, 20)
                 .transition(.opacity)
+            }
+            if let recoveryText = recoveryText, switching == nil {
+                VStack {
+                    HStack(spacing: 10) {
+                        ProgressView().tint(.white)
+                        Text(recoveryText)
+                            .font(.subheadline.weight(.semibold))
+                    }
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    .background(Color.black.opacity(0.75), in: Capsule())
+                    Spacer()
+                }
+                .padding(.top, showControls ? 64 : 16)
+                .padding(.horizontal, 20)
             }
         }
     }
@@ -849,7 +1093,7 @@ struct PlayerHostView: View {
                     }
                     ForEach(model.audioTracks) { track in
                         checkRow(track.name, selected: track.id == model.currentAudio) {
-                            model.setAudio(track.id)
+                            selectAudio(track, remember: true)
                         }
                     }
                 }
@@ -939,6 +1183,8 @@ struct PlayerHostView: View {
         // Usually instant: the film page has searched already.
         if let result = try? await TorrentSearchService.shared.search(TorrentSearchQuery(item: item)) {
             alternatives = result.releases
+            AppDiagnostics.shared.log("search", "Для плеера доступно раздач: \(result.releases.count)")
+            if model.started { recordPlaybackSuccessIfPossible() }
         }
         alternativesLoaded = true
     }
@@ -1032,6 +1278,7 @@ struct PlayerHostView: View {
         showOptions = false
         showQuality = false
         guard newLink != link else { return }
+        desiredQuality = release.quality
         if phase == .playing {
             hotSwitch(to: release, link: newLink)
         } else {
@@ -1049,6 +1296,8 @@ struct PlayerHostView: View {
         cancelSwitch()
         switching = release
         switchStatus = "Подключение…"
+        attemptStartedAt = Date()
+        playbackSuccessRecorded = false
         let title = request.item?.title ?? request.title
         let poster = request.item?.posterURL
         let isEpisode = request.item?.kind == .series || files.count > 1
@@ -1086,6 +1335,7 @@ struct PlayerHostView: View {
                 saveProgress(final: true)
                 if let key = request.itemKey { library.addSource(SavedSource(release: release), for: key) }
                 link = newLink
+                attemptedLinks.insert(canonicalLink(newLink))
                 wantedFileId = nil
                 if let target = target {
                     wantedSeason = target.season ?? wantedSeason
@@ -1099,6 +1349,8 @@ struct PlayerHostView: View {
                 TorrentWarmup.shared.playbackStarted(hash: h)
             } catch {
                 guard !Task.isCancelled, !closing, switching == release else { return }
+                PlaybackLearning.shared.recordFailure(release)
+                AppDiagnostics.shared.log("switch", "Смена раздачи не удалась: \(error.localizedDescription)")
                 switching = nil
                 switchError = error.localizedDescription
             }

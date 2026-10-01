@@ -55,6 +55,10 @@ final class TorrentSearchService {
     private var memory: [URL: CachedSearch] = [:]
     private var inFlight: [URL: (id: UUID, task: Task<TorrentSearchResult, Error>)] = [:]
     private var pruned = false
+    /// Different film pages share one polite request queue, preventing jac.red 429 bursts.
+    private var nextRequestAt = Date.distantPast
+    private var rateLimitUntil = Date.distantPast
+    private var rateLimitLevel = 0
 
     init() {
         let config = URLSessionConfiguration.default
@@ -83,12 +87,23 @@ final class TorrentSearchService {
     func search(_ query: TorrentSearchQuery, force: Bool = false) async throws -> TorrentSearchResult {
         guard let url = query.url(server: server, apiKey: apiKey) else { throw TorrentSearchError.noServer }
         if !force {
-            if let hit = await cached(url), hit.age < freshLifetime { return hit.result }
+            if let hit = await cached(url) {
+                if hit.age < freshLifetime { return hit.result }
+                // During server backoff show the older result immediately instead of
+                // making the film page wait for the retry timer.
+                if Date() < rateLimitUntil, hit.age < staleLifetime { return hit.result }
+            }
             if let running = inFlight[url] { return try await running.task.value }
         }
         let alternative = query.url(server: server, apiKey: apiKey, useOriginalTitle: true)
         let id = UUID()
-        let task = Task { try await self.download(url, alternative: alternative, query: query) }
+        let task = Task {
+            let started = Date()
+            let result = try await self.download(url, alternative: alternative, query: query)
+            let elapsed = Int(Date().timeIntervalSince(started) * 1_000)
+            AppDiagnostics.shared.log("search", "\(query.title): \(result.releases.count) раздач за \(elapsed) мс")
+            return result
+        }
         inFlight[url] = (id, task)
         defer {
             if inFlight[url]?.id == id { inFlight[url] = nil }
@@ -200,16 +215,37 @@ final class TorrentSearchService {
     private func fetch(_ url: URL, query: TorrentSearchQuery) async throws -> TorrentSearchResult {
         var request = URLRequest(url: url)
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        let data: Data
-        let response: URLResponse
-        do {
-            (data, response) = try await session.data(for: request)
-        } catch {
-            if error is CancellationError || (error as? URLError)?.code == .cancelled { throw CancellationError() }
-            throw TorrentSearchError.network(error.localizedDescription)
+        var responseData: Data?
+        var lastCode = 0
+        for attempt in 0..<2 {
+            try await waitForRequestSlot()
+            let data: Data
+            let response: URLResponse
+            do {
+                (data, response) = try await session.data(for: request)
+            } catch {
+                if error is CancellationError || (error as? URLError)?.code == .cancelled { throw CancellationError() }
+                AppDiagnostics.shared.log("search", "Ошибка сети: \(error.localizedDescription)")
+                throw TorrentSearchError.network(error.localizedDescription)
+            }
+            let http = response as? HTTPURLResponse
+            let code = http?.statusCode ?? 0
+            lastCode = code
+            if code == 429 {
+                let headerDelay = http?.value(forHTTPHeaderField: "Retry-After").flatMap(TimeInterval.init)
+                registerRateLimit(retryAfter: headerDelay)
+                AppDiagnostics.shared.log("search", "HTTP 429, повтор \(attempt + 1)")
+                if attempt == 0 { continue }
+            }
+            guard (200..<300).contains(code) else {
+                AppDiagnostics.shared.log("search", "HTTP \(code)")
+                throw TorrentSearchError.http(code)
+            }
+            rateLimitLevel = max(0, rateLimitLevel - 1)
+            responseData = data
+            break
         }
-        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-        guard (200..<300).contains(code) else { throw TorrentSearchError.http(code) }
+        guard let data = responseData else { throw TorrentSearchError.http(lastCode) }
 
         let filter = query.filter
         let parsed: (found: Int, releases: [TorrentRelease])? = await Task.detached(priority: .userInitiated) {
@@ -218,6 +254,25 @@ final class TorrentSearchService {
         }.value
         guard let parsed = parsed else { throw TorrentSearchError.badResponse }
         return TorrentSearchResult(releases: parsed.releases, found: parsed.found)
+    }
+
+    /// Reserves a request slot before sleeping, so concurrent searches cannot wake together.
+    private func waitForRequestSlot() async throws {
+        let now = Date()
+        let slot = max(now, max(nextRequestAt, rateLimitUntil))
+        nextRequestAt = slot.addingTimeInterval(0.9)
+        let delay = slot.timeIntervalSince(now)
+        if delay > 0 {
+            try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+        }
+        try Task.checkCancellation()
+    }
+
+    private func registerRateLimit(retryAfter: TimeInterval?) {
+        rateLimitLevel = min(rateLimitLevel + 1, 4)
+        let automatic = min(120, 12 * pow(2, Double(rateLimitLevel - 1)))
+        let delay = max(1, retryAfter ?? automatic)
+        rateLimitUntil = max(rateLimitUntil, Date().addingTimeInterval(delay))
     }
 }
 

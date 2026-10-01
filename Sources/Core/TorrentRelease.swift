@@ -63,6 +63,8 @@ enum VoiceKind: Int, Codable, CaseIterable, Comparable, Sendable {
     }
 
     static func < (lhs: VoiceKind, rhs: VoiceKind) -> Bool { lhs.rawValue < rhs.rawValue }
+
+    static let audioChoices: [VoiceKind] = allCases.filter { $0 != .subtitles }
 }
 
 /// A voice-over the user can request before playback. A kind covers releases
@@ -83,6 +85,27 @@ enum ReleaseVoiceOption: Hashable, Identifiable, Sendable {
         case .kind(let kind): return kind.title
         case .studio(let name): return name
         }
+    }
+
+    var settingValue: String {
+        switch self {
+        case .kind(let kind): return "kind:\(kind.rawValue)"
+        case .studio(let name): return "studio:" + name
+        }
+    }
+
+    static func fromSetting(_ value: String) -> ReleaseVoiceOption? {
+        if value.hasPrefix("kind:"),
+           let raw = Int(value.dropFirst("kind:".count)),
+           let kind = VoiceKind(rawValue: raw),
+           kind != .subtitles {
+            return .kind(kind)
+        }
+        if value.hasPrefix("studio:") {
+            let name = String(value.dropFirst("studio:".count)).trimmed
+            return name.isEmpty ? nil : .studio(name)
+        }
+        return nil
     }
 
     func matches(_ release: TorrentRelease) -> Bool {

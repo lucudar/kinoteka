@@ -338,6 +338,9 @@ struct PlayRequest: Identifiable {
     var startTime: Int32? = nil
     /// Release-level voice choice to apply to a matching VLC audio track after startup.
     var preferredAudio: String? = nil
+    /// Requested release quality and voice, used by automatic fallback.
+    var requestedQuality: ReleaseQuality? = nil
+    var requestedVoice: ReleaseVoiceOption? = nil
 }
 
 extension PlayRequest {

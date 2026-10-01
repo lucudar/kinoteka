@@ -8,8 +8,8 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    MARKETING_VERSION: "0.4.0"
-    CURRENT_PROJECT_VERSION: "4"
+    MARKETING_VERSION: "0.5.0"
+    CURRENT_PROJECT_VERSION: "5"
 packages:
   VLCKitSPM:
     url: https://github.com/tylerjonesio/vlckit-spm
@@ -27,6 +27,8 @@ targets:
       - sdk: Security.framework
       - sdk: CoreFoundation.framework
       - sdk: SystemConfiguration.framework
+      - sdk: Network.framework
+      - sdk: MetricKit.framework
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.lucudar.kinoteka

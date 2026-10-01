@@ -5,9 +5,12 @@ struct DetailsView: View {
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var coordinator: PlayerCoordinator
     @Environment(\.openURL) private var openURL
+    @ObservedObject private var network = NetworkMonitor.shared
     @AppStorage(SettingsKeys.kpToken) private var token = ""
     @AppStorage(SettingsKeys.autoPlayBest) private var autoPlayBest = true
     @AppStorage(SettingsKeys.preferredQuality) private var preferredRaw = ReleaseQuality.fullHD.rawValue
+    @AppStorage(SettingsKeys.preferredVoice) private var preferredVoiceRaw = "auto"
+    @AppStorage(SettingsKeys.smartQuality) private var smartQuality = true
 
     @State private var film: KPFilm?
     @State private var staff: [KPStaff] = []
@@ -29,6 +32,7 @@ struct DetailsView: View {
     @State private var chosenQuality: ReleaseQuality?
     /// Voice-over picked on the page for the next playback; nil means "Авто".
     @State private var chosenVoice: ReleaseVoiceOption?
+    @State private var appliedDefaultVoice = false
 
     private var current: MediaItem { film?.item ?? item }
     private var isSeries: Bool { film?.isSeries ?? (item.kind == .series) }
@@ -37,7 +41,11 @@ struct DetailsView: View {
     private var shareURL: URL {
         URL(string: film?.webUrl ?? "") ?? URL(string: "https://www.kinopoisk.ru/film/\(item.id)/")!
     }
-    private var preferredQuality: ReleaseQuality { ReleaseQuality(rawValue: preferredRaw) ?? .fullHD }
+    private var preferredQuality: ReleaseQuality {
+        let configured = ReleaseQuality(rawValue: preferredRaw) ?? .fullHD
+        return PlaybackPolicy.effectiveQuality(configured, connection: network.connection, smart: smartQuality)
+    }
+    private var defaultVoice: ReleaseVoiceOption? { ReleaseVoiceOption.fromSetting(preferredVoiceRaw) }
 
     private var searchQuery: TorrentSearchQuery? {
         filmResolved ? TorrentSearchQuery(item: current) : nil
@@ -69,9 +77,10 @@ struct DetailsView: View {
         guard let list = releases else { return nil }
         let matchingVoice = ReleaseRanking.matching(ReleaseRanking.matching(list, season: season), voice: chosenVoice)
         if let quality = chosenQuality {
-            return ReleaseRanking.best(matchingVoice, quality: quality, season: season)
+            let exact = matchingVoice.filter { $0.quality == quality && !$0.isCamRip }
+            return PlaybackLearning.shared.best(exact, preferred: quality, season: season, voice: chosenVoice)
         }
-        return ReleaseRanking.best(matchingVoice, preferred: preferredQuality, season: season)
+        return PlaybackLearning.shared.best(matchingVoice, preferred: preferredQuality, season: season, voice: chosenVoice)
     }
 
     private var qualityOptions: [ReleaseQuality] {
@@ -104,7 +113,7 @@ struct DetailsView: View {
             }
             return .resume(entry)
         }
-        if chosenQuality == nil, let source = savedSource(season: season) {
+        if chosenQuality == nil, chosenVoice == nil, let source = savedSource(season: season) {
             return .source(source)
         }
         return plannedRelease(season: season).map { Plan.release($0) }
@@ -180,7 +189,7 @@ struct DetailsView: View {
         }
         .sheet(isPresented: $showSources) {
             SourcesSheet(item: current, episode: pendingEpisode, seasonNumbers: seasons.map { $0.number },
-                         initialQuality: chosenQuality)
+                         initialQuality: chosenQuality, initialVoice: chosenVoice)
         }
         .alert(alertText ?? "", isPresented: Binding(get: { alertText != nil }, set: { if !$0 { alertText = nil } })) {
             Button("OK", role: .cancel) {}
@@ -198,7 +207,7 @@ struct DetailsView: View {
             // The choice is for one playback: next time the page continues what was watched.
             if id != nil {
                 chosenQuality = nil
-                chosenVoice = nil
+                chosenVoice = availableDefaultVoice(in: releases ?? [])
             }
         }
         .onAppear { library.addHistory(current) }
@@ -390,6 +399,9 @@ struct DetailsView: View {
         var request = PlayRequest(continuing: entry, item: current)
         request.itemKey = item.key
         request.preferredAudio = chosenVoice?.title
+            ?? PlaybackLearning.shared.preferredAudio(for: item.key)
+        request.requestedQuality = chosenQuality
+        request.requestedVoice = chosenVoice
         if case .release(let release) = plan {
             // Another quality is chosen: the same episode and place in that release.
             let source = SavedSource(release: release)
@@ -412,12 +424,14 @@ struct DetailsView: View {
     private func request(for episode: KPEpisode?, link: String) -> PlayRequest {
         guard let episode = episode else {
             return PlayRequest(title: current.title, link: link, itemKey: item.key, item: current,
-                               preferredAudio: chosenVoice?.title)
+                               preferredAudio: chosenVoice?.title ?? PlaybackLearning.shared.preferredAudio(for: item.key),
+                               requestedQuality: chosenQuality, requestedVoice: chosenVoice)
         }
         return PlayRequest(title: SeriesTitle.make(current.title, episode.seasonNumber, episode.episodeNumber),
                            link: link, itemKey: item.key, item: current,
                            season: episode.seasonNumber, episode: episode.episodeNumber,
-                           preferredAudio: chosenVoice?.title)
+                           preferredAudio: chosenVoice?.title ?? PlaybackLearning.shared.preferredAudio(for: item.key),
+                           requestedQuality: chosenQuality, requestedVoice: chosenVoice)
     }
 
     /// Like Zona: starts the release watched before or the best found one right away (the search
@@ -445,6 +459,7 @@ struct DetailsView: View {
             defer { searchingRelease = false }
             if let result = try? await TorrentSearchService.shared.search(query) {
                 releases = result.releases
+                applyDefaultVoiceIfNeeded(result.releases)
                 releasesFailed = false
             }
             if let release = plannedRelease(season: season) {
@@ -470,6 +485,7 @@ struct DetailsView: View {
         let service = TorrentSearchService.shared
         if releases == nil, let cached = await service.cachedResult(query), searchQuery == query {
             releases = cached.releases
+            applyDefaultVoiceIfNeeded(cached.releases)
         }
         // Only for a page that stays open, not while flicking through pages (the server limits requests).
         try? await Task.sleep(nanoseconds: 300_000_000)
@@ -478,11 +494,24 @@ struct DetailsView: View {
             let result = try await service.search(query)
             guard searchQuery == query else { return }
             releases = result.releases
+            applyDefaultVoiceIfNeeded(result.releases)
             releasesFailed = false
         } catch {
             guard searchQuery == query, !(error is CancellationError) else { return }
             releasesFailed = true
         }
+    }
+
+    private func availableDefaultVoice(in list: [TorrentRelease]) -> ReleaseVoiceOption? {
+        guard let preferred = defaultVoice else { return nil }
+        let options = ReleaseRanking.voiceOptions(list, season: planSeason)
+        return options.contains(preferred) ? preferred : nil
+    }
+
+    private func applyDefaultVoiceIfNeeded(_ list: [TorrentRelease]) {
+        guard !appliedDefaultVoice else { return }
+        appliedDefaultVoice = true
+        chosenVoice = availableDefaultVoice(in: list)
     }
 
     /// Adds the torrent the button will play to the engine a moment after the page opens

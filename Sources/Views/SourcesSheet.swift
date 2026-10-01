@@ -8,7 +8,9 @@ struct SourcesSheet: View {
     @EnvironmentObject private var coordinator: PlayerCoordinator
     @Environment(\.dismiss) private var dismiss
     @Environment(\.openURL) private var openURL
+    @ObservedObject private var network = NetworkMonitor.shared
     @AppStorage(SettingsKeys.preferredQuality) private var preferredRaw = ReleaseQuality.fullHD.rawValue
+    @AppStorage(SettingsKeys.smartQuality) private var smartQuality = true
     @AppStorage(SettingsKeys.searchServer) private var server = TorrentSearchService.defaultServer
 
     let item: MediaItem
@@ -16,6 +18,8 @@ struct SourcesSheet: View {
     var seasonNumbers: [Int] = []
     /// Quality picked on the film page: the list opens filtered by it.
     var initialQuality: ReleaseQuality? = nil
+    /// Voice picked on the film page: the list opens filtered by it.
+    var initialVoice: ReleaseVoiceOption? = nil
 
     private enum LoadState: Equatable {
         case loading
@@ -28,6 +32,7 @@ struct SourcesSheet: View {
     @State private var found = 0
     @State private var season: Int?
     @State private var quality: ReleaseQuality?
+    @State private var voice: ReleaseVoiceOption?
     @State private var order: ReleaseSort = .seeders
     @State private var searchText = ""
     @State private var customQuery: String?
@@ -35,7 +40,11 @@ struct SourcesSheet: View {
     @State private var didStart = false
 
     private var isSeries: Bool { item.kind == .series }
-    private var preferred: ReleaseQuality { ReleaseQuality(rawValue: preferredRaw) ?? .fullHD }
+    private var preferred: ReleaseQuality {
+        PlaybackPolicy.effectiveQuality(ReleaseQuality(rawValue: preferredRaw) ?? .fullHD,
+                                        connection: network.connection,
+                                        smart: smartQuality)
+    }
 
     private var sources: [SavedSource] {
         let all = library.sources(for: item.key)
@@ -55,8 +64,15 @@ struct SourcesSheet: View {
     }
 
     private var qualityOptions: [ReleaseQuality] {
-        let present = Set(releases.map { $0.quality })
+        let candidates = ReleaseRanking.matching(releases, voice: voice)
+        let present = Set(candidates.map { $0.quality })
         return ReleaseQuality.choices.filter { present.contains($0) }
+    }
+
+    private var voiceOptions: [ReleaseVoiceOption] {
+        var candidates = ReleaseRanking.matching(releases, season: season)
+        if let quality = quality { candidates = candidates.filter { $0.quality == quality } }
+        return ReleaseRanking.voiceOptions(candidates)
     }
 
     private var filtered: [TorrentRelease] {
@@ -67,6 +83,7 @@ struct SourcesSheet: View {
         if let quality = quality {
             list = list.filter { $0.quality == quality }
         }
+        list = ReleaseRanking.matching(list, voice: voice)
         return ReleaseRanking.sorted(list, by: order)
     }
 
@@ -77,7 +94,7 @@ struct SourcesSheet: View {
 
     var body: some View {
         let list = filtered
-        let best = ReleaseRanking.best(list, preferred: preferred, season: season)
+        let best = PlaybackLearning.shared.best(list, preferred: preferred, season: season, voice: voice)
         let saved = Set(library.sources(for: item.key).map { $0.link })
         NavigationStack {
             List {
@@ -91,7 +108,7 @@ struct SourcesSheet: View {
                 if customQuery == nil && !sources.isEmpty {
                     savedSection
                 }
-                if !releases.isEmpty && (seasonOptions.count > 1 || qualityOptions.count > 1) {
+                if !releases.isEmpty && (seasonOptions.count > 1 || qualityOptions.count > 1 || !voiceOptions.isEmpty) {
                     filtersSection
                 }
                 results(list: list, best: best, saved: saved)
@@ -121,6 +138,12 @@ struct SourcesSheet: View {
                     startSearch()
                 }
             }
+            .onChange(of: voice) { _, _ in
+                if let current = quality, !qualityOptions.contains(current) { quality = nil }
+            }
+            .onChange(of: quality) { _, _ in
+                if let current = voice, !voiceOptions.contains(current) { voice = nil }
+            }
             .refreshable { await load(force: true) }
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -143,6 +166,7 @@ struct SourcesSheet: View {
                     didStart = true
                     season = episode?.seasonNumber
                     quality = initialQuality
+                    voice = initialVoice
                 }
                 // Also restarts a search that was cancelled while "Своя ссылка" was open.
                 if state == .loading {
@@ -207,6 +231,14 @@ struct SourcesSheet: View {
                         Chip(title: "Любое качество", selected: quality == nil) { quality = nil }
                         ForEach(qualityOptions) { option in
                             Chip(title: option.title, selected: quality == option) { quality = option }
+                        }
+                    }
+                }
+                if !voiceOptions.isEmpty {
+                    chipRow {
+                        Chip(title: "Любая озвучка", selected: voice == nil) { voice = nil }
+                        ForEach(voiceOptions) { option in
+                            Chip(title: option.title, selected: voice == option) { voice = option }
                         }
                     }
                 }
@@ -279,6 +311,7 @@ struct SourcesSheet: View {
                     Button("Сбросить фильтры") {
                         season = nil
                         quality = nil
+                        voice = nil
                     }
                 }
             } else {
@@ -379,6 +412,10 @@ struct SourcesSheet: View {
             if let current = quality, !result.releases.contains(where: { $0.quality == current }) {
                 quality = nil
             }
+            if let current = voice,
+               !ReleaseRanking.voiceOptions(result.releases, season: season).contains(current) {
+                voice = nil
+            }
         } catch is CancellationError {
             return
         } catch {
@@ -394,11 +431,14 @@ struct SourcesSheet: View {
     private func play(_ release: TorrentRelease) {
         let source = SavedSource(release: release)
         library.addSource(source, for: item.key)
-        play(source)
+        play(source, release: release)
     }
 
-    private func play(_ source: SavedSource) {
-        var request = PlayRequest(title: item.title, link: source.link, itemKey: item.key, item: item)
+    private func play(_ source: SavedSource, release: TorrentRelease? = nil) {
+        var request = PlayRequest(title: item.title, link: source.link, itemKey: item.key, item: item,
+                                  preferredAudio: voice?.title ?? PlaybackLearning.shared.preferredAudio(for: item.key),
+                                  requestedQuality: release?.quality ?? quality,
+                                  requestedVoice: voice)
         if let episode = episode {
             request.season = episode.seasonNumber
             request.episode = episode.episodeNumber
