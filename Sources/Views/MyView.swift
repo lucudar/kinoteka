@@ -17,6 +17,23 @@ enum LibraryListKind: Hashable {
     }
 }
 
+private enum LibrarySort: String, CaseIterable, Identifiable {
+    case added
+    case title
+    case year
+    case rating
+
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .added: return "Сначала новые"
+        case .title: return "По названию"
+        case .year: return "По году"
+        case .rating: return "По рейтингу"
+        }
+    }
+}
+
 struct MyView: View {
     @EnvironmentObject private var library: LibraryStore
 
@@ -103,8 +120,10 @@ struct ItemsGridScreen: View {
     @EnvironmentObject private var library: LibraryStore
     let kind: LibraryListKind
     @State private var confirmClear = false
+    @State private var searchText = ""
+    @State private var sort: LibrarySort = .added
 
-    private var items: [MediaItem] {
+    private var sourceItems: [MediaItem] {
         switch kind {
         case .favorites(let type): return library.favorites(type)
         case .watchLater: return library.data.watchLater
@@ -113,10 +132,34 @@ struct ItemsGridScreen: View {
         }
     }
 
+    private var items: [MediaItem] {
+        let query = searchText.trimmed.lowercased()
+        var result = query.isEmpty ? sourceItems : sourceItems.filter {
+            $0.title.lowercased().contains(query) ||
+            ($0.originalTitle?.lowercased().contains(query) == true) ||
+            $0.genres.contains { $0.lowercased().contains(query) }
+        }
+        switch sort {
+        case .added:
+            break
+        case .title:
+            result.sort { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+        case .year:
+            result.sort { ($0.year ?? 0) > ($1.year ?? 0) }
+        case .rating:
+            result.sort { ($0.ratingKP ?? $0.ratingIMDb ?? 0) > ($1.ratingKP ?? $1.ratingIMDb ?? 0) }
+        }
+        return result
+    }
+
     var body: some View {
         ScrollView {
             if items.isEmpty {
-                ContentUnavailableView("Пока пусто", systemImage: "tray", description: Text("Здесь появятся фильмы и сериалы"))
+                ContentUnavailableView(searchText.trimmed.isEmpty ? "Пока пусто" : "Ничего не найдено",
+                                       systemImage: searchText.trimmed.isEmpty ? "tray" : "magnifyingglass",
+                                       description: Text(searchText.trimmed.isEmpty
+                                                         ? "Здесь появятся фильмы и сериалы"
+                                                         : "Попробуйте другое название или жанр"))
                     .padding(.top, 80)
             } else {
                 MediaGrid(items: items)
@@ -126,9 +169,21 @@ struct ItemsGridScreen: View {
         .background(Theme.background)
         .navigationTitle(kind.title)
         .navigationBarTitleDisplayMode(.inline)
+        .searchable(text: $searchText, prompt: "Название или жанр")
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                if kind == .history && !items.isEmpty {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                if !sourceItems.isEmpty {
+                    Menu {
+                        Picker("Сортировка", selection: $sort) {
+                            ForEach(LibrarySort.allCases) { option in
+                                Text(option.title).tag(option)
+                            }
+                        }
+                    } label: {
+                        Image(systemName: "arrow.up.arrow.down")
+                    }
+                }
+                if kind == .history && !sourceItems.isEmpty {
                     Button("Очистить") { confirmClear = true }
                 }
             }
@@ -512,7 +567,7 @@ struct AboutView: View {
                     }
                 }
                 Text("Личный медиаплеер в стиле Zona для iPhone.")
-                Text("• Каталог, поиск, описания, рейтинги, сезоны и актёры — из неофициального API Кинопоиска.\n• Раздачи находятся автоматически через Jacred / Jackett. Можно выбрать качество и озвучку; нерабочая раздача заменяется автоматически.\n• Автокачество учитывает тип сети, удачные раздачи запоминаются, следующая серия готовится заранее.\n• Плеер VLCKit восстанавливает зависший поток с сохранённого места.\n• Локальный журнал и системные отчёты о сбоях экспортируются только вручную из настроек.\n• Свои magnet, .torrent, прямые ссылки, HLS и M3U-телеканалы.")
+                Text("• Каталог, поиск, описания, рейтинги, сезоны и актёры — из неофициального API Кинопоиска.\n• Раздачи находятся автоматически через Jacred / Jackett. Можно выбрать качество и озвучку; нерабочая раздача заменяется автоматически.\n• «Смотреть позже», персональные рекомендации, недавние ТВ-каналы и сортировка медиатеки.\n• Плеер VLCKit: жесты, блокировка управления, таймер сна, запоминание дорожек и обратный отсчёт до следующей серии.\n• Медиатеку и прогресс можно экспортировать и восстановить; секретные ключи в копию не попадают.\n• Локальный журнал и системные отчёты о сбоях экспортируются только вручную из настроек.\n• Свои magnet, .torrent, прямые ссылки, HLS и M3U-телеканалы.")
                     .font(.subheadline)
                     .foregroundStyle(Theme.secondary)
                 Text("Приложение не содержит и не распространяет контент.")

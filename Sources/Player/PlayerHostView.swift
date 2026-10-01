@@ -125,6 +125,8 @@ struct PlayerHostView: View {
     @State private var sleepTask: Task<Void, Never>?
     @State private var playerNotice: String?
     @State private var noticeToken = 0
+    @State private var showNextEpisodePrompt = false
+    @State private var autoNextCancelled = false
 
     init(request: PlayRequest) {
         self.request = request
@@ -182,6 +184,7 @@ struct PlayerHostView: View {
         .onChange(of: model.timeMs) { _, _ in
             periodicSave()
             prepareNextEpisodeIfNeeded()
+            updateNextEpisodePrompt()
         }
         .onChange(of: model.ended) { _, ended in
             if ended { handleEnded() }
@@ -444,6 +447,8 @@ struct PlayerHostView: View {
         preloadTask?.cancel()
         preloadTask = nil
         nextPreparedID = nil
+        showNextEpisodePrompt = false
+        autoNextCancelled = false
         currentFile = file
         streamKey = "\(h):\(file.id)"
         addedAudio = []
@@ -753,7 +758,7 @@ struct PlayerHostView: View {
             close()
             return
         }
-        if autoNext, let next = nextFile {
+        if autoNext, !autoNextCancelled, let next = nextFile {
             play(next)
         } else {
             close()
@@ -875,6 +880,20 @@ struct PlayerHostView: View {
             guard token == noticeToken else { return }
             withAnimation { playerNotice = nil }
         }
+    }
+
+    private func updateNextEpisodePrompt() {
+        let remaining = model.lengthMs - model.timeMs
+        let shouldShow = autoNext && !autoNextCancelled && model.started &&
+            model.lengthMs > 0 && remaining > 0 && remaining <= 15_000 && nextFile != nil
+        guard shouldShow != showNextEpisodePrompt else { return }
+        withAnimation(.easeInOut(duration: 0.2)) {
+            showNextEpisodePrompt = shouldShow
+        }
+    }
+
+    private var nextEpisodeCountdown: Int {
+        max(1, Int(ceil(Double(max(0, model.lengthMs - model.timeMs)) / 1_000)))
     }
 
     // MARK: - Screens
@@ -1094,6 +1113,40 @@ struct PlayerHostView: View {
                     .padding(.bottom, 24)
                     .transition(.opacity)
                     .allowsHitTesting(false)
+                }
+                if showNextEpisodePrompt, let next = nextFile, !controlsLocked {
+                    VStack {
+                        Spacer()
+                        HStack {
+                            Spacer()
+                            VStack(alignment: .leading, spacing: 7) {
+                                Text("Следующая серия через \(nextEpisodeCountdown) сек.")
+                                    .font(.headline)
+                                Text(fileLabel(next))
+                                    .font(.caption)
+                                    .foregroundStyle(.white.opacity(0.75))
+                                HStack(spacing: 10) {
+                                    Button("Сейчас") {
+                                        showNextEpisodePrompt = false
+                                        switchTo(next)
+                                    }
+                                    .buttonStyle(.borderedProminent)
+                                    Button("Отмена") {
+                                        autoNextCancelled = true
+                                        showNextEpisodePrompt = false
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .tint(.white)
+                                }
+                            }
+                            .foregroundStyle(.white)
+                            .padding(16)
+                            .background(Color.black.opacity(0.82), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        }
+                    }
+                    .padding(.horizontal, 22)
+                    .padding(.bottom, showControls ? 72 : 22)
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
                 }
             }
         }
@@ -1604,6 +1657,16 @@ struct PlayerHostView: View {
                 }
             }
             .contentShape(Rectangle())
+        }
+        .contextMenu {
+            if !selected {
+                Button(role: .destructive) {
+                    library.blockRelease(release)
+                    alternatives.removeAll { $0.id == release.id }
+                } label: {
+                    Label("Не предлагать эту раздачу", systemImage: "hand.thumbsdown")
+                }
+            }
         }
     }
 

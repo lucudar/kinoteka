@@ -6,15 +6,21 @@ import SwiftUI
 final class LibraryStore: ObservableObject {
     private(set) var data = LibraryData()
     private let fileURL: URL
+    private let recoveryURL: URL
     private var saveTask: Task<Void, Never>?
 
     init() {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         fileURL = dir.appendingPathComponent("library.json")
+        recoveryURL = dir.appendingPathComponent("library-recovery.json")
         if let raw = try? Data(contentsOf: fileURL),
            let decoded = try? JSONDecoder().decode(LibraryData.self, from: raw) {
             data = decoded
+        } else if let raw = try? Data(contentsOf: recoveryURL),
+                  let decoded = try? JSONDecoder().decode(LibraryData.self, from: raw) {
+            data = decoded
+            AppDiagnostics.shared.log("library", "Медиатека восстановлена из резервного файла")
         }
     }
 
@@ -34,9 +40,14 @@ final class LibraryStore: ObservableObject {
     }
 
     func persist() {
-        if let raw = try? JSONEncoder().encode(data) {
-            try? raw.write(to: fileURL, options: .atomic)
+        guard let raw = try? JSONEncoder().encode(data) else { return }
+        // Keep one known-good generation in case iOS terminates the app during
+        // a write or the main file becomes damaged.
+        if let previous = try? Data(contentsOf: fileURL),
+           (try? JSONDecoder().decode(LibraryData.self, from: previous)) != nil {
+            try? previous.write(to: recoveryURL, options: .atomic)
         }
+        try? raw.write(to: fileURL, options: .atomic)
     }
 
     // Favorites
