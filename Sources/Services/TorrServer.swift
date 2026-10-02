@@ -96,26 +96,42 @@ final class TorrServer {
 
     var isRunning: Bool { TorrserverkitIsRunning() }
 
-    private var dataDirectory: String {
+    static var dataDirectory: URL {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("TorrServer", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.path
+        return dir
     }
 
+    /// TorrServer writes its log here and also sends the process's stdout/stderr to it,
+    /// so Go panics and Swift runtime errors of the previous run end up in this file.
+    static var logFile: URL { dataDirectory.appendingPathComponent("torrserver.log") }
+
+    private var logPrepared = false
+
     /// Must be called on `queue`.
+    ///
+    /// TorrServer cannot be stopped and started again inside one process: its stop
+    /// closes the settings database but keeps using it, so the next start crashes the
+    /// whole app in Go. The engine is therefore only ever started when it is not running.
     private func startOnQueue() {
-        let message = TorrserverkitStartServer(port, dataDirectory)
+        guard !TorrserverkitIsRunning() else { return }
+        if !logPrepared {
+            logPrepared = true
+            EngineLog.inspectPreviousRun(TorrServer.logFile)
+        }
+        let started = Date()
+        let message = TorrserverkitStartServer(port, TorrServer.dataDirectory.path)
         lock.lock()
         lastError = message.isEmpty ? nil : message
         lock.unlock()
+        let elapsed = Int(Date().timeIntervalSince(started) * 1000)
+        AppDiagnostics.shared.log("torrent", message.isEmpty ? "Движок запущен за \(elapsed) мс" : "Движок не запустился: \(message)")
     }
 
     func start() {
         queue.async {
-            if !TorrserverkitIsRunning() {
-                self.startOnQueue()
-            }
+            self.startOnQueue()
         }
     }
 
@@ -130,7 +146,7 @@ final class TorrServer {
 
     func ping() async -> Bool {
         guard let url = URL(string: base + "/echo") else { return false }
-        var request = URLRequest(url: url, timeoutInterval: 2)
+        var request = URLRequest(url: url, timeoutInterval: 3)
         request.cachePolicy = .reloadIgnoringLocalCacheData
         do {
             let (_, response) = try await session.data(for: request)
@@ -140,33 +156,39 @@ final class TorrServer {
         }
     }
 
-    private func waitForPing(attempts: Int) async -> Bool {
-        for _ in 0..<attempts {
+    private func waitForPing(seconds: TimeInterval) async -> Bool {
+        let deadline = Date().addingTimeInterval(seconds)
+        repeat {
             if await ping() { return true }
+            if Task.isCancelled { return false }
             try? await Task.sleep(nanoseconds: 250_000_000)
-        }
+        } while Date() < deadline
         return false
     }
 
-    /// Makes sure the local HTTP server answers (iOS may break the socket after a long suspension).
+    /// Makes sure the local HTTP server answers (iOS may break the socket after a long
+    /// suspension) and the app's engine settings are applied before torrents are added.
     func ensureRunning() async throws {
         try await startIfNeeded()
-        await applyPreferredSettings()
+        await applySettingsOnce()
     }
 
     private func startIfNeeded() async throws {
-        if await waitForPing(attempts: 6) { return }
-        await onQueue {
-            if !TorrserverkitIsRunning() { self.startOnQueue() }
+        if await waitForPing(seconds: 1.5) { return }
+        for attempt in 1...2 {
+            // Only starts when the engine is not running (its HTTP server stopped).
+            await onQueue { self.startOnQueue() }
+            if await waitForPing(seconds: attempt == 1 ? 10 : 15) { return }
+            if Task.isCancelled { throw CancellationError() }
         }
-        if await waitForPing(attempts: 24) { return }
-        await onQueue {
-            _ = TorrserverkitStopServer()
-            Thread.sleep(forTimeInterval: 0.5)
-            self.startOnQueue()
+        let reason: String
+        if isRunning {
+            reason = "движок не отвечает. Закройте Кинотеку в переключателе приложений и откройте снова."
+        } else {
+            reason = startError ?? "сервер не отвечает"
         }
-        if await waitForPing(attempts: 40) { return }
-        throw TorrServerError.notRunning(startError ?? "сервер не отвечает")
+        AppDiagnostics.shared.log("torrent", "Движок недоступен: \(reason)")
+        throw TorrServerError.notRunning(reason)
     }
 
     // MARK: Engine settings
@@ -175,39 +197,60 @@ final class TorrServer {
     /// Long enough to reopen the film or pick another episode without reconnecting to peers.
     static let keepAliveSeconds = 180
 
-    private var settingsState = 0 // 0: not checked, 1: checking, 2: done
+    private var settingsApplied = false
+    private var settingsTask: Task<Void, Never>?
 
-    private func beginSettingsCheck() -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        guard settingsState == 0 else { return false }
-        settingsState = 1
-        return true
+    /// Changing settings makes TorrServer drop its torrents and reconnect its client, so it
+    /// is done once, and every caller waits for it before adding a torrent.
+    private func applySettingsOnce() async {
+        guard let task = settingsTaskToAwait() else { return }
+        await task.value
     }
 
-    private func endSettingsCheck(done: Bool) {
+    /// The task applying the settings (started by the first caller), or nil once applied.
+    private func settingsTaskToAwait() -> Task<Void, Never>? {
         lock.lock()
-        settingsState = done ? 2 : 0
+        defer { lock.unlock() }
+        if settingsApplied { return nil }
+        if let existing = settingsTask { return existing }
+        let task = Task { await self.applyPreferredSettings() }
+        settingsTask = task
+        return task
+    }
+
+    private func finishSettings(applied: Bool) {
+        lock.lock()
+        settingsApplied = applied
+        settingsTask = nil
         lock.unlock()
     }
 
-    /// Applied once: TorrServer keeps its settings in its own database.
-    /// Changing settings restarts the engine's torrents, so it is done only when needed.
+    /// TorrServer keeps its settings in its own database.
     private func applyPreferredSettings() async {
-        guard beginSettingsCheck() else { return }
-        var done = false
-        defer { endSettingsCheck(done: done) }
         guard let data = try? await post(["action": "get"], path: "/settings"),
-              var sets = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
-        let timeout = (sets["TorrentDisconnectTimeout"] as? NSNumber)?.intValue ?? 0
-        guard timeout < TorrServer.keepAliveSeconds else {
-            done = true
+              var sets = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            finishSettings(applied: false)
             return
         }
-        sets["TorrentDisconnectTimeout"] = TorrServer.keepAliveSeconds
-        if (try? await post(["action": "set", "sets": sets], path: "/settings")) != nil {
-            done = true
+        var changes: [String] = []
+        let timeout = (sets["TorrentDisconnectTimeout"] as? NSNumber)?.intValue ?? 0
+        if timeout < TorrServer.keepAliveSeconds {
+            sets["TorrentDisconnectTimeout"] = TorrServer.keepAliveSeconds
+            changes.append("удержание \(TorrServer.keepAliveSeconds) с")
         }
+        // Discovery of other devices is not needed inside the app; it only adds
+        // multicast traffic and work while the phone plays.
+        for key in ["EnableBonjour", "EnableLPD", "EnableDLNA"] where (sets[key] as? Bool) == true {
+            sets[key] = false
+            changes.append(key)
+        }
+        guard !changes.isEmpty else {
+            finishSettings(applied: true)
+            return
+        }
+        let saved = (try? await post(["action": "set", "sets": sets], path: "/settings")) != nil
+        AppDiagnostics.shared.log("torrent", saved ? "Настройки движка: \(changes.joined(separator: ", "))" : "Настройки движка не сохранились")
+        finishSettings(applied: saved)
     }
 
     // MARK: Torrents

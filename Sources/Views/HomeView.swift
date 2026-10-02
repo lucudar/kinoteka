@@ -91,7 +91,7 @@ struct PersonalizedRow: View {
             loaded = false
             if let result = try? await RecommendationService.recommendations(for: data),
                !Task.isCancelled {
-                items = result.items
+                items = result.items.uniqued(by: \.id)
                 reason = result.reason
             }
             loaded = true

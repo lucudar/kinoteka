@@ -16,13 +16,16 @@ final class LibraryStore: ObservableObject {
         recoveryURL = dir.appendingPathComponent("library-recovery.json")
         if let raw = try? Data(contentsOf: fileURL),
            let decoded = try? JSONDecoder().decode(LibraryData.self, from: raw) {
-            data = decoded
+            data = decoded.sanitized()
         } else if let raw = try? Data(contentsOf: recoveryURL),
                   let decoded = try? JSONDecoder().decode(LibraryData.self, from: raw) {
-            data = decoded
+            data = decoded.sanitized()
             AppDiagnostics.shared.log("library", "Медиатека восстановлена из резервного файла")
         }
     }
+
+    /// All writes go through one serial queue, so they never overlap and never block the UI.
+    private static let ioQueue = DispatchQueue(label: "kinoteka.library.io", qos: .utility)
 
     private func mutate(notify: Bool = true, _ change: (inout LibraryData) -> Void) {
         if notify { objectWillChange.send() }
@@ -40,10 +43,24 @@ final class LibraryStore: ObservableObject {
     }
 
     func persist() {
-        guard let raw = try? JSONEncoder().encode(data) else { return }
+        saveTask?.cancel()
+        saveTask = nil
+        let snapshot = data
+        let fileURL = fileURL
+        let recoveryURL = recoveryURL
+        // The app may be going to the background: finish the write before suspension.
+        let token = BackgroundTaskToken.begin("Сохранение медиатеки")
+        LibraryStore.ioQueue.async {
+            LibraryStore.write(snapshot, to: fileURL, recoveryURL: recoveryURL)
+            token.end()
+        }
+    }
+
+    private nonisolated static func write(_ snapshot: LibraryData, to fileURL: URL, recoveryURL: URL) {
+        guard let raw = try? JSONEncoder().encode(snapshot) else { return }
         // Keep one known-good generation in case iOS terminates the app during
         // a write or the main file becomes damaged.
-        if let previous = try? Data(contentsOf: fileURL),
+        if let previous = try? Data(contentsOf: fileURL), previous != raw,
            (try? JSONDecoder().decode(LibraryData.self, from: previous)) != nil {
             try? previous.write(to: recoveryURL, options: .atomic)
         }
@@ -250,7 +267,7 @@ final class LibraryStore: ObservableObject {
     func replaceData(_ replacement: LibraryData) {
         saveTask?.cancel()
         objectWillChange.send()
-        data = replacement
+        data = replacement.sanitized()
         persist()
     }
 
@@ -271,6 +288,25 @@ final class LibraryStore: ObservableObject {
 
     func clearQueries() {
         mutate { d in d.recentQueries.removeAll() }
+    }
+}
+
+extension LibraryData {
+    /// Lists from older versions and backups may repeat entries; SwiftUI lists need unique ids.
+    func sanitized() -> LibraryData {
+        var copy = self
+        copy.favorites = favorites.uniqued(by: \.id)
+        copy.watchLater = watchLater.uniqued(by: \.id)
+        copy.watched = watched.uniqued(by: \.id)
+        copy.history = history.uniqued(by: \.id)
+        copy.continueWatching = continueWatching.uniqued(by: \.itemKey)
+        copy.favoriteChannels = favoriteChannels.uniqued(by: \.url)
+        copy.recentChannels = recentChannels.uniqued(by: \.url)
+        copy.recentQueries = recentQueries.uniqued { $0.lowercased() }
+        copy.blockedReleaseIDs = blockedReleaseIDs.uniqued { $0 }
+        copy.sources = sources.mapValues { $0.uniqued(by: \.id) }
+        copy.resume = resume.filter { $0.value > 0 }
+        return copy
     }
 }
 
@@ -341,7 +377,7 @@ final class ChannelsStore: ObservableObject {
                 error = "Файл плейлиста не найден. Выберите его заново."
                 return
             }
-            finish(raw, source: source, cache: false)
+            await finish(raw, source: source, cache: false)
             return
         }
         guard let url = URL(string: source), url.scheme != nil else {
@@ -355,10 +391,10 @@ final class ChannelsStore: ObservableObject {
             if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
                 throw APIError.http(http.statusCode)
             }
-            finish(raw, source: source, cache: true)
+            await finish(raw, source: source, cache: true)
         } catch {
             if let cached = try? Data(contentsOf: cacheFile) {
-                finish(cached, source: source, cache: false)
+                await finish(cached, source: source, cache: false)
                 if channels.isEmpty { self.error = error.localizedDescription }
             } else {
                 self.error = "Не удалось загрузить плейлист: \(error.localizedDescription)"
@@ -366,14 +402,18 @@ final class ChannelsStore: ObservableObject {
         }
     }
 
-    private func finish(_ raw: Data, source: String, cache: Bool) {
-        let text = String(decoding: raw, as: UTF8.self)
-        let list = M3UParser.parse(text)
+    /// Big IPTV playlists take a while to parse: it is done off the main thread.
+    private func finish(_ raw: Data, source: String, cache: Bool) async {
+        let target = cacheFile
+        let list: [Channel] = await Task.detached(priority: .userInitiated) {
+            let list = M3UParser.parse(String(decoding: raw, as: UTF8.self))
+            if cache, !list.isEmpty { try? raw.write(to: target, options: .atomic) }
+            return list
+        }.value
         if list.isEmpty {
             error = "В плейлисте не найдено каналов."
             return
         }
-        if cache { try? raw.write(to: cacheFile, options: .atomic) }
         apply(list, source: source)
     }
 
@@ -442,7 +482,7 @@ final class PlayerCoordinator: ObservableObject {
             return
         }
         Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            try? await Task.sleep(seconds: delay)
             self?.request = request
         }
     }

@@ -261,6 +261,7 @@ struct SettingsView: View {
     @State private var engineStatus = "Проверка…"
     @State private var cacheSize = ""
     @State private var diagnosticsSize = ""
+    @State private var reportVersion = 0
     @State private var message: String?
     @State private var importingBackup = false
     @State private var backupURL: URL?
@@ -452,18 +453,18 @@ struct SettingsView: View {
                     Text(diagnosticsSize)
                         .foregroundStyle(Theme.secondary)
                 }
-                ShareLink(item: AppDiagnostics.shared.exportURL()) {
-                    Label("Поделиться отчётом", systemImage: "square.and.arrow.up")
-                }
+                DiagnosticsReportLink()
+                    .id(reportVersion)
                 Button("Очистить журнал", role: .destructive) {
                     AppDiagnostics.shared.clear()
                     diagnosticsSize = AppDiagnostics.shared.sizeText
+                    reportVersion += 1
                     message = "Журнал диагностики очищен"
                 }
             } header: {
                 Text("Диагностика")
             } footer: {
-                Text("Отчёт хранится только на iPhone: последние этапы запуска, восстановления и системные отчёты о сбоях MetricKit. Он отправляется только через кнопку выше.")
+                Text("Отчёт хранится только на iPhone: события плеера и движка, память, зависания, сбои прошлых запусков и системные отчёты iOS (MetricKit). Он отправляется только через кнопку выше — например, в Telegram или по почте.")
             }
 
             Section {

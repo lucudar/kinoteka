@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 enum Theme {
     static let accent = Color(red: 0.0, green: 0.58, blue: 0.965)
@@ -50,5 +51,64 @@ enum RatingStyle {
 
     static func text(_ value: Double) -> String {
         String(format: "%.1f", value)
+    }
+}
+
+extension Sequence {
+    /// The first element for every key. Lists from the network, playlists and old backups can
+    /// repeat items, and SwiftUI lists need unique identifiers.
+    func uniqued<Key: Hashable>(by key: (Element) -> Key) -> [Element] {
+        var seen = Set<Key>()
+        var result: [Element] = []
+        for element in self where seen.insert(key(element)).inserted {
+            result.append(element)
+        }
+        return result
+    }
+}
+
+extension Task where Success == Never, Failure == Never {
+    /// `Task.sleep` for a number of seconds that may come from the network or a calculation:
+    /// negative, NaN, infinite and huge values are clamped instead of trapping.
+    static func sleep(seconds: Double) async throws {
+        let clamped = seconds.isFinite ? min(max(seconds, 0), 86_400) : 0
+        try await Task.sleep(nanoseconds: UInt64(clamped * 1_000_000_000))
+    }
+}
+
+/// Asks iOS for a little time in the background, so a short write is not cut off when the
+/// app is suspended.
+final class BackgroundTaskToken: @unchecked Sendable {
+    private let lock = NSLock()
+    private var identifier: UIBackgroundTaskIdentifier = .invalid
+    private var ended = false
+
+    @MainActor
+    static func begin(_ name: String) -> BackgroundTaskToken {
+        let token = BackgroundTaskToken()
+        let identifier = UIApplication.shared.beginBackgroundTask(withName: name) {
+            token.end()
+        }
+        token.lock.lock()
+        let alreadyEnded = token.ended
+        if !alreadyEnded { token.identifier = identifier }
+        token.lock.unlock()
+        if alreadyEnded, identifier != .invalid {
+            UIApplication.shared.endBackgroundTask(identifier)
+        }
+        return token
+    }
+
+    /// May be called from any thread, more than once.
+    func end() {
+        lock.lock()
+        let identifier = self.identifier
+        self.identifier = .invalid
+        ended = true
+        lock.unlock()
+        guard identifier != .invalid else { return }
+        Task { @MainActor in
+            UIApplication.shared.endBackgroundTask(identifier)
+        }
     }
 }

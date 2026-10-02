@@ -8,8 +8,8 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    MARKETING_VERSION: "0.6.0"
-    CURRENT_PROJECT_VERSION: "6"
+    MARKETING_VERSION: "0.7.0"
+    CURRENT_PROJECT_VERSION: "7"
 packages:
   VLCKitSPM:
     url: https://github.com/tylerjonesio/vlckit-spm
@@ -37,6 +37,7 @@ targets:
         ENABLE_BITCODE: NO
         OTHER_LDFLAGS: ["$(inherited)", "-lresolv", "-lc++"]
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        DEBUG_INFORMATION_FORMAT: dwarf-with-dsym
     info:
       path: Config/Info.plist
       properties:

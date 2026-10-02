@@ -263,7 +263,7 @@ final class TorrentSearchService {
         nextRequestAt = slot.addingTimeInterval(0.9)
         let delay = slot.timeIntervalSince(now)
         if delay > 0 {
-            try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            try await Task.sleep(seconds: min(delay, 300))
         }
         try Task.checkCancellation()
     }
@@ -271,8 +271,11 @@ final class TorrentSearchService {
     private func registerRateLimit(retryAfter: TimeInterval?) {
         rateLimitLevel = min(rateLimitLevel + 1, 4)
         let automatic = min(120, 12 * pow(2, Double(rateLimitLevel - 1)))
-        let delay = max(1, retryAfter ?? automatic)
-        rateLimitUntil = max(rateLimitUntil, Date().addingTimeInterval(delay))
+        // Retry-After comes from the server: "inf", "nan" or a huge number must not
+        // break the timer, and a search should never wait for more than five minutes.
+        let requested = retryAfter.flatMap { $0.isFinite ? $0 : nil } ?? automatic
+        let delay = min(300, max(1, requested))
+        rateLimitUntil = min(max(rateLimitUntil, Date().addingTimeInterval(delay)), Date().addingTimeInterval(300))
     }
 }
 

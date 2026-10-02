@@ -248,7 +248,7 @@ struct DetailsView: View {
                 .frame(maxWidth: .infinity)
                 .overlay {
                     if let cover = film?.coverUrl, let url = URL(string: cover) {
-                        PosterImage(url: url)
+                        PosterImage(url: url, maxPixel: 1300)
                     } else {
                         PosterImage(url: current.poster)
                             .blur(radius: 24)
@@ -825,7 +825,7 @@ struct SimilarBlock: View {
         .task(id: itemId) {
             guard !loaded else { return }
             if let list = try? await KPClient.shared.similars(itemId) {
-                items = list
+                items = list.uniqued(by: \.id)
                 loaded = true
             }
         }

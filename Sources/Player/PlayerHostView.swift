@@ -598,8 +598,9 @@ struct PlayerHostView: View {
             firstFrameLogged = true
             let elapsed = Date().timeIntervalSince(attemptStartedAt) * 1_000
             startupMs = elapsed
-            AppDiagnostics.shared.log("player", "Первый кадр за \(Int(elapsed)) мс")
+            AppDiagnostics.shared.log("player", "Первый кадр за \(Int(elapsed)) мс · \(AppDiagnostics.memorySummary())")
         }
+        AppDiagnostics.shared.setPlayback(request.item?.title ?? request.title)
         if model.isBuffering { scheduleRecovery(reason: "поток завис при запуске", delay: 12) }
         if let item = request.item {
             library.removeWatchLater(item)
@@ -619,7 +620,7 @@ struct PlayerHostView: View {
         guard automaticRecovery, !request.isLive, phase == .playing, !closing else { return }
         recoveryTask?.cancel()
         recoveryTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            try? await Task.sleep(seconds: delay)
             guard !Task.isCancelled, !closing, phase == .playing,
                   model.failed || model.isBuffering else { return }
             await recoverPlayback(reason: reason)
@@ -773,7 +774,8 @@ struct PlayerHostView: View {
         preloadTask?.cancel()
         cancelSleepTimer()
         saveProgress(final: true)
-        model.stop()
+        model.shutdown()
+        AppDiagnostics.shared.setPlayback(nil)
         coordinator.request = nil
     }
 
@@ -787,8 +789,10 @@ struct PlayerHostView: View {
         if !closing {
             closing = true
             saveProgress(final: true)
-            model.stop()
         }
+        // Final: the VLC player is released off the main thread once it has stopped.
+        model.shutdown()
+        AppDiagnostics.shared.setPlayback(nil)
         // The torrent is not dropped here: TorrServer keeps it for a few minutes
         // (reopening or the next episode starts without reconnecting) and closes it itself.
         if OrientationHelper.isPhone {
@@ -846,7 +850,7 @@ struct PlayerHostView: View {
         let seconds = TimeInterval(choice.rawValue * 60)
         sleepDeadline = Date().addingTimeInterval(seconds)
         sleepTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            try? await Task.sleep(seconds: seconds)
             guard !Task.isCancelled, !closing else { return }
             sleepChoice = .off
             sleepDeadline = nil
@@ -1396,7 +1400,9 @@ struct PlayerHostView: View {
     }
 
     private var displayedTime: Int32 {
-        scrubbing ? Int32(scrubValue * Double(model.lengthMs)) : model.timeMs
+        guard scrubbing else { return model.timeMs }
+        let fraction = scrubValue.isFinite ? min(max(scrubValue, 0), 1) : 0
+        return Int32(fraction * Double(max(0, model.lengthMs)))
     }
 
     private var bottomBar: some View {

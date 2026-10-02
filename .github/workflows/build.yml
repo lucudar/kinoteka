@@ -95,6 +95,18 @@ jobs:
           zip -qry Kinoteka.ipa Payload
           ls -lh Kinoteka.ipa
 
+      - name: Package dSYM
+        continue-on-error: true
+        run: |
+          # Symbols for reading crash reports (iPhone: Настройки → Конфиденциальность → Аналитика).
+          DSYM=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app.dSYM" | head -1)
+          if [ -n "$DSYM" ]; then
+            (cd "$(dirname "$DSYM")" && zip -qry "$GITHUB_WORKSPACE/Kinoteka.dSYM.zip" "$(basename "$DSYM")")
+            ls -lh Kinoteka.dSYM.zip
+          else
+            echo "dSYM не найден"
+          fi
+
       - uses: actions/upload-artifact@v4
         with:
           name: Kinoteka-ipa
@@ -104,14 +116,16 @@ jobs:
       - name: Publish release
         run: |
           TAG="build-${{ github.run_number }}"
+          FILES="Kinoteka.ipa"
+          if [ -f Kinoteka.dSYM.zip ]; then FILES="$FILES Kinoteka.dSYM.zip"; fi
           if [ "$GITHUB_REF_NAME" = "main" ]; then
-            gh release create "$TAG" Kinoteka.ipa \
+            gh release create "$TAG" $FILES \
               --target "$GITHUB_SHA" \
               --title "Кинотека — сборка ${{ github.run_number }}" \
               --notes "Коммит ${GITHUB_SHA::7}. Файл Kinoteka.ipa ставится на iPhone через Sideloadly (см. README)." \
               --latest
           else
-            gh release create "$TAG" Kinoteka.ipa \
+            gh release create "$TAG" $FILES \
               --target "$GITHUB_SHA" \
               --title "Кинотека — тестовая сборка ${{ github.run_number }} ($GITHUB_REF_NAME)" \
               --notes "Тестовая сборка из ветки $GITHUB_REF_NAME, коммит ${GITHUB_SHA::7}. Основные сборки — из main." \
