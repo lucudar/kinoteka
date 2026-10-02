@@ -4,54 +4,73 @@ import ImageIO
 
 // MARK: - Image loading with memory + disk cache
 
-final class ImageCache {
+final class ImageCache: @unchecked Sendable {
     static let shared = ImageCache()
+    /// Grid posters are at most about 180×270 pt: 800 px covers 3× screens.
+    static let defaultMaxPixel = 800
 
-    private let memory = NSCache<NSURL, UIImage>()
+    private let memory = NSCache<NSString, UIImage>()
+    private let urlCache: URLCache
     private let session: URLSession
     private let lock = NSLock()
-    private var inFlight: [URL: Task<UIImage?, Never>] = [:]
+    private var inFlight: [String: Task<UIImage?, Never>] = [:]
 
     init() {
-        memory.countLimit = 400
-        memory.totalCostLimit = 120 * 1024 * 1024
+        memory.countLimit = 300
+        memory.totalCostLimit = 80 * 1024 * 1024
         let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("images", isDirectory: true)
+        urlCache = URLCache(memoryCapacity: 8 * 1024 * 1024, diskCapacity: 300 * 1024 * 1024, directory: dir)
         let config = URLSessionConfiguration.default
-        config.urlCache = URLCache(memoryCapacity: 16 * 1024 * 1024, diskCapacity: 300 * 1024 * 1024, directory: dir)
+        config.urlCache = urlCache
         config.requestCachePolicy = .returnCacheDataElseLoad
         config.timeoutIntervalForRequest = 30
         session = URLSession(configuration: config)
     }
 
-    func cached(_ url: URL) -> UIImage? {
-        memory.object(forKey: url as NSURL)
+    private static func key(_ url: URL, _ maxPixel: Int) -> String {
+        "\(maxPixel)|\(url.absoluteString)"
     }
 
-    func load(_ url: URL) async -> UIImage? {
-        if let image = cached(url) { return image }
+    func cached(_ url: URL, maxPixel: Int = ImageCache.defaultMaxPixel) -> UIImage? {
+        memory.object(forKey: ImageCache.key(url, maxPixel) as NSString)
+    }
+
+    func load(_ url: URL, maxPixel: Int = ImageCache.defaultMaxPixel) async -> UIImage? {
+        let key = ImageCache.key(url, maxPixel)
+        if let image = memory.object(forKey: key as NSString) { return image }
         let task: Task<UIImage?, Never>
         lock.lock()
-        if let existing = inFlight[url] {
+        if let existing = inFlight[key] {
             task = existing
         } else {
             let session = session
+            let size = max(64, min(maxPixel, 2000))
             task = Task {
                 guard let (data, _) = try? await session.data(from: url),
-                      let image = ImageCache.downsample(data, maxPixel: 1400) else { return nil }
+                      let image = ImageCache.downsample(data, maxPixel: size) else { return nil }
                 return await image.byPreparingForDisplay() ?? image
             }
-            inFlight[url] = task
+            inFlight[key] = task
         }
         lock.unlock()
 
         let prepared = await task.value
         lock.lock()
-        inFlight[url] = nil
+        inFlight[key] = nil
         lock.unlock()
         guard let prepared = prepared else { return nil }
-        let cost = Int(prepared.size.width * prepared.scale * prepared.size.height * prepared.scale * 4)
-        memory.setObject(prepared, forKey: url as NSURL, cost: cost)
+        let pixels = prepared.size.width * prepared.scale * prepared.size.height * prepared.scale
+        let cost = pixels.isFinite ? Int(min(max(pixels * 4, 0), 64 * 1024 * 1024)) : 0
+        memory.setObject(prepared, forKey: key as NSString, cost: cost)
         return prepared
+    }
+
+    /// Memory warning: decoded images are dropped, the files stay in the disk cache.
+    func purgeMemory() {
+        memory.removeAllObjects()
+        let capacity = urlCache.memoryCapacity
+        urlCache.memoryCapacity = 0
+        urlCache.memoryCapacity = capacity
     }
 
     /// Posters from Kinopoisk can be several thousand pixels wide. Decoding them
@@ -73,12 +92,14 @@ final class ImageCache {
 struct PosterImage: View {
     let url: URL?
     var mode: ContentMode = .fill
+    var maxPixel: Int = ImageCache.defaultMaxPixel
     @State private var image: UIImage?
 
-    init(url: URL?, mode: ContentMode = .fill) {
+    init(url: URL?, mode: ContentMode = .fill, maxPixel: Int = ImageCache.defaultMaxPixel) {
         self.url = url
         self.mode = mode
-        _image = State(initialValue: url.flatMap { ImageCache.shared.cached($0) })
+        self.maxPixel = maxPixel
+        _image = State(initialValue: url.flatMap { ImageCache.shared.cached($0, maxPixel: maxPixel) })
     }
 
     var body: some View {
@@ -100,11 +121,11 @@ struct PosterImage: View {
                 image = nil
                 return
             }
-            if let cached = ImageCache.shared.cached(url) {
+            if let cached = ImageCache.shared.cached(url, maxPixel: maxPixel) {
                 image = cached
                 return
             }
-            let loaded = await ImageCache.shared.load(url)
+            let loaded = await ImageCache.shared.load(url, maxPixel: maxPixel)
             if !Task.isCancelled, let loaded = loaded {
                 image = loaded
             }

@@ -158,7 +158,7 @@ final class KPClient {
 
     func seasons(_ id: Int) async throws -> [KPSeason] {
         let result: KPSeasons = try await get("/api/v2.2/films/\(id)/seasons", ttl: TTL.day)
-        return result.items
+        return KPSeason.merged(result.items)
     }
 
     func staff(_ id: Int) async throws -> [KPStaff] {

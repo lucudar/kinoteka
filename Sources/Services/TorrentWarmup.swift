@@ -66,6 +66,18 @@ final class TorrentWarmup {
         _ = try? await TorrServer.shared.get(hash: hash)
     }
 
+    /// Memory is low: the torrent prepared only in advance is closed (its cache lives in the
+    /// app's memory). Playback adds it again when needed.
+    func releaseUnused() {
+        guard let hash = warmHash, hash != playingHash else { return }
+        warmHash = nil
+        warmLink = nil
+        if pageHash == hash { pageHash = nil }
+        generation += 1
+        AppDiagnostics.shared.log("torrent", "Нехватка памяти: заранее подготовленная раздача закрыта")
+        Task { await TorrServer.shared.drop(hash: hash) }
+    }
+
     /// Playback of `hash` started: the torrent played before and the one prepared for
     /// another release are disconnected, so the new one gets all the bandwidth.
     func playbackStarted(hash: String) {

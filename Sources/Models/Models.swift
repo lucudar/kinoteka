@@ -235,6 +235,19 @@ struct KPSeason: Decodable, Identifiable {
     let number: Int
     let episodes: [KPEpisode]
     var id: Int { number }
+
+    /// Kinopoisk sometimes lists a season or an episode twice; the lists need unique ids.
+    static func merged(_ seasons: [KPSeason]) -> [KPSeason] {
+        var order: [Int] = []
+        var episodes: [Int: [KPEpisode]] = [:]
+        for season in seasons {
+            if episodes[season.number] == nil { order.append(season.number) }
+            episodes[season.number, default: []] += season.episodes
+        }
+        return order.map { number in
+            KPSeason(number: number, episodes: (episodes[number] ?? []).uniqued(by: \.id))
+        }
+    }
 }
 
 struct KPEpisode: Decodable, Identifiable, Hashable {

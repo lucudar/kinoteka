@@ -90,7 +90,8 @@ struct TVChannelsView: View {
         if !q.isEmpty {
             list = list.filter { $0.name.lowercased().contains(q) }
         }
-        return list
+        // Playlists often repeat a channel; the grid needs unique ids.
+        return list.uniqued(by: \.url)
     }
 
     private var channelGrid: some View {

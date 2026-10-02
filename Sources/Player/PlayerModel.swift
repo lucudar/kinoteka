@@ -89,9 +89,69 @@ final class VideoSurfaceView: UIView {
     }
 }
 
+/// Holds a stopped VLC player until libvlc has finished closing its stream, then
+/// releases it on a background queue.
+///
+/// The iOS video output of libvlc creates and removes its view with
+/// `performSelectorOnMainThread:…waitUntilDone:YES`, and releasing a player waits
+/// for libvlc's worker thread that closes the stream. Releasing a player on the
+/// main thread while its stream is still closing can therefore freeze the app
+/// until iOS terminates it. The video view is released on the main thread afterwards.
+enum VLCPlayerGraveyard {
+    private final class Remains: @unchecked Sendable {
+        var player: VLCMediaPlayer?
+        var view: UIView?
+
+        init(player: VLCMediaPlayer, view: UIView) {
+            self.player = player
+            self.view = view
+        }
+    }
+
+    private static let queue = DispatchQueue(label: "kinoteka.vlc.release", qos: .utility)
+
+    /// Call on the main thread.
+    static func bury(_ player: VLCMediaPlayer, view: UIView) {
+        if player.state != .stopped {
+            player.stop()
+        }
+        VLCPlayerGraveyard.waitForStop(Remains(player: player, view: view), checks: 0)
+    }
+
+    private static func waitForStop(_ remains: Remains, checks: Int) {
+        let stopped = remains.player?.state == .stopped
+        if !stopped && checks < 40 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                VLCPlayerGraveyard.waitForStop(remains, checks: checks + 1)
+            }
+            return
+        }
+        if !stopped {
+            AppDiagnostics.shared.log("player", "VLC не остановился за 10 с, освобождается принудительно")
+        }
+        // The callbacks VLCKit has already queued on the main thread run first.
+        VLCPlayerGraveyard.queue.asyncAfter(deadline: .now() + 1) {
+            remains.player = nil
+            DispatchQueue.main.async {
+                remains.view = nil
+            }
+        }
+    }
+}
+
+/// Lets the non-isolated `deinit` of the model reach its player.
+private final class VLCPlayerSlot: @unchecked Sendable {
+    var player: VLCMediaPlayer?
+    var view: UIView?
+}
+
 @MainActor
 final class VLCPlayerModel: ObservableObject {
-    let player = VLCMediaPlayer()
+    /// libvlc calls that may wait for the video output (aspect ratio, crop) run on
+    /// this queue: while the video output is being created it waits for the main thread.
+    private static let controlQueue = DispatchQueue(label: "kinoteka.vlc.control", qos: .userInitiated)
+
+    private let slot = VLCPlayerSlot()
     let videoView = VideoSurfaceView()
 
     @Published private(set) var isPlaying = false
@@ -109,6 +169,7 @@ final class VLCPlayerModel: ObservableObject {
     @Published private(set) var aspect: AspectMode = .fit
 
     private var timer: Timer?
+    private var aspectTask: Task<Void, Never>?
     private var lastTime: Int32 = -1
     private var stallTicks = 0
     private var tickCount = 0
@@ -125,20 +186,36 @@ final class VLCPlayerModel: ObservableObject {
     init() {
         videoView.backgroundColor = .black
         videoView.isUserInteractionEnabled = false
+        let player = VLCMediaPlayer()
         player.drawable = videoView
+        slot.player = player
+        slot.view = videoView
         videoView.onResize = { [weak self] _ in
-            self?.applyAspect()
+            self?.scheduleAspectUpdate()
         }
     }
 
-    var progress: Double {
-        guard lengthMs > 0 else { return 0 }
-        return min(1, max(0, Double(timeMs) / Double(lengthMs)))
+    deinit {
+        // Normally `shutdown()` has already handed the player over.
+        if let player = slot.player, let view = slot.view {
+            slot.player = nil
+            VLCPlayerGraveyard.bury(player, view: view)
+        }
     }
 
-    var isSeekable: Bool { player.isSeekable }
+    /// nil after `shutdown()`: every call below is then ignored.
+    private var player: VLCMediaPlayer? { slot.player }
+
+    var progress: Double {
+        guard lengthMs > 0 else { return 0 }
+        let value = Double(timeMs) / Double(lengthMs)
+        return value.isFinite ? min(1, max(0, value)) : 0
+    }
+
+    var isSeekable: Bool { player?.isSeekable ?? false }
 
     func load(url: URL, startAt: Int32, options: [String: Any], rate: Float, aspect: AspectMode, slaves: [(URL, VLCMediaPlaybackSlaveType)] = []) {
+        guard let player = player else { return }
         let media: VLCMedia = VLCMedia(url: url)
         var all: [String: Any] = ["network-caching": 3000]
         if startAt > 0 {
@@ -153,7 +230,7 @@ final class VLCPlayerModel: ObservableObject {
         ended = false
         failed = false
         isBuffering = true
-        timeMs = startAt
+        timeMs = max(0, startAt)
         lengthMs = 0
         lastTime = -1
         stallTicks = 0
@@ -166,17 +243,27 @@ final class VLCPlayerModel: ObservableObject {
         pendingSlaves = slaves
         hiddenVideoTrack = nil
 
+        // VLCKit ignores a new media with the same URL as the current one, together
+        // with its options (start position): the old one is detached first.
+        if let current = player.media, current.url == url {
+            player.media = nil
+        }
         player.media = media
         player.play()
+        applyAspect()
         startTimer()
         updateNowPlaying()
     }
 
     private func startTimer() {
         timer?.invalidate()
-        let t = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.tick()
+        let t = Timer(timeInterval: 0.5, repeats: true) { [weak self] timer in
+            guard let self = self else {
+                timer.invalidate()
+                return
+            }
+            MainActor.assumeIsolated {
+                self.tick()
             }
         }
         RunLoop.main.add(t, forMode: .common)
@@ -184,9 +271,10 @@ final class VLCPlayerModel: ObservableObject {
     }
 
     private func tick() {
+        guard let player = player else { return }
         tickCount += 1
         let state = player.state
-        let t = player.time.intValue
+        let t = max(0, player.time.intValue)
         let length = player.media?.length.intValue ?? 0
         if length > 0 && length != lengthMs { lengthMs = length }
         if t > 0 && t != timeMs { timeMs = t }
@@ -231,6 +319,7 @@ final class VLCPlayerModel: ObservableObject {
     }
 
     private func onStarted() {
+        guard let player = player else { return }
         for (url, type) in pendingSlaves {
             _ = player.addPlaybackSlave(url, type: type, enforce: false)
         }
@@ -238,18 +327,19 @@ final class VLCPlayerModel: ObservableObject {
         if abs(rate - 1) > 0.01 {
             player.rate = rate
         }
-        appliedAspectKey = ""
-        applyAspect()
+        applyAspect(force: true)
         refreshTracks()
         // The next episode started while the app is in the background: sound only.
         if videoOff { hideVideo() }
     }
 
     func refreshTracks() {
+        guard let player = player else { return }
         let audioNames = player.audioTrackNames.compactMap { $0 as? String }
         let audioIds = player.audioTrackIndexes.compactMap { ($0 as? NSNumber)?.int32Value }
+        var seenAudio = Set<Int32>()
         let audio = zip(audioIds, audioNames)
-            .filter { $0.0 >= 0 }
+            .filter { $0.0 >= 0 && seenAudio.insert($0.0).inserted }
             .map { MediaTrack(id: $0.0, name: $0.1) }
         if audio != audioTracks { audioTracks = audio }
         let audioIndex = player.currentAudioTrackIndex
@@ -257,8 +347,9 @@ final class VLCPlayerModel: ObservableObject {
 
         let subNames = player.videoSubTitlesNames.compactMap { $0 as? String }
         let subIds = player.videoSubTitlesIndexes.compactMap { ($0 as? NSNumber)?.int32Value }
+        var seenSubs = Set<Int32>()
         var subs = zip(subIds, subNames)
-            .filter { $0.0 >= 0 }
+            .filter { $0.0 >= 0 && seenSubs.insert($0.0).inserted }
             .map { MediaTrack(id: $0.0, name: $0.1) }
         if !subs.isEmpty {
             subs.insert(MediaTrack(id: -1, name: "Выключены"), at: 0)
@@ -270,6 +361,7 @@ final class VLCPlayerModel: ObservableObject {
 
     /// Connects an external audio file (separate dub) to the current stream.
     func addAudioSlave(_ url: URL) {
+        guard let player = player else { return }
         _ = player.addPlaybackSlave(url, type: .audio, enforce: true)
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 1_500_000_000)
@@ -278,6 +370,7 @@ final class VLCPlayerModel: ObservableObject {
     }
 
     func togglePlay() {
+        guard let player = player else { return }
         if player.isPlaying {
             pause()
         } else {
@@ -286,14 +379,14 @@ final class VLCPlayerModel: ObservableObject {
     }
 
     func pause() {
-        guard player.isPlaying else { return }
+        guard let player = player, player.isPlaying else { return }
         player.pause()
         isPlaying = false
         updateNowPlaying()
     }
 
     func resume() {
-        guard !player.isPlaying else { return }
+        guard let player = player, !player.isPlaying else { return }
         if ended {
             ended = false
         }
@@ -305,22 +398,23 @@ final class VLCPlayerModel: ObservableObject {
     }
 
     func jump(_ seconds: Int32) {
-        guard player.isSeekable else { return }
-        let target = max(0, timeMs + seconds * 1000)
-        if lengthMs > 0 && target >= lengthMs - 1000 { return }
-        player.time = VLCTime(int: target)
-        timeMs = target
+        guard let player = player, player.isSeekable else { return }
+        let target = max(0, Int64(timeMs) + Int64(seconds) * 1000)
+        if lengthMs > 0 && target >= Int64(lengthMs) - 1000 { return }
+        let clamped = Int32(min(target, Int64(Int32.max)))
+        player.time = VLCTime(int: clamped)
+        timeMs = clamped
         stallTicks = 0
         updateNowPlaying()
     }
 
     func seek(fraction: Double) {
-        guard lengthMs > 0 else { return }
+        guard lengthMs > 0, fraction.isFinite else { return }
         seek(ms: Int32(Double(lengthMs) * min(max(fraction, 0), 0.995)))
     }
 
     func seek(ms: Int32) {
-        guard player.isSeekable else { return }
+        guard let player = player, player.isSeekable else { return }
         var target = max(0, ms)
         if lengthMs > 0 { target = min(target, Int32(Double(lengthMs) * 0.995)) }
         player.time = VLCTime(int: target)
@@ -335,6 +429,7 @@ final class VLCPlayerModel: ObservableObject {
     /// playing, as in VLC) and back on when the app returns.
     func setVideoEnabled(_ enabled: Bool) {
         videoOff = !enabled
+        guard let player = player else { return }
         if enabled {
             guard let saved = hiddenVideoTrack else { return }
             hiddenVideoTrack = nil
@@ -344,22 +439,25 @@ final class VLCPlayerModel: ObservableObject {
             } else if let first = available.first {
                 player.currentVideoTrackIndex = first
             }
+            AppDiagnostics.shared.log("player", "Картинка включена")
         } else if player.isPlaying {
             hideVideo()
         }
     }
 
     private func hideVideo() {
-        guard hiddenVideoTrack == nil else { return }
+        guard let player = player, hiddenVideoTrack == nil else { return }
         let current = player.currentVideoTrackIndex
         guard current >= 0 else { return }
         hiddenVideoTrack = current
         player.currentVideoTrackIndex = -1
+        AppDiagnostics.shared.log("player", "Фон: только звук")
     }
 
     // MARK: Lock screen and Control Center
 
     func enableRemoteControls(title: String, subtitle: String?, isLive: Bool) {
+        guard player != nil else { return }
         nowPlayingTitle = title
         nowPlayingSubtitle = subtitle
         isLiveStream = isLive
@@ -449,6 +547,7 @@ final class VLCPlayerModel: ObservableObject {
     }
 
     func setRate(_ value: Float) {
+        guard let player = player, value.isFinite, value > 0 else { return }
         rate = value
         player.rate = value
         updateNowPlaying()
@@ -460,18 +559,64 @@ final class VLCPlayerModel: ObservableObject {
     }
 
     func setAudio(_ id: Int32) {
+        guard let player = player else { return }
         player.currentAudioTrackIndex = id
         currentAudio = id
     }
 
     func setSubtitle(_ id: Int32) {
+        guard let player = player else { return }
         player.currentVideoSubTitleIndex = id
         currentSubtitle = id
     }
 
-    private func setAspectRatio(_ value: String?) {
-        if let value = value {
-            value.withCString { pointer in
+    /// Rotation produces several sizes in a row: only the last one is applied.
+    private func scheduleAspectUpdate() {
+        aspectTask?.cancel()
+        aspectTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            guard !Task.isCancelled else { return }
+            self?.applyAspect()
+        }
+    }
+
+    func applyAspect(force: Bool = false) {
+        guard let player = player else { return }
+        let size = videoView.bounds.size
+        guard size.width > 1, size.height > 1, size.width.isFinite, size.height.isFinite else { return }
+        let screen = "\(Int(size.width.rounded())):\(Int(size.height.rounded()))"
+        var ratio: String?
+        var crop: String?
+        switch aspect {
+        case .fit:
+            break
+        case .fill:
+            crop = screen
+        case .stretch:
+            ratio = screen
+        case .ratio16x9:
+            ratio = "16:9"
+        case .ratio4x3:
+            ratio = "4:3"
+        }
+        let key = "\(ratio ?? "-")|\(crop ?? "-")"
+        guard force || key != appliedAspectKey else { return }
+        appliedAspectKey = key
+        VLCPlayerModel.controlQueue.async {
+            VLCPlayerModel.applyGeometry(to: player, ratio: ratio, crop: crop)
+        }
+    }
+
+    private nonisolated static func applyGeometry(to player: VLCMediaPlayer, ratio: String?, crop: String?) {
+        if let crop = crop {
+            crop.withCString { pointer in
+                player.videoCropGeometry = UnsafeMutablePointer(mutating: pointer)
+            }
+        } else {
+            player.videoCropGeometry = nil
+        }
+        if let ratio = ratio {
+            ratio.withCString { pointer in
                 player.videoAspectRatio = UnsafeMutablePointer(mutating: pointer)
             }
         } else {
@@ -479,49 +624,26 @@ final class VLCPlayerModel: ObservableObject {
         }
     }
 
-    private func setCrop(_ value: String?) {
-        if let value = value {
-            value.withCString { pointer in
-                player.videoCropGeometry = UnsafeMutablePointer(mutating: pointer)
-            }
-        } else {
-            player.videoCropGeometry = nil
-        }
-    }
-
-    func applyAspect() {
-        let size = videoView.bounds.size
-        guard size.width > 1, size.height > 1 else { return }
-        let screen = "\(Int(size.width.rounded())):\(Int(size.height.rounded()))"
-        let key = "\(aspect.rawValue)-\(screen)"
-        guard key != appliedAspectKey else { return }
-        appliedAspectKey = key
-        switch aspect {
-        case .fit:
-            setCrop(nil)
-            setAspectRatio(nil)
-        case .fill:
-            setAspectRatio(nil)
-            setCrop(screen)
-        case .stretch:
-            setCrop(nil)
-            setAspectRatio(screen)
-        case .ratio16x9:
-            setCrop(nil)
-            setAspectRatio("16:9")
-        case .ratio4x3:
-            setCrop(nil)
-            setAspectRatio("4:3")
-        }
-    }
-
+    /// Stops the stream; the player can load another one afterwards (recovery, next file).
     func stop() {
         timer?.invalidate()
         timer = nil
         disableRemoteControls()
-        // VLCKit is also read from this actor by the timer and track controls.
-        // Stopping it on another queue could race those reads and crash on close.
-        player.stop()
+        player?.stop()
+    }
+
+    /// Final stop when the player screen closes. Safe to call more than once.
+    func shutdown() {
+        timer?.invalidate()
+        timer = nil
+        aspectTask?.cancel()
+        aspectTask = nil
+        disableRemoteControls()
+        guard let player = slot.player else { return }
+        slot.player = nil
+        isPlaying = false
+        AppDiagnostics.shared.log("player", "Плеер закрыт")
+        VLCPlayerGraveyard.bury(player, view: videoView)
     }
 }
 
