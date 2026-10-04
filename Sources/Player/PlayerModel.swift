@@ -167,6 +167,9 @@ final class VLCPlayerModel: ObservableObject {
     @Published private(set) var currentSubtitle: Int32 = -1
     @Published private(set) var rate: Float = 1
     @Published private(set) var aspect: AspectMode = .fit
+    /// Shift of the sound and of the subtitles against the picture (ms, "+" = later).
+    @Published private(set) var audioDelayMs = 0
+    @Published private(set) var subtitleDelayMs = 0
 
     private var timer: Timer?
     private var aspectTask: Task<Void, Never>?
@@ -328,6 +331,8 @@ final class VLCPlayerModel: ObservableObject {
             player.rate = rate
         }
         applyAspect(force: true)
+        // A new stream starts without the shift: the one chosen for the release stays.
+        if audioDelayMs != 0 || subtitleDelayMs != 0 { applyDelays() }
         refreshTracks()
         // The next episode started while the app is in the background: sound only.
         if videoOff { hideVideo() }
@@ -568,6 +573,28 @@ final class VLCPlayerModel: ObservableObject {
         guard let player = player else { return }
         player.currentVideoSubTitleIndex = id
         currentSubtitle = id
+    }
+
+    /// Out-of-sync dubs (often a separate audio file of the release) and subtitles.
+    func setAudioDelay(ms: Int) {
+        audioDelayMs = min(max(ms, -10_000), 10_000)
+        applyDelays()
+    }
+
+    func setSubtitleDelay(ms: Int) {
+        subtitleDelayMs = min(max(ms, -60_000), 60_000)
+        applyDelays()
+    }
+
+    /// VLC takes the shifts in microseconds.
+    private func applyDelays() {
+        guard let player = player else { return }
+        let audio = audioDelayMs * 1_000
+        let subtitle = subtitleDelayMs * 1_000
+        VLCPlayerModel.controlQueue.async {
+            player.currentAudioPlaybackDelay = audio
+            player.currentVideoSubTitleDelay = subtitle
+        }
     }
 
     /// Rotation produces several sizes in a row: only the last one is applied.

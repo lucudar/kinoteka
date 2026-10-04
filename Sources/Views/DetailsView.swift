@@ -33,6 +33,8 @@ struct DetailsView: View {
     /// Voice-over picked on the page for the next playback; nil means "Авто".
     @State private var chosenVoice: ReleaseVoiceOption?
     @State private var appliedDefaultVoice = false
+    /// The season below was chosen automatically once (the one being watched).
+    @State private var seasonPreselected = false
 
     private var current: MediaItem { film?.item ?? item }
     private var isSeries: Bool { film?.isSeries ?? (item.kind == .series) }
@@ -56,12 +58,35 @@ struct DetailsView: View {
         filmResolved ? TorrentSearchQuery(item: current) : nil
     }
 
-    /// The episode "Смотреть" starts for a series: the first one of the season chosen below.
+    private var watchedEpisodes: Set<String> { library.watchedEpisodes(for: item.key) }
+
+    /// The episode "Смотреть" starts for a series: the first one not watched yet of the season
+    /// chosen below (or of the next seasons when it is watched), otherwise its first episode.
     private var firstEpisode: KPEpisode? {
         let season = seasons.first(where: { $0.number == selectedSeason })
             ?? seasons.first(where: { $0.number > 0 })
             ?? seasons.first
-        return season?.episodes.first
+        guard let season = season else { return nil }
+        let watched = watchedEpisodes
+        guard !watched.isEmpty else { return season.episodes.first }
+        for candidate in seasons where candidate.number >= season.number {
+            if let next = candidate.episodes.first(where: { !watched.contains($0.id) && !RuDate.isFuture($0.releaseDate) }) {
+                return next
+            }
+        }
+        return season.episodes.first
+    }
+
+    /// The season to show first: the one being continued, otherwise the first one with
+    /// an episode not watched yet.
+    private func initialSeason(in list: [KPSeason]) -> Int? {
+        if let season = continueEntry?.season, list.contains(where: { $0.number == season }) { return season }
+        let watched = watchedEpisodes
+        guard !watched.isEmpty else { return nil }
+        let regular = list.filter { $0.number > 0 }
+        return (regular.isEmpty ? list : regular).first { season in
+            season.episodes.contains { !watched.contains($0.id) && !RuDate.isFuture($0.releaseDate) }
+        }?.number
     }
 
     /// Season of the main button: the one being continued, or the one chosen below.
@@ -169,9 +194,9 @@ struct DetailsView: View {
             if let info = sources.first(where: { $0.link == entry.link })?.info { parts.append(info) }
             return parts.isEmpty ? nil : parts.joined(separator: " · ")
         case .source(let source):
-            return "Раздача: " + (source.info ?? source.title)
+            return episodePrefix + "Раздача: " + (source.info ?? source.title)
         case .release(let release):
-            return "Раздача: " + (release.summary.isEmpty ? release.title : release.summary)
+            return episodePrefix + "Раздача: " + (release.summary.isEmpty ? release.title : release.summary)
         case nil:
             if searchingRelease { return nil }
             if releases == nil {
@@ -179,6 +204,12 @@ struct DetailsView: View {
             }
             return "Раздачи не найдены автоматически — откройте «Раздачи»"
         }
+    }
+
+    /// "2 сезон, 3 серия · " before the release of a series (what "Смотреть" starts).
+    private var episodePrefix: String {
+        guard isSeries, continueEntry == nil, let episode = firstEpisode else { return "" }
+        return "\(episode.seasonNumber) сезон, \(episode.episodeNumber) серия · "
     }
 
     var body: some View {
@@ -193,8 +224,8 @@ struct DetailsView: View {
                 if isSeries && !seasons.isEmpty {
                     seasonsBlock
                 }
-                if !actors.isEmpty {
-                    actorsBlock
+                if !people.isEmpty {
+                    peopleBlock
                 }
                 if let error = error {
                     ErrorView(message: error) { Task { await load() } }
@@ -647,19 +678,33 @@ struct DetailsView: View {
             .joined(separator: ", ")
     }
 
-    private var actors: [KPStaff] {
-        Array(staff.filter { $0.professionKey == "ACTOR" && !$0.name.isEmpty }.prefix(20))
+    /// Directors first, then the cast: every person opens their films.
+    private var people: [KPStaff] {
+        let directors = staff.filter { $0.professionKey == "DIRECTOR" && !$0.name.isEmpty }.prefix(2)
+        let actors = staff.filter { $0.professionKey == "ACTOR" && !$0.name.isEmpty }.prefix(20)
+        return Array(directors) + Array(actors)
     }
 
     // MARK: Seasons
 
     private var seasonsBlock: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            SectionHeader(title: "Сезоны и серии")
+        let watched = watchedEpisodes
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("Сезоны и серии")
+                    .font(.title3.weight(.bold))
+                Spacer()
+                if let season = seasons.first(where: { $0.number == selectedSeason }) {
+                    seasonMenu(season, watched: watched)
+                }
+            }
+            .padding(.horizontal, 16)
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 8) {
                     ForEach(seasons) { season in
-                        Chip(title: "\(season.number) сезон", selected: season.number == selectedSeason) {
+                        let complete = !season.episodes.isEmpty && season.episodes.allSatisfy { watched.contains($0.id) }
+                        Chip(title: complete ? "\(season.number) сезон ✓" : "\(season.number) сезон",
+                             selected: season.number == selectedSeason) {
                             selectedSeason = season.number
                         }
                     }
@@ -672,9 +717,12 @@ struct DetailsView: View {
                         Button {
                             play(episode)
                         } label: {
-                            EpisodeRow(episode: episode)
+                            EpisodeRow(episode: episode,
+                                       watched: watched.contains(episode.id),
+                                       progress: progress(of: episode))
                         }
                         .buttonStyle(.plain)
+                        .contextMenu { episodeMenu(episode, in: season, watched: watched) }
                         Divider().padding(.leading, 64)
                     }
                 }
@@ -682,36 +730,130 @@ struct DetailsView: View {
         }
     }
 
-    // MARK: Actors
+    /// The share watched of the episode being continued.
+    private func progress(of episode: KPEpisode) -> Double? {
+        guard let entry = continueEntry, entry.episode == episode.episodeNumber,
+              (entry.season ?? episode.seasonNumber) == episode.seasonNumber,
+              entry.position > 0.01 else { return nil }
+        return min(entry.position, 1)
+    }
 
-    private var actorsBlock: some View {
+    @ViewBuilder
+    private func episodeMenu(_ episode: KPEpisode, in season: KPSeason, watched: Set<String>) -> some View {
+        let isWatched = watched.contains(episode.id)
+        Button {
+            play(episode)
+        } label: {
+            Label("Смотреть", systemImage: "play.fill")
+        }
+        Button {
+            library.setEpisodeWatched(item.key, season: episode.seasonNumber, episode: episode.episodeNumber,
+                                      watched: !isWatched)
+        } label: {
+            Label(isWatched ? "Снять отметку" : "Отметить просмотренной",
+                  systemImage: isWatched ? "eye.slash" : "eye")
+        }
+        if episode.id != season.episodes.first?.id {
+            Button {
+                markWatched(upTo: episode)
+            } label: {
+                Label("Просмотрено до этой серии", systemImage: "checkmark.circle")
+            }
+        }
+    }
+
+    private func seasonMenu(_ season: KPSeason, watched: Set<String>) -> some View {
+        let all = season.episodes.map { (season: $0.seasonNumber, episode: $0.episodeNumber) }
+        let complete = !season.episodes.isEmpty && season.episodes.allSatisfy { watched.contains($0.id) }
+        return Menu {
+            if complete {
+                Button {
+                    library.setEpisodesWatched(item.key, all, watched: false)
+                } label: {
+                    Label("Снять отметки сезона", systemImage: "eye.slash")
+                }
+            } else {
+                Button {
+                    library.setEpisodesWatched(item.key, all, watched: true)
+                } label: {
+                    Label("Отметить сезон просмотренным", systemImage: "eye")
+                }
+                if season.episodes.contains(where: { watched.contains($0.id) }) {
+                    Button {
+                        library.setEpisodesWatched(item.key, all, watched: false)
+                    } label: {
+                        Label("Снять отметки сезона", systemImage: "eye.slash")
+                    }
+                }
+            }
+        } label: {
+            Image(systemName: "ellipsis.circle")
+                .font(.title3)
+        }
+    }
+
+    /// Everything before the episode (earlier seasons too) and the episode itself.
+    private func markWatched(upTo episode: KPEpisode) {
+        var list: [(season: Int, episode: Int)] = []
+        for season in seasons where season.number > 0 || episode.seasonNumber == 0 {
+            for candidate in season.episodes {
+                if candidate.seasonNumber < episode.seasonNumber
+                    || (candidate.seasonNumber == episode.seasonNumber && candidate.episodeNumber <= episode.episodeNumber) {
+                    list.append((candidate.seasonNumber, candidate.episodeNumber))
+                }
+            }
+        }
+        library.setEpisodesWatched(item.key, list, watched: true)
+    }
+
+    // MARK: People
+
+    private var peopleBlock: some View {
         VStack(alignment: .leading, spacing: 12) {
-            SectionHeader(title: "Актёры")
+            SectionHeader(title: "Режиссёр и актёры")
             ScrollView(.horizontal, showsIndicators: false) {
                 LazyHStack(alignment: .top, spacing: 14) {
-                    ForEach(Array(actors.enumerated()), id: \.offset) { _, person in
-                        VStack(spacing: 6) {
-                            Color.clear
-                                .frame(width: 72, height: 72)
-                                .overlay { PosterImage(url: URL(string: person.posterUrl ?? "")) }
-                                .clipShape(Circle())
-                            Text(person.name)
-                                .font(.caption)
-                                .lineLimit(2, reservesSpace: true)
-                                .multilineTextAlignment(.center)
-                            if let role = person.description, !role.isEmpty {
-                                Text(role)
-                                    .font(.caption2)
-                                    .foregroundStyle(Theme.secondary)
-                                    .lineLimit(1)
+                    ForEach(Array(people.enumerated()), id: \.offset) { _, person in
+                        if let id = person.staffId {
+                            NavigationLink(value: PersonRoute(id: id, name: person.name, professionKey: person.professionKey)) {
+                                personCard(person)
                             }
+                            .buttonStyle(.plain)
+                        } else {
+                            personCard(person)
                         }
-                        .frame(width: 84)
                     }
                 }
                 .padding(.horizontal, 16)
             }
         }
+    }
+
+    private func personCard(_ person: KPStaff) -> some View {
+        VStack(spacing: 6) {
+            Color.clear
+                .frame(width: 72, height: 72)
+                .overlay { PosterImage(url: URL(string: person.posterUrl ?? "")) }
+                .clipShape(Circle())
+            Text(person.name)
+                .font(.caption)
+                .foregroundStyle(.white)
+                .lineLimit(2, reservesSpace: true)
+                .multilineTextAlignment(.center)
+            if person.professionKey == "DIRECTOR" {
+                Text("Режиссёр")
+                    .font(.caption2)
+                    .foregroundStyle(Theme.accent)
+                    .lineLimit(1)
+            } else if let role = person.description, !role.isEmpty {
+                Text(role)
+                    .font(.caption2)
+                    .foregroundStyle(Theme.secondary)
+                    .lineLimit(1)
+            }
+        }
+        .frame(width: 84)
+        .contentShape(Rectangle())
     }
 
     // MARK: Loading
@@ -741,7 +883,12 @@ struct DetailsView: View {
                 }
                 if let list = list {
                     seasons = list.filter { !$0.episodes.isEmpty }.sorted { $0.number < $1.number }
-                    if let first = seasons.first, !seasons.contains(where: { $0.number == selectedSeason }) {
+                    if !seasonPreselected, let season = initialSeason(in: seasons) {
+                        selectedSeason = season
+                    }
+                    seasonPreselected = true
+                    if let first = seasons.first(where: { $0.number > 0 }) ?? seasons.first,
+                       !seasons.contains(where: { $0.number == selectedSeason }) {
                         selectedSeason = first.number
                     }
                 }
@@ -768,39 +915,50 @@ enum SeriesTitle {
 
 struct EpisodeRow: View {
     let episode: KPEpisode
+    var watched = false
+    /// The share watched of the episode being continued.
+    var progress: Double? = nil
+
+    private var upcoming: Bool { RuDate.isFuture(episode.releaseDate) }
 
     private var dateText: String? {
-        guard let raw = episode.releaseDate, raw.count >= 10 else { return nil }
-        let parser = DateFormatter()
-        parser.locale = Locale(identifier: "en_US_POSIX")
-        parser.dateFormat = "yyyy-MM-dd"
-        guard let date = parser.date(from: String(raw.prefix(10))) else { return nil }
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "ru_RU")
-        formatter.dateFormat = "d MMMM yyyy"
-        return formatter.string(from: date)
+        guard let date = RuDate.text(episode.releaseDate) else { return nil }
+        return upcoming ? "Выйдет " + date : date
+    }
+
+    private var icon: String {
+        if watched { return "checkmark.circle.fill" }
+        if progress != nil { return "play.circle.fill" }
+        return upcoming ? "clock" : "play.circle"
     }
 
     var body: some View {
         HStack(spacing: 12) {
             Text("\(episode.episodeNumber)")
                 .font(.subheadline.weight(.bold))
+                .foregroundStyle(watched ? Theme.secondary : .white)
                 .frame(width: 36, height: 36)
                 .background(Circle().fill(Theme.card))
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: 3) {
                 Text(episode.title)
                     .font(.subheadline)
+                    .foregroundStyle(watched || upcoming ? Theme.secondary : .white)
                     .lineLimit(2)
                 if let date = dateText {
                     Text(date)
                         .font(.caption)
-                        .foregroundStyle(Theme.secondary)
+                        .foregroundStyle(upcoming ? Theme.accent : Theme.secondary)
+                }
+                if let progress = progress, !watched {
+                    ProgressView(value: progress)
+                        .tint(Theme.accent)
+                        .frame(maxWidth: 160)
                 }
             }
             Spacer(minLength: 8)
-            Image(systemName: "play.circle")
+            Image(systemName: icon)
                 .font(.title3)
-                .foregroundStyle(Theme.accent)
+                .foregroundStyle(upcoming && !watched ? Theme.secondary : Theme.accent)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 8)

@@ -21,16 +21,19 @@ struct HomeSection: Identifiable, Hashable {
 struct HomeView: View {
     @EnvironmentObject private var library: LibraryStore
     @AppStorage(SettingsKeys.kpToken) private var token = ""
+    @State private var path = NavigationPath()
 
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $path) {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 26) {
                     if token.trimmed.isEmpty {
                         TokenBanner()
                     }
                     if !library.data.continueWatching.isEmpty {
-                        ContinueWatchingRow(entries: library.data.continueWatching)
+                        ContinueWatchingRow(entries: library.data.continueWatching) { item in
+                            path.append(item)
+                        }
                     }
                     if !library.data.watchLater.isEmpty {
                         VStack(alignment: .leading, spacing: 10) {
@@ -53,6 +56,7 @@ struct HomeView: View {
             .navigationTitle("Кинотека")
             .navigationDestination(for: MediaItem.self) { DetailsView(item: $0) }
             .navigationDestination(for: HomeSection.self) { CollectionGridView(section: $0) }
+            .navigationDestination(for: PersonRoute.self) { PersonView(route: $0) }
         }
     }
 }
@@ -103,6 +107,8 @@ struct ContinueWatchingRow: View {
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var coordinator: PlayerCoordinator
     let entries: [ContinueEntry]
+    /// Opens the page of the film or series.
+    var openItem: ((MediaItem) -> Void)? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -117,6 +123,14 @@ struct ContinueWatchingRow: View {
                         }
                         .buttonStyle(.plain)
                         .contextMenu {
+                            if let item = entry.item, let openItem = openItem {
+                                Button {
+                                    openItem(item)
+                                } label: {
+                                    Label(item.kind == .series ? "Страница сериала" : "Страница фильма",
+                                          systemImage: "info.circle")
+                                }
+                            }
                             Button(role: .destructive) {
                                 library.removeContinue(entry.itemKey)
                             } label: {
@@ -133,6 +147,17 @@ struct ContinueWatchingRow: View {
 
 struct ContinueCard: View {
     let entry: ContinueEntry
+
+    /// "Осталось 34 мин": the length is known from the saved position and its share.
+    private var remainingText: String? {
+        guard let time = entry.time, time > 0, entry.position > 0.02, entry.position < 0.98 else { return nil }
+        let total = Double(time) / entry.position
+        let minutes = Int(((total - Double(time)) / 60_000).rounded(.up))
+        guard minutes > 0, minutes < 1_000 else { return nil }
+        if minutes < 60 { return "Осталось \(minutes) мин" }
+        let rest = minutes % 60
+        return rest == 0 ? "Осталось \(minutes / 60) ч" : "Осталось \(minutes / 60) ч \(rest) мин"
+    }
 
     var body: some View {
         HStack(spacing: 12) {
@@ -157,6 +182,11 @@ struct ContinueCard: View {
                         .lineLimit(2)
                 }
                 Spacer(minLength: 0)
+                if let remaining = remainingText {
+                    Text(remaining)
+                        .font(.caption2)
+                        .foregroundStyle(Theme.secondary)
+                }
                 ProgressView(value: min(max(entry.position, 0), 1))
                     .tint(Theme.accent)
             }

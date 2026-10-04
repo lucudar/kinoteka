@@ -313,11 +313,14 @@ struct Decade: Identifiable, Hashable {
     }
 }
 
-struct CatalogFilter: Equatable {
+struct CatalogFilter: Equatable, Codable {
     var type: String = "FILM"
     var order: String = "NUM_VOTE"
     var genreId: Int? = nil
     var countryId: Int? = nil
+    /// Names for the summary line ("драма, США"); not sent to the server.
+    var genreName: String? = nil
+    var countryName: String? = nil
     var decade: String = "all"
     var ratingFrom: Int = 0
     var hideWatched: Bool = false
@@ -339,6 +342,22 @@ struct CatalogFilter: Equatable {
         if let g = genreId { q.append(("genres", String(g))) }
         if let c = countryId { q.append(("countries", String(c))) }
         return q
+    }
+}
+
+extension CatalogFilter {
+    private static let storageKey = "catalogFilter"
+
+    /// The catalog opens with the filters chosen last time.
+    static func restored() -> CatalogFilter {
+        guard let raw = UserDefaults.standard.data(forKey: storageKey),
+              let filter = try? JSONDecoder().decode(CatalogFilter.self, from: raw) else { return CatalogFilter() }
+        return filter
+    }
+
+    func save() {
+        guard let raw = try? JSONEncoder().encode(self) else { return }
+        UserDefaults.standard.set(raw, forKey: CatalogFilter.storageKey)
     }
 }
 
@@ -399,10 +418,12 @@ struct LibraryData: Codable {
     var recentQueries: [String] = []
     /// Search-result IDs the user marked as broken or unwanted.
     var blockedReleaseIDs: [String] = []
+    /// Episodes watched to the end, per title: "kp:123" → ["1-1", "1-2"] ("season-episode").
+    var watchedEpisodes: [String: [String]] = [:]
 
     enum CodingKeys: String, CodingKey {
         case favorites, watchLater, watched, history, sources, resume, continueWatching
-        case favoriteChannels, recentChannels, recentQueries, blockedReleaseIDs
+        case favoriteChannels, recentChannels, recentQueries, blockedReleaseIDs, watchedEpisodes
     }
 
     init() {}
@@ -420,5 +441,116 @@ struct LibraryData: Codable {
         recentChannels = (try? c.decodeIfPresent([Channel].self, forKey: .recentChannels)) ?? []
         recentQueries = (try? c.decodeIfPresent([String].self, forKey: .recentQueries)) ?? []
         blockedReleaseIDs = (try? c.decodeIfPresent([String].self, forKey: .blockedReleaseIDs)) ?? []
+        watchedEpisodes = (try? c.decodeIfPresent([String: [String]].self, forKey: .watchedEpisodes)) ?? [:]
     }
+}
+
+enum EpisodeKey {
+    static func make(_ season: Int, _ episode: Int) -> String { "\(season)-\(episode)" }
+}
+
+// MARK: - People
+
+/// A person of Kinopoisk with the films they took part in (`/api/v1/staff/{id}`).
+struct KPPerson: Decodable {
+    let personId: Int
+    let nameRu: String?
+    let nameEn: String?
+    let posterUrl: String?
+    let birthday: String?
+    let death: String?
+    let age: Int?
+    let birthplace: String?
+    let profession: String?
+    let films: [KPPersonFilm]
+
+    var name: String { nameRu?.nonEmpty ?? nameEn ?? "" }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: AnyKey.self)
+        personId = c.int("personId", "kinopoiskId") ?? 0
+        nameRu = c.string("nameRu")
+        nameEn = c.string("nameEn")
+        posterUrl = c.string("posterUrl")
+        birthday = c.string("birthday")
+        death = c.string("death")
+        age = c.int("age")
+        birthplace = c.string("birthplace")
+        profession = c.string("profession")
+        films = (try? c.decodeIfPresent([KPPersonFilm].self, forKey: AnyKey("films"))) ?? []
+    }
+}
+
+struct KPPersonFilm: Decodable, Hashable {
+    let filmId: Int?
+    let nameRu: String?
+    let nameEn: String?
+    let rating: Double?
+    /// A main role.
+    let general: Bool
+    /// The character or the kind of work.
+    let role: String?
+    let professionKey: String
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: AnyKey.self)
+        filmId = c.int("filmId")
+        nameRu = c.string("nameRu")
+        nameEn = c.string("nameEn")
+        rating = c.double("rating")
+        general = (try? c.decodeIfPresent(Bool.self, forKey: AnyKey("general"))) ?? false
+        role = c.string("description")
+        professionKey = c.string("professionKey") ?? "UNKNOWN"
+    }
+
+    /// The film as a catalog item: the list has no posters or years, the poster address is known.
+    var item: MediaItem? {
+        guard let id = filmId, id > 0 else { return nil }
+        let russian = nameRu?.nonEmpty.map(KinopoiskName.split)
+        let english = nameEn?.nonEmpty.map(KinopoiskName.split)
+        guard let main = russian ?? english else { return nil }
+        var original = english?.title
+        if original == main.title { original = nil }
+        return MediaItem(
+            id: id,
+            title: main.title,
+            originalTitle: original,
+            year: main.year ?? english?.year,
+            posterURL: "https://kinopoiskapiunofficial.tech/images/posters/kp/\(id).jpg",
+            posterPreviewURL: "https://kinopoiskapiunofficial.tech/images/posters/kp_small/\(id).jpg",
+            ratingKP: rating.flatMap { $0 > 0 && $0 <= 10 ? $0 : nil },
+            ratingIMDb: nil,
+            kind: (main.isSeries || english?.isSeries == true) ? .series : .movie,
+            genres: [],
+            countries: []
+        )
+    }
+}
+
+/// Groups of the person's work, in the order they are shown.
+enum PersonWork {
+    static func group(_ key: String) -> (order: Int, title: String) {
+        switch key {
+        case "ACTOR": return (0, "Роли")
+        case "DIRECTOR": return (1, "Режиссура")
+        case "WRITER": return (2, "Сценарии")
+        case "PRODUCER", "PRODUCER_USSR": return (3, "Продюсер")
+        case "COMPOSER": return (4, "Музыка")
+        case "OPERATOR": return (5, "Оператор")
+        case "EDITOR": return (6, "Монтаж")
+        case "DESIGN": return (7, "Художник")
+        case "VOICE_DIRECTOR": return (8, "Дубляж")
+        case "TRANSLATOR": return (9, "Перевод")
+        case "HIMSELF", "HERSELF", "HRONO_TITR_MALE", "HRONO_TITR_FEMALE": return (10, "Играет себя")
+        default: return (11, "Другое")
+        }
+    }
+}
+
+/// Opens the page of a person (actor, director) in any tab.
+struct PersonRoute: Hashable {
+    let id: Int
+    let name: String
+    /// Work to show first: "ACTOR", "DIRECTOR"…
+    let professionKey: String?
 }

@@ -3,7 +3,7 @@ import SwiftUI
 struct CatalogView: View {
     @EnvironmentObject private var library: LibraryStore
     @AppStorage(SettingsKeys.kpToken) private var token = ""
-    @State private var filter = CatalogFilter()
+    @State private var filter = CatalogFilter.restored()
     @State private var items: [MediaItem] = []
     @State private var page = 0
     @State private var totalPages = 1
@@ -21,6 +21,8 @@ struct CatalogView: View {
     private var serverFilter: CatalogFilter {
         var f = filter
         f.hideWatched = false
+        f.genreName = nil
+        f.countryName = nil
         return f
     }
 
@@ -83,6 +85,9 @@ struct CatalogView: View {
                     filter = newFilter
                 }
             }
+            .onChange(of: filter) { _, newFilter in
+                newFilter.save()
+            }
             .task(id: LoadKey(filter: serverFilter, token: token)) {
                 let key = LoadKey(filter: serverFilter, token: token)
                 if key == loadedKey && !items.isEmpty { return }
@@ -90,6 +95,7 @@ struct CatalogView: View {
                 await reload()
             }
             .navigationDestination(for: MediaItem.self) { DetailsView(item: $0) }
+            .navigationDestination(for: PersonRoute.self) { PersonView(route: $0) }
         }
     }
 
@@ -119,8 +125,8 @@ struct CatalogView: View {
         case "YEAR": parts.append("по дате выхода")
         default: break
         }
-        if filter.genreId != nil { parts.append("жанр") }
-        if filter.countryId != nil { parts.append("страна") }
+        if filter.genreId != nil { parts.append(filter.genreName?.lowercased() ?? "жанр") }
+        if filter.countryId != nil { parts.append(filter.countryName ?? "страна") }
         if filter.decade != "all" { parts.append(Decade.byId(filter.decade).title) }
         if filter.ratingFrom > 0 { parts.append("рейтинг от \(filter.ratingFrom)") }
         if filter.hideWatched { parts.append("без просмотренного") }
@@ -242,13 +248,29 @@ struct FiltersView: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Показать") {
-                        onApply(draft)
+                        onApply(named(draft))
                         dismiss()
                     }
                 }
             }
             .task { await loadFilters() }
         }
+    }
+
+    /// The names of the chosen genre and country, for the summary above the catalog.
+    private func named(_ filter: CatalogFilter) -> CatalogFilter {
+        var result = filter
+        if let id = result.genreId {
+            if let genre = genres.first(where: { $0.id == id }) { result.genreName = genre.title }
+        } else {
+            result.genreName = nil
+        }
+        if let id = result.countryId {
+            if let country = countries.first(where: { $0.id == id }) { result.countryName = country.title }
+        } else {
+            result.countryName = nil
+        }
+        return result
     }
 
     private func loadFilters() async {

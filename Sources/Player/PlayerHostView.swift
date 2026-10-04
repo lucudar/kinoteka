@@ -22,6 +22,7 @@ struct PlayerHostView: View {
     @AppStorage(SettingsKeys.automaticRecovery) private var automaticRecovery = true
     @AppStorage(SettingsKeys.preloadNextEpisode) private var preloadNextEpisode = true
     @AppStorage(SettingsKeys.playerGestures) private var playerGestures = true
+    @AppStorage(SettingsKeys.playerShowRemaining) private var showRemaining = false
 
     enum Phase: Equatable {
         case resolving
@@ -127,6 +128,12 @@ struct PlayerHostView: View {
     @State private var noticeToken = 0
     @State private var showNextEpisodePrompt = false
     @State private var autoNextCancelled = false
+    /// Double tap on the left or right side seeks by 10 seconds (every further quick tap adds 10).
+    @State private var pendingTap: Task<Void, Never>?
+    @State private var lastTapAt = Date.distantPast
+    @State private var lastTapSide = 0
+    @State private var seekStreakSide = 0
+    @State private var seekStreakSeconds = 0
 
     init(request: PlayRequest) {
         self.request = request
@@ -708,6 +715,30 @@ struct PlayerHostView: View {
         }
     }
 
+    /// Season and episode of a file of a series, for the watched marks on the series page.
+    private func episodeIdentity(_ file: TorrentFile?) -> (season: Int, episode: Int)? {
+        guard request.item?.kind == .series, let file = file,
+              let numbers = EpisodeMatcher.numbers(of: file) else { return nil }
+        if let season = numbers.season { return (season, numbers.episode) }
+        if let season = wantedSeason { return (season, numbers.episode) }
+        if let seasons = release(matching: link)?.seasons, seasons.count == 1 { return (seasons[0], numbers.episode) }
+        return (1, numbers.episode)
+    }
+
+    private func isWatchedEpisode(_ file: TorrentFile) -> Bool {
+        guard let key = request.itemKey, let episode = episodeIdentity(file) else { return false }
+        return library.isEpisodeWatched(key, season: episode.season, episode: episode.episode)
+    }
+
+    /// Files are played one after another (episodes, parts of a film). A film with extras
+    /// is still one film: its main file takes most of the torrent.
+    private var playsSequence: Bool {
+        guard let kind = request.item?.kind else { return files.count > 1 }
+        if kind == .series { return true }
+        guard files.count > 1, let file = currentFile else { return false }
+        return dominantFile(files)?.id != file.id
+    }
+
     private func saveProgress(final: Bool) {
         guard !request.isLive, model.started, !streamKey.isEmpty else { return }
         let time = model.timeMs
@@ -717,11 +748,19 @@ struct PlayerHostView: View {
         library.setResume(finished ? 0 : time, for: streamKey)
 
         if let key = request.itemKey {
-            let isSeries = request.item?.kind == .series || files.count > 1
+            // The end credits are often skipped: 90% counts as a watched episode.
+            if model.ended || fraction >= 0.9, let episode = episodeIdentity(currentFile) {
+                library.setEpisodeWatched(key, season: episode.season, episode: episode.episode, watched: true)
+            }
+            let isSeries = playsSequence
             let title = request.item?.title ?? request.title
             if finished && !isSeries {
                 library.removeContinue(key)
                 if let item = request.item { library.markWatched(item) }
+            } else if finished && nextFile == nil {
+                // The last episode of the release: the series page offers the next one
+                // (another season) instead of restarting this one.
+                library.removeContinue(key)
             } else if finished, let next = nextFile {
                 let numbers = isSeries ? EpisodeMatcher.numbers(of: next) : nil
                 library.updateContinue(ContinueEntry(itemKey: key, item: request.item, title: title,
@@ -731,7 +770,7 @@ struct PlayerHostView: View {
                                                      episode: numbers?.episode, time: 0))
             } else {
                 var subtitle: String?
-                if let file = currentFile, files.count > 1 {
+                if let file = currentFile, files.count > 1, isSeries {
                     subtitle = fileLabel(file)
                 } else if fraction > 0 {
                     subtitle = "Просмотрено \(Int(fraction * 100))%"
@@ -769,6 +808,7 @@ struct PlayerHostView: View {
     private func close() {
         guard !closing else { return }
         closing = true
+        pendingTap?.cancel()
         recoveryTask?.cancel()
         startupWatchdogTask?.cancel()
         preloadTask?.cancel()
@@ -1000,7 +1040,7 @@ struct PlayerHostView: View {
                 Button {
                     play(file)
                 } label: {
-                    FileRow(file: file, title: fileLabel(file), selected: false)
+                    FileRow(file: file, title: fileLabel(file), selected: false, watched: isWatchedEpisode(file))
                 }
                 .listRowBackground(Theme.card)
             }
@@ -1160,7 +1200,12 @@ struct PlayerHostView: View {
         Color.clear
             .contentShape(Rectangle())
             .ignoresSafeArea()
-            .onTapGesture { toggleControls() }
+            .gesture(
+                SpatialTapGesture()
+                    .onEnded { value in
+                        handleTap(at: value.location, width: size.width)
+                    }
+            )
             .gesture(
                 DragGesture(minimumDistance: 18, coordinateSpace: .local)
                     .onChanged { value in
@@ -1170,6 +1215,60 @@ struct PlayerHostView: View {
                         finishPlayerGesture()
                     }
             )
+    }
+
+    /// A tap in the middle shows or hides the controls at once. On the sides the first tap
+    /// waits a moment: a second one seeks 10 seconds back or forward instead (like YouTube).
+    private func handleTap(at location: CGPoint, width: CGFloat) {
+        let side = location.x < width * 0.38 ? -1 : (location.x > width * 0.62 ? 1 : 0)
+        let now = Date()
+        let canSeek = side != 0 && !request.isLive && model.isSeekable && model.started
+        let interval = now.timeIntervalSince(lastTapAt)
+        lastTapAt = now
+        if canSeek, seekStreakSide == side, interval < 0.7 {
+            seekByTap(side)
+            return
+        }
+        if canSeek, pendingTap != nil, lastTapSide == side, interval < 0.3 {
+            pendingTap?.cancel()
+            pendingTap = nil
+            seekStreakSide = side
+            seekStreakSeconds = 0
+            seekByTap(side)
+            return
+        }
+        lastTapSide = side
+        seekStreakSide = 0
+        pendingTap?.cancel()
+        pendingTap = nil
+        guard canSeek else {
+            toggleControls()
+            return
+        }
+        pendingTap = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 260_000_000)
+            guard !Task.isCancelled else { return }
+            pendingTap = nil
+            toggleControls()
+        }
+    }
+
+    private func seekByTap(_ side: Int) {
+        seekStreakSeconds += 10
+        model.jump(Int32(10 * side))
+        gestureIcon = side > 0 ? "goforward" : "gobackward"
+        gestureText = "\(side > 0 ? "+" : "−")\(seekStreakSeconds) с · \(TimeFormat.string(ms: model.timeMs))"
+        gestureHUDToken += 1
+        let token = gestureHUDToken
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 800_000_000)
+            guard token == gestureHUDToken, gestureMode == nil else { return }
+            seekStreakSide = 0
+            withAnimation {
+                gestureText = ""
+                gestureIcon = ""
+            }
+        }
     }
 
     private func updatePlayerGesture(_ value: DragGesture.Value, size: CGSize) {
@@ -1399,6 +1498,13 @@ struct PlayerHostView: View {
         .shadow(color: .black.opacity(0.5), radius: 6)
     }
 
+    /// The length of the video, or the time left ("−12:34") after a tap on it.
+    private var durationLabel: String {
+        guard showRemaining, model.lengthMs > 0 else { return TimeFormat.string(ms: model.lengthMs) }
+        let left = max(Int32(0), model.lengthMs - displayedTime)
+        return "−" + TimeFormat.string(ms: left)
+    }
+
     private var displayedTime: Int32 {
         guard scrubbing else { return model.timeMs }
         let fraction = scrubValue.isFinite ? min(max(scrubValue, 0), 1) : 0
@@ -1424,7 +1530,13 @@ struct PlayerHostView: View {
                                }
                            })
                         .tint(Theme.accent)
-                    Text(TimeFormat.string(ms: model.lengthMs))
+                    Button {
+                        showRemaining.toggle()
+                        bumpControls()
+                    } label: {
+                        Text(durationLabel)
+                    }
+                    .buttonStyle(.plain)
                 }
                 .font(.caption.monospacedDigit())
             }
@@ -1459,7 +1571,8 @@ struct PlayerHostView: View {
                     showFiles = false
                     if file != currentFile { switchTo(file) }
                 } label: {
-                    FileRow(file: file, title: fileLabel(file), selected: file == currentFile)
+                    FileRow(file: file, title: fileLabel(file), selected: file == currentFile,
+                            watched: isWatchedEpisode(file))
                 }
             }
             .navigationTitle("Серии и файлы")
@@ -1512,6 +1625,19 @@ struct PlayerHostView: View {
                                 selectSubtitle(track, remember: true)
                             }
                         }
+                    }
+                }
+
+                if !request.isLive {
+                    Section {
+                        delayRow("Звук", value: model.audioDelayMs, step: 100) { model.setAudioDelay(ms: $0) }
+                        if model.subtitleTracks.count > 1 {
+                            delayRow("Субтитры", value: model.subtitleDelayMs, step: 500) { model.setSubtitleDelay(ms: $0) }
+                        }
+                    } header: {
+                        Text("Синхронизация")
+                    } footer: {
+                        Text("Если голос не совпадает с губами (бывает у отдельных озвучек), сдвиньте звук: «+» — позже, «−» — раньше. Сдвиг сохраняется до закрытия плеера.")
                     }
                 }
 
@@ -1713,7 +1839,6 @@ struct PlayerHostView: View {
         startupMs = nil
         let title = request.item?.title ?? request.title
         let poster = request.item?.posterURL
-        let isEpisode = request.item?.kind == .series || files.count > 1
         let target: (season: Int?, episode: Int)?
         if let parsed = currentFile.flatMap({ EpisodeMatcher.numbers(of: $0) }) {
             target = parsed
@@ -1722,6 +1847,8 @@ struct PlayerHostView: View {
         } else {
             target = nil
         }
+        // A film with extras is matched by its main file, not by an episode number.
+        let isEpisode = request.item?.kind == .series || (playsSequence && target != nil)
         switchTask = Task {
             do {
                 try await TorrServer.shared.ensureRunning()
@@ -1783,6 +1910,41 @@ struct PlayerHostView: View {
         model.addAudioSlave(url)
     }
 
+    private func delayRow(_ title: String, value: Int, step: Int, change: @escaping (Int) -> Void) -> some View {
+        HStack(spacing: 12) {
+            Text(title)
+            Spacer(minLength: 8)
+            if value != 0 {
+                Button("Сброс") { change(0) }
+                    .buttonStyle(.borderless)
+                    .font(.subheadline)
+            }
+            Button {
+                change(value - step)
+            } label: {
+                Image(systemName: "minus.circle.fill")
+                    .font(.title2)
+            }
+            .buttonStyle(.borderless)
+            Text(PlayerHostView.delayText(value))
+                .font(.body.monospacedDigit())
+                .frame(minWidth: 64)
+            Button {
+                change(value + step)
+            } label: {
+                Image(systemName: "plus.circle.fill")
+                    .font(.title2)
+            }
+            .buttonStyle(.borderless)
+        }
+    }
+
+    private static func delayText(_ ms: Int) -> String {
+        guard ms != 0 else { return "0 с" }
+        let text = String(format: "%.1f", Double(abs(ms)) / 1_000).replacingOccurrences(of: ".", with: ",")
+        return (ms > 0 ? "+" : "−") + text + " с"
+    }
+
     private func checkRow(_ title: String, selected: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             HStack {
@@ -1803,11 +1965,12 @@ struct FileRow: View {
     let file: TorrentFile
     let title: String
     let selected: Bool
+    var watched = false
 
     var body: some View {
         HStack(spacing: 12) {
-            Image(systemName: selected ? "play.circle.fill" : "film")
-                .foregroundStyle(selected ? Theme.accent : Theme.secondary)
+            Image(systemName: selected ? "play.circle.fill" : (watched ? "checkmark.circle.fill" : "film"))
+                .foregroundStyle(selected || watched ? Theme.accent : Theme.secondary)
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
                     .font(.subheadline)
