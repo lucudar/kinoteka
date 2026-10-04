@@ -23,7 +23,7 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 60
     env:
-      TORRSERVER_TAG: MatriX.145
+      TORRSERVER_TAG: MatriX.145.1
       HOMEBREW_NO_AUTO_UPDATE: "1"
       HOMEBREW_NO_INSTALL_CLEANUP: "1"
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

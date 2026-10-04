@@ -318,7 +318,9 @@ struct PlayerHostView: View {
         phase = .resolving
         statusText = fallbackCount > 0 ? "Пробуем запасную раздачу…" : "Запуск торрент-движка…"
         detailText = ""
-        try await TorrServer.shared.ensureRunning()
+        TorrServer.shared.setPlayerActive(true)
+        // A new playback may retune the engine for the network it runs on now.
+        try await TorrServer.shared.ensureRunning(applyNetworkChanges: true)
         statusText = "Получение данных торрента…"
         let status = try await TorrServer.shared.add(link: torrent, title: request.item?.title ?? request.title, poster: request.item?.posterURL)
         try Task.checkCancellation()
@@ -430,9 +432,7 @@ struct PlayerHostView: View {
 
     /// Video files of the torrent without samples, in name order.
     private func videoFiles(_ all: [TorrentFile]) -> [TorrentFile] {
-        let videos = EpisodeMatcher.sorted(all.filter { $0.isVideo })
-        let main = videos.filter { !($0.name.lowercased().contains("sample") && $0.length < 300_000_000) }
-        return main.isEmpty ? videos : main
+        TorrentFile.playable(all)
     }
 
     private func takePendingStart() -> Int32? {
@@ -443,9 +443,7 @@ struct PlayerHostView: View {
 
     /// For movies: the file that takes most of the torrent (main feature vs extras).
     private func dominantFile(_ list: [TorrentFile]) -> TorrentFile? {
-        let total = list.reduce(Int64(0)) { $0 + $1.length }
-        guard total > 0, let largest = list.max(by: { $0.length < $1.length }) else { return nil }
-        return Double(largest.length) >= Double(total) * 0.7 ? largest : nil
+        TorrentFile.dominant(list)
     }
 
     /// `startAt`: position in the file (another release of what played); otherwise the saved one.
@@ -816,6 +814,7 @@ struct PlayerHostView: View {
         saveProgress(final: true)
         model.shutdown()
         AppDiagnostics.shared.setPlayback(nil)
+        TorrServer.shared.setPlayerActive(false)
         coordinator.request = nil
     }
 
@@ -833,6 +832,7 @@ struct PlayerHostView: View {
         // Final: the VLC player is released off the main thread once it has stopped.
         model.shutdown()
         AppDiagnostics.shared.setPlayback(nil)
+        TorrServer.shared.setPlayerActive(false)
         // The torrent is not dropped here: TorrServer keeps it for a few minutes
         // (reopening or the next episode starts without reconnecting) and closes it itself.
         if OrientationHelper.isPhone {
@@ -1667,6 +1667,10 @@ struct PlayerHostView: View {
                             if savePlayerSettings { savedAspect = mode.rawValue }
                         }
                     }
+                }
+
+                if let h = hash, !request.isLive {
+                    TorrentStatsSection(hash: h)
                 }
             }
             .navigationTitle("Настройки плеера")

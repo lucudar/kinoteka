@@ -16,10 +16,14 @@ struct TSStatus: Decodable {
     let statString: String?
     let totalPeers: Int?
     let activePeers: Int?
+    let pendingPeers: Int?
+    let halfOpenPeers: Int?
     let connectedSeeders: Int?
     let downloadSpeed: Double?
+    let uploadSpeed: Double?
     let preloadedBytes: Int64?
     let preloadSize: Int64?
+    let bytesRead: Int64?
     let fileStats: [TSFileRaw]?
 
     var files: [TorrentFile] {
@@ -33,8 +37,16 @@ struct TSStatus: Decodable {
         "Пиры: \(activePeers ?? 0) из \(totalPeers ?? 0), сиды: \(connectedSeeders ?? 0)"
     }
 
-    var speedText: String {
-        let value = downloadSpeed ?? 0
+    var speedText: String { TSStatus.rateText(downloadSpeed) }
+    var uploadText: String { TSStatus.rateText(uploadSpeed) }
+
+    /// What the engine keeps of the torrent now (its buffer ahead of the playback).
+    var cachedText: String {
+        ByteCountFormatter.string(fromByteCount: max(0, preloadedBytes ?? 0), countStyle: .file)
+    }
+
+    static func rateText(_ value: Double?) -> String {
+        let value = value ?? 0
         let bytes: Int64
         if !value.isFinite || value <= 0 {
             bytes = 0
@@ -107,6 +119,12 @@ final class TorrServer {
     /// so Go panics and Swift runtime errors of the previous run end up in this file.
     static var logFile: URL { dataDirectory.appendingPathComponent("torrserver.log") }
 
+    /// Pieces of the playing torrents (the disk cache of EngineProfile).
+    static var cacheDirectory: URL {
+        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("TorrServerCache", isDirectory: true)
+    }
+
     private var logPrepared = false
 
     /// Must be called on `queue`.
@@ -119,6 +137,7 @@ final class TorrServer {
         if !logPrepared {
             logPrepared = true
             EngineLog.inspectPreviousRun(TorrServer.logFile)
+            prepareFirstStart()
         }
         let started = Date()
         let message = TorrserverkitStartServer(port, TorrServer.dataDirectory.path)
@@ -167,10 +186,14 @@ final class TorrServer {
     }
 
     /// Makes sure the local HTTP server answers (iOS may break the socket after a long
-    /// suspension) and the app's engine settings are applied before torrents are added.
-    func ensureRunning() async throws {
+    /// suspension) and the engine is tuned (EngineProfile) before torrents are added.
+    ///
+    /// `applyNetworkChanges`: retuning for another network (Wi‑Fi ↔ mobile) makes the engine
+    /// close all its torrents, so only callers that start a new playback pass true; the first
+    /// check after the start is always made.
+    func ensureRunning(applyNetworkChanges: Bool = false) async throws {
         try await startIfNeeded()
-        await applySettingsOnce()
+        await applyProfile(allowChange: applyNetworkChanges)
     }
 
     private func startIfNeeded() async throws {
@@ -191,66 +214,156 @@ final class TorrServer {
         throw TorrServerError.notRunning(reason)
     }
 
-    // MARK: Engine settings
+    // MARK: Engine profile
 
-    /// Seconds a torrent stays connected after the player stops reading it (TorrServer default: 30).
-    /// Long enough to reopen the film or pick another episode without reconnecting to peers.
-    static let keepAliveSeconds = 180
+    private var appliedProfile: EngineProfile?
+    private var profileVerified = false
+    private var profileTask: Task<Void, Never>?
+    private var loggedProfile: EngineProfile?
+    private var playerActive = false
+    private var measuredFreeSpace: Int64??
 
-    private var settingsApplied = false
-    private var settingsTask: Task<Void, Never>?
-
-    /// Changing settings makes TorrServer drop its torrents and reconnect its client, so it
-    /// is done once, and every caller waits for it before adding a torrent.
-    private func applySettingsOnce() async {
-        guard let task = settingsTaskToAwait() else { return }
-        await task.value
-    }
-
-    /// The task applying the settings (started by the first caller), or nil once applied.
-    private func settingsTaskToAwait() -> Task<Void, Never>? {
+    /// The player is open: the engine must not be retuned (that closes its torrents) by
+    /// anything else than the player itself.
+    var isPlayerActive: Bool {
         lock.lock()
         defer { lock.unlock() }
-        if settingsApplied { return nil }
-        if let existing = settingsTask { return existing }
-        let task = Task { await self.applyPreferredSettings() }
-        settingsTask = task
-        return task
+        return playerActive
     }
 
-    private func finishSettings(applied: Bool) {
+    func setPlayerActive(_ active: Bool) {
         lock.lock()
-        settingsApplied = applied
-        settingsTask = nil
+        playerActive = active
         lock.unlock()
     }
 
-    /// TorrServer keeps its settings in its own database.
-    private func applyPreferredSettings() async {
+    /// The profile the engine runs with; nil until it is checked after the start.
+    var activeProfile: EngineProfile? {
+        lock.lock()
+        defer { lock.unlock() }
+        return appliedProfile
+    }
+
+    /// The profile for the network and the device right now.
+    var desiredProfile: EngineProfile { EngineProfile.make(environment()) }
+
+    private func environment(waitForNetwork: Bool = false) -> EngineEnvironment {
+        let network = waitForNetwork
+            ? NetworkState.shared.wait(timeout: 0.5)
+            : (NetworkState.shared.current ?? NetworkState.reachabilitySnapshot())
+        let mode = EngineEncryptionMode(rawValue: UserDefaults.standard.string(forKey: SettingsKeys.engineEncryption) ?? "") ?? .automatic
+        return EngineEnvironment(connection: network.connection,
+                                 isExpensive: network.isExpensive,
+                                 isConstrained: network.isConstrained,
+                                 supportsIPv6: network.supportsIPv6,
+                                 freeBytes: freeSpace(),
+                                 cachePath: TorrServer.cacheDirectory.path,
+                                 encryption: mode)
+    }
+
+    /// Measured once per run: the cache takes space itself and must not shrink its own size.
+    private func freeSpace() -> Int64? {
+        lock.lock()
+        defer { lock.unlock() }
+        if let measured = measuredFreeSpace { return measured }
+        let values = try? URL(fileURLWithPath: NSHomeDirectory())
+            .resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+        let free = values?.volumeAvailableCapacityForImportantUsage
+        measuredFreeSpace = .some(free)
+        return free
+    }
+
+    /// Before the first start in this process (on `queue`): the disk cache is emptied (pieces
+    /// left by an earlier run could be taken for complete ones), the extra trackers are written,
+    /// and the saved engine settings get the profile of the current network, so the engine starts
+    /// tuned instead of reconnecting when the first torrent is added.
+    private func prepareFirstStart() {
+        let manager = FileManager.default
+        let cache = TorrServer.cacheDirectory
+        // Before the free space is measured for the size of the new cache.
+        try? manager.removeItem(at: cache)
+        try? manager.createDirectory(at: cache, withIntermediateDirectories: true)
+        let trackers = EngineProfile.trackers.joined(separator: "\n") + "\n"
+        try? Data(trackers.utf8).write(to: TorrServer.dataDirectory.appendingPathComponent("trackers.txt"), options: .atomic)
+        presetSettingsFile(EngineProfile.make(environment(waitForNetwork: true)))
+    }
+
+    /// TorrServer keeps its settings in settings.json of its folder (written by an earlier run).
+    private func presetSettingsFile(_ profile: EngineProfile) {
+        let file = TorrServer.dataDirectory.appendingPathComponent("settings.json")
+        guard let data = try? Data(contentsOf: file),
+              var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let sets = root["BitTorr"] as? [String: Any] else { return }
+        let changes = profile.changes(from: sets)
+        guard !changes.isEmpty else { return }
+        root["BitTorr"] = profile.merged(into: sets)
+        guard JSONSerialization.isValidJSONObject(root),
+              let output = try? JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .withoutEscapingSlashes]),
+              (try? output.write(to: file, options: .atomic)) != nil else { return }
+        AppDiagnostics.shared.log("torrent", "Профиль задан до запуска движка: \(changes.joined(separator: ", "))")
+    }
+
+    private func applyProfile(allowChange: Bool) async {
+        let env = environment()
+        let desired = EngineProfile.make(env)
+        guard let task = profileTaskToAwait(desired, allowChange: allowChange && env.connection != .offline) else { return }
+        await task.value
+    }
+
+    /// The task checking or applying the profile (shared by the callers), or nil when nothing is needed.
+    private func profileTaskToAwait(_ desired: EngineProfile, allowChange: Bool) -> Task<Void, Never>? {
+        lock.lock()
+        defer { lock.unlock() }
+        if let running = profileTask { return running }
+        if profileVerified && (!allowChange || appliedProfile == desired) { return nil }
+        // Not checked yet (the check failed): retuning closes the torrents, so it waits for
+        // a new playback while a film plays.
+        if !profileVerified && !allowChange && playerActive { return nil }
+        let task = Task { await self.verifyAndApply(desired) }
+        profileTask = task
+        return task
+    }
+
+    /// Changing settings makes TorrServer drop its torrents and reconnect its client, so it is done
+    /// only when the engine runs with other values, and every caller waits for it.
+    private func verifyAndApply(_ profile: EngineProfile) async {
         guard let data = try? await post(["action": "get"], path: "/settings"),
-              var sets = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
-            finishSettings(applied: false)
+              let sets = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            finishProfile(nil)
             return
         }
-        var changes: [String] = []
-        let timeout = (sets["TorrentDisconnectTimeout"] as? NSNumber)?.intValue ?? 0
-        if timeout < TorrServer.keepAliveSeconds {
-            sets["TorrentDisconnectTimeout"] = TorrServer.keepAliveSeconds
-            changes.append("удержание \(TorrServer.keepAliveSeconds) с")
-        }
-        // Discovery of other devices is not needed inside the app; it only adds
-        // multicast traffic and work while the phone plays.
-        for key in ["EnableBonjour", "EnableLPD", "EnableDLNA"] where (sets[key] as? Bool) == true {
-            sets[key] = false
-            changes.append(key)
-        }
+        let changes = profile.changes(from: sets)
         guard !changes.isEmpty else {
-            finishSettings(applied: true)
+            finishProfile(profile)
             return
         }
-        let saved = (try? await post(["action": "set", "sets": sets], path: "/settings")) != nil
-        AppDiagnostics.shared.log("torrent", saved ? "Настройки движка: \(changes.joined(separator: ", "))" : "Настройки движка не сохранились")
-        finishSettings(applied: saved)
+        let started = Date()
+        let saved = (try? await post(["action": "set", "sets": profile.merged(into: sets)], path: "/settings")) != nil
+        if saved {
+            // The engine has closed its torrents and reconnected.
+            _ = await waitForPing(seconds: 10)
+            await TorrentWarmup.shared.engineDidReset()
+        }
+        let elapsed = Int(Date().timeIntervalSince(started) * 1000)
+        AppDiagnostics.shared.log("torrent", saved
+            ? "Движок перенастроен за \(elapsed) мс: \(changes.joined(separator: ", "))"
+            : "Настройки движка не сохранились")
+        finishProfile(saved ? profile : nil)
+    }
+
+    private func finishProfile(_ profile: EngineProfile?) {
+        lock.lock()
+        if let profile = profile {
+            appliedProfile = profile
+            profileVerified = true
+        }
+        profileTask = nil
+        let log = profile != nil && profile != loggedProfile
+        if log { loggedProfile = profile }
+        lock.unlock()
+        if log, let profile = profile {
+            AppDiagnostics.shared.log("torrent", "Профиль движка: \(profile.summary)")
+        }
     }
 
     // MARK: Torrents
@@ -339,6 +452,22 @@ final class TorrServer {
             if !Task.isCancelled {
                 AppDiagnostics.shared.log("torrent", "Подготовка серии не удалась: \(error.localizedDescription)")
             }
+        }
+    }
+
+    /// Reads a range of the file through the engine, so it downloads those pieces now: the start
+    /// and the end of the film the open page will play. Returns the bytes read.
+    func readAhead(hash: String, file: TorrentFile, offset: Int64, length: Int64, idleTimeout: TimeInterval = 20) async -> Int64 {
+        guard length > 0, offset >= 0, offset < file.length, let url = streamURL(hash: hash, file: file) else { return 0 }
+        let last = min(file.length, offset + length) - 1
+        var request = URLRequest(url: url, timeoutInterval: idleTimeout)
+        request.setValue("bytes=\(offset)-\(last)", forHTTPHeaderField: "Range")
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        do {
+            let (data, _) = try await session.data(for: request)
+            return Int64(data.count)
+        } catch {
+            return 0
         }
     }
 }
