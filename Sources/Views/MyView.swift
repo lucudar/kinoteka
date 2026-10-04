@@ -258,8 +258,10 @@ struct SettingsView: View {
     @AppStorage(SettingsKeys.automaticRecovery) private var automaticRecovery = true
     @AppStorage(SettingsKeys.preloadNextEpisode) private var preloadNextEpisode = true
     @AppStorage(SettingsKeys.playerGestures) private var playerGestures = true
+    @AppStorage(SettingsKeys.engineEncryption) private var engineEncryption = EngineEncryptionMode.automatic.rawValue
     @State private var checkingSearch = false
     @State private var engineStatus = "Проверка…"
+    @State private var profileText = ""
     @State private var cacheSize = ""
     @State private var diagnosticsSize = ""
     @State private var reportVersion = 0
@@ -361,7 +363,7 @@ struct SettingsView: View {
             } header: {
                 Text("Поиск раздач")
             } footer: {
-                Text("«Автокачество по сети» ограничивает мобильную сеть до 720p; Wi‑Fi использует выбранное качество. При нерабочей раздаче приложение само попробует следующую подходящую. Запросы Jacred выполняются по очереди и повторяются после ограничения сервера.\n\n«Готовить раздачу заранее»: пока открыта страница фильма, его раздача уже подключается к пирам. Тратит немного трафика.")
+                Text("«Автокачество по сети» ограничивает мобильную сеть до 720p; Wi‑Fi использует выбранное качество. При нерабочей раздаче приложение само попробует следующую подходящую.\n\nЕсли jac.red не отвечает (в мобильной сети зарубежные серверы часто замедляют), поиск сам переходит на его зеркала в России — jr.maxvol.pro и jac-red.ru, а в мобильной сети спрашивает их первыми.\n\n«Готовить раздачу заранее»: пока открыта страница фильма, его раздача подключается к пирам и заранее скачивает начало и конец видео — плеер стартует быстрее. Тратит немного трафика.")
             }
 
             Section {
@@ -395,6 +397,19 @@ struct SettingsView: View {
                         await refreshStatus()
                     }
                 }
+                Picker("Шифрование трафика", selection: $engineEncryption) {
+                    ForEach(EngineEncryptionMode.allCases) { mode in
+                        Text(mode.title).tag(mode.rawValue)
+                    }
+                }
+                if !profileText.isEmpty {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Настройка движка")
+                        Text(profileText)
+                            .font(.footnote)
+                            .foregroundStyle(Theme.secondary)
+                    }
+                }
                 Button("Очистить список торрентов", role: .destructive) {
                     Task {
                         await TorrServer.shared.wipe()
@@ -404,7 +419,7 @@ struct SettingsView: View {
             } header: {
                 Text("Торренты")
             } footer: {
-                Text("Встроенный TorrServer MatriX раздаёт видео плееру прямо на устройстве. Видео не скачивается целиком — кэш в памяти.")
+                Text("Встроенный TorrServer MatriX раздаёт видео плееру прямо на устройстве. Движок сам настраивается под сеть: по Wi‑Fi — буфер до 2 ГБ на диске (по свободному месту) и до 60 пиров; в мобильной сети — меньший буфер, только TCP, ограниченная отдача и шифрование. Видео целиком не сохраняется: буфер очищается при закрытии раздачи и при следующем запуске.\n\nШифрование мешает оператору распознать и замедлить торрент-трафик, но часть пиров без шифрования будет недоступна. Если в мобильной сети раздачи качаются медленно, проверьте, помогает ли «Всегда»; если пиров слишком мало — «Не требовать».")
             }
 
             Section {
@@ -454,6 +469,11 @@ struct SettingsView: View {
                     Text(diagnosticsSize)
                         .foregroundStyle(Theme.secondary)
                 }
+                NavigationLink {
+                    NetworkCheckView()
+                } label: {
+                    Label("Проверка сети", systemImage: "network")
+                }
                 DiagnosticsReportLink()
                     .id(reportVersion)
                 Button("Очистить журнал", role: .destructive) {
@@ -465,7 +485,7 @@ struct SettingsView: View {
             } header: {
                 Text("Диагностика")
             } footer: {
-                Text("Отчёт хранится только на iPhone: события плеера и движка, память, зависания, сбои прошлых запусков и системные отчёты iOS (MetricKit). Он отправляется только через кнопку выше — например, в Telegram или по почте.")
+                Text("«Проверка сети» показывает, что в текущей сети доступно без VPN: Кинопоиск, поиск раздач и его зеркала, трекеры, DHT и реальная скорость торрента.\n\nОтчёт хранится только на iPhone: события плеера и движка, память, зависания, сбои прошлых запусков и системные отчёты iOS (MetricKit). Он отправляется только через кнопку выше — например, в Telegram или по почте.")
             }
 
             Section {
@@ -506,6 +526,29 @@ struct SettingsView: View {
             backupURL = BackupService.exportURL(library: library.data)
             await refreshStatus()
         }
+        .onChange(of: engineEncryption) { _, _ in
+            refreshProfile()
+            Task {
+                // Retuning closes the torrents of the engine, so not while a film plays.
+                let server = TorrServer.shared
+                if server.isRunning, !server.isPlayerActive {
+                    try? await server.ensureRunning(applyNetworkChanges: true)
+                }
+                refreshProfile()
+            }
+        }
+        .onChange(of: network.connection) { _, _ in refreshProfile() }
+    }
+
+    /// What the engine runs with now, or what it will use for the current network.
+    private func refreshProfile() {
+        let server = TorrServer.shared
+        let desired = server.desiredProfile
+        if let active = server.activeProfile, active != desired {
+            profileText = active.summary + "\nДля текущей сети при следующем запуске раздачи: " + desired.summary
+        } else {
+            profileText = desired.summary
+        }
     }
 
     private func checkSearch() {
@@ -515,10 +558,11 @@ struct SettingsView: View {
             let query = TorrentSearchQuery(title: "Матрица", originalTitle: "The Matrix", year: 1999, isSeries: false)
             do {
                 let result = try await TorrentSearchService.shared.search(query, force: true)
+                let host = result.server.flatMap(SearchMirrors.host).map { " Ответил \($0)." } ?? ""
                 if result.releases.isEmpty {
-                    message = "Сервер ответил, но раздач «Матрицы» не нашёл (результатов: \(result.found)). Проверьте адрес и API-ключ."
+                    message = "Сервер ответил, но раздач «Матрицы» не нашёл (результатов: \(result.found)). Проверьте адрес и API-ключ." + host
                 } else {
-                    message = "Поиск работает. Раздач «Матрицы»: \(result.releases.count)."
+                    message = "Поиск работает. Раздач «Матрицы»: \(result.releases.count)." + host
                 }
             } catch {
                 message = error.localizedDescription
@@ -533,6 +577,7 @@ struct SettingsView: View {
     }
 
     private func refreshStatus() async {
+        refreshProfile()
         let ok = await TorrServer.shared.ping()
         if ok {
             engineStatus = "работает"
@@ -569,7 +614,7 @@ struct AboutView: View {
                     }
                 }
                 Text("Личный медиаплеер в стиле Zona для iPhone.")
-                Text("• Каталог, поиск, описания, рейтинги, сезоны, актёры и их фильмография — из неофициального API Кинопоиска.\n• Просмотренные серии отмечаются сами; «Смотреть» включает первую непросмотренную.\n• Раздачи находятся автоматически через Jacred / Jackett. Можно выбрать качество и озвучку; нерабочая раздача заменяется автоматически.\n• «Смотреть позже», персональные рекомендации, недавние ТВ-каналы и сортировка медиатеки.\n• Плеер VLCKit: жесты и двойное касание для перемотки, синхронизация звука и субтитров, блокировка управления, таймер сна, запоминание дорожек и обратный отсчёт до следующей серии.\n• Медиатеку и прогресс можно экспортировать и восстановить; секретные ключи в копию не попадают.\n• Локальный журнал и системные отчёты о сбоях экспортируются только вручную из настроек.\n• Свои magnet, .torrent, прямые ссылки, HLS и M3U-телеканалы.")
+                Text("• Каталог, поиск, описания, рейтинги, сезоны, актёры и их фильмография — из неофициального API Кинопоиска.\n• Просмотренные серии отмечаются сами; «Смотреть» включает первую непросмотренную.\n• Раздачи находятся автоматически через Jacred / Jackett, а если jac.red не отвечает — через его зеркала в России. Можно выбрать качество и озвучку; нерабочая раздача заменяется автоматически.\n• Встроенный TorrServer подстраивается под сеть: большой буфер на диске по Wi‑Fi, шифрование и только TCP в мобильной сети; начало фильма скачивается заранее.\n• «Проверка сети» показывает, что доступно без VPN, и измеряет реальную скорость торрента.\n• «Смотреть позже», персональные рекомендации, недавние ТВ-каналы и сортировка медиатеки.\n• Плеер VLCKit: жесты и двойное касание для перемотки, синхронизация звука и субтитров, блокировка управления, таймер сна, запоминание дорожек и обратный отсчёт до следующей серии.\n• Медиатеку и прогресс можно экспортировать и восстановить; секретные ключи в копию не попадают.\n• Локальный журнал и системные отчёты о сбоях экспортируются только вручную из настроек.\n• Свои magnet, .torrent, прямые ссылки, HLS и M3U-телеканалы.")
                     .font(.subheadline)
                     .foregroundStyle(Theme.secondary)
                 Text("Приложение не содержит и не распространяет контент.")

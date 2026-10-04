@@ -180,6 +180,24 @@ struct DetailsView: View {
         }
     }
 
+    /// The file "Смотреть" will play, so its start is downloaded in advance.
+    private var warmupTarget: WarmupTarget {
+        if case .resume(let entry) = plan {
+            return WarmupTarget(fileId: entry.fileId, season: entry.season, episode: entry.episode, isSeries: isSeries)
+        }
+        if isSeries, let episode = firstEpisode {
+            return WarmupTarget(fileId: nil, season: episode.seasonNumber, episode: episode.episodeNumber, isSeries: true)
+        }
+        return WarmupTarget(fileId: nil, season: nil, episode: nil, isSeries: isSeries)
+    }
+
+    private struct WarmupKey: Hashable {
+        var link: String?
+        var target: WarmupTarget
+    }
+
+    private var warmupKey: WarmupKey { WarmupKey(link: warmupLink, target: warmupTarget) }
+
     private var watchTitle: String {
         let title = continueEntry != nil ? "Продолжить" : "Смотреть"
         let choices = [chosenQuality?.title, chosenVoice?.title].compactMap { $0 }
@@ -253,7 +271,7 @@ struct DetailsView: View {
         }
         .task(id: token) { await load() }
         .task(id: searchQuery) { await prefetchReleases() }
-        .task(id: warmupLink) { await warmUp(warmupLink) }
+        .task(id: warmupKey) { await warmUp(warmupKey) }
         .onChange(of: qualityOptions) { _, options in
             if let quality = chosenQuality, !options.contains(quality) { chosenQuality = nil }
         }
@@ -581,11 +599,11 @@ struct DetailsView: View {
 
     /// Adds the torrent the button will play to the engine a moment after the page opens
     /// (not while scrolling through pages) and keeps it connected while the page is open.
-    private func warmUp(_ link: String?) async {
-        guard let link = link, TorrentWarmup.shared.isEnabled else { return }
+    private func warmUp(_ key: WarmupKey) async {
+        guard let link = key.link, TorrentWarmup.shared.isEnabled else { return }
         try? await Task.sleep(nanoseconds: 800_000_000)
         guard !Task.isCancelled else { return }
-        await TorrentWarmup.shared.prepare(link: link, title: current.title, poster: current.posterURL)
+        await TorrentWarmup.shared.prepare(link: link, title: current.title, poster: current.posterURL, target: key.target)
         while !Task.isCancelled {
             try? await Task.sleep(nanoseconds: 45_000_000_000)
             guard !Task.isCancelled else { return }

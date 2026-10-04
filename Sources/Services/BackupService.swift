@@ -25,6 +25,8 @@ struct BackupSettings: Codable {
     var automaticRecovery: Bool
     var preloadNextEpisode: Bool
     var playerGestures: Bool
+    /// Added in 0.9.0 (older copies do not have it).
+    var engineEncryption: String?
 
     static func current(defaults: UserDefaults = .standard) -> BackupSettings {
         BackupSettings(
@@ -42,7 +44,8 @@ struct BackupSettings: Codable {
             automaticFallback: defaults.bool(forKey: SettingsKeys.automaticFallback),
             automaticRecovery: defaults.bool(forKey: SettingsKeys.automaticRecovery),
             preloadNextEpisode: defaults.bool(forKey: SettingsKeys.preloadNextEpisode),
-            playerGestures: defaults.bool(forKey: SettingsKeys.playerGestures)
+            playerGestures: defaults.bool(forKey: SettingsKeys.playerGestures),
+            engineEncryption: defaults.string(forKey: SettingsKeys.engineEncryption)
         )
     }
 
@@ -62,6 +65,9 @@ struct BackupSettings: Codable {
         defaults.set(automaticRecovery, forKey: SettingsKeys.automaticRecovery)
         defaults.set(preloadNextEpisode, forKey: SettingsKeys.preloadNextEpisode)
         defaults.set(playerGestures, forKey: SettingsKeys.playerGestures)
+        if let mode = engineEncryption, EngineEncryptionMode(rawValue: mode) != nil {
+            defaults.set(mode, forKey: SettingsKeys.engineEncryption)
+        }
     }
 }
 

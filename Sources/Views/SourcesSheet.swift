@@ -30,6 +30,8 @@ struct SourcesSheet: View {
     @State private var state: LoadState = .loading
     @State private var releases: [TorrentRelease] = []
     @State private var found = 0
+    /// The search mirror that answered.
+    @State private var answeredServer: String?
     @State private var season: Int?
     @State private var quality: ReleaseQuality?
     @State private var voice: ReleaseVoiceOption?
@@ -92,6 +94,7 @@ struct SourcesSheet: View {
     }
 
     private var serverHost: String {
+        if let answered = answeredServer.flatMap(SearchMirrors.host) { return answered }
         let base = TorrentSearchQuery.normalizedServer(server) ?? TorrentSearchService.defaultServer
         return URL(string: base)?.host ?? base
     }
@@ -431,6 +434,7 @@ struct SourcesSheet: View {
             guard token == loadToken else { return }
             releases = result.releases
             found = result.found
+            answeredServer = result.server
             state = .loaded
             if let current = quality, !result.releases.contains(where: { $0.quality == current }) {
                 quality = nil

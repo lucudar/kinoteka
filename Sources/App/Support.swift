@@ -28,6 +28,10 @@ enum SettingsKeys {
     static let preloadNextEpisode = "preloadNextEpisode"
     static let playerGestures = "playerGestures"
     static let playerShowRemaining = "playerShowRemaining"
+    static let engineEncryption = "torrentEngineEncryption"
+    /// The Jacred mirror that answered last and when (the built-in search).
+    static let searchMirror = "torrentSearchMirror"
+    static let searchMirrorDate = "torrentSearchMirrorDate"
 }
 
 enum TimeFormat {
