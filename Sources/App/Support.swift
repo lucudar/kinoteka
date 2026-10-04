@@ -27,6 +27,7 @@ enum SettingsKeys {
     static let automaticRecovery = "automaticPlaybackRecovery"
     static let preloadNextEpisode = "preloadNextEpisode"
     static let playerGestures = "playerGestures"
+    static let playerShowRemaining = "playerShowRemaining"
 }
 
 enum TimeFormat {
@@ -51,6 +52,41 @@ enum RatingStyle {
 
     static func text(_ value: Double) -> String {
         String(format: "%.1f", value)
+    }
+}
+
+/// Dates of Kinopoisk ("2024-05-12") in Russian ("12 мая 2024"). The formatters are
+/// expensive to create, so they are made once (long episode lists format many dates).
+enum RuDate {
+    private static let parser: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter
+    }()
+
+    private static let printer: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "ru_RU")
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        formatter.dateFormat = "d MMMM yyyy"
+        return formatter
+    }()
+
+    static func date(_ raw: String?) -> Date? {
+        guard let raw = raw?.trimmed, raw.count >= 10 else { return nil }
+        return parser.date(from: String(raw.prefix(10)))
+    }
+
+    static func text(_ raw: String?) -> String? {
+        date(raw).map { printer.string(from: $0) }
+    }
+
+    /// The date has not come yet (an episode that is not out).
+    static func isFuture(_ raw: String?) -> Bool {
+        guard let date = date(raw) else { return false }
+        return date > Date()
     }
 }
 

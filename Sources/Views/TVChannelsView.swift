@@ -236,8 +236,15 @@ struct PlaylistSetupView: View {
                 Button {
                     importing = true
                 } label: {
-                    Label("Выбрать файл .m3u", systemImage: "folder")
+                    HStack {
+                        Label("Выбрать файл .m3u", systemImage: "folder")
+                        if channels.isLoading {
+                            Spacer()
+                            ProgressView()
+                        }
+                    }
                 }
+                .disabled(channels.isLoading)
             } footer: {
                 if let error = channels.error {
                     Text(error)
@@ -257,9 +264,12 @@ struct PlaylistSetupView: View {
         .scrollContentBackground(.hidden)
         .background(Theme.background)
         .fileImporter(isPresented: $importing, allowedContentTypes: playlistTypes) { result in
-            if case .success(let url) = result, channels.importFile(url) {
-                playlistURL = ChannelsStore.localMarker
-                onDone?()
+            guard case .success(let url) = result else { return }
+            Task {
+                if await channels.importFile(url) {
+                    playlistURL = ChannelsStore.localMarker
+                    onDone?()
+                }
             }
         }
         .onAppear {

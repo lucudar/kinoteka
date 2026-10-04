@@ -210,6 +210,38 @@ final class LibraryStore: ObservableObject {
         mutate { d in d.continueWatching.removeAll { $0.itemKey == key } }
     }
 
+    // Watched episodes of series
+    func watchedEpisodes(for key: String) -> Set<String> {
+        Set(data.watchedEpisodes[key] ?? [])
+    }
+
+    func isEpisodeWatched(_ key: String, season: Int, episode: Int) -> Bool {
+        data.watchedEpisodes[key]?.contains(EpisodeKey.make(season, episode)) ?? false
+    }
+
+    func setEpisodeWatched(_ key: String, season: Int, episode: Int, watched: Bool) {
+        setEpisodesWatched(key, [(season, episode)], watched: watched)
+    }
+
+    /// Marks (or unmarks) several episodes at once, e.g. a whole season.
+    func setEpisodesWatched(_ key: String, _ episodes: [(season: Int, episode: Int)], watched: Bool) {
+        let ids = episodes.map { EpisodeKey.make($0.season, $0.episode) }
+        var current = data.watchedEpisodes[key] ?? []
+        let known = Set(current)
+        if watched {
+            let added = ids.filter { !known.contains($0) }
+            guard !added.isEmpty else { return }
+            current += added.uniqued { $0 }
+        } else {
+            let removed = Set(ids)
+            guard !known.isDisjoint(with: removed) else { return }
+            current.removeAll { removed.contains($0) }
+        }
+        mutate { d in
+            d.watchedEpisodes[key] = current.isEmpty ? nil : current
+        }
+    }
+
     // TV channels
     func isFavoriteChannel(_ channel: Channel) -> Bool {
         data.favoriteChannels.contains { $0.url == channel.url }
@@ -306,6 +338,9 @@ extension LibraryData {
         copy.blockedReleaseIDs = blockedReleaseIDs.uniqued { $0 }
         copy.sources = sources.mapValues { $0.uniqued(by: \.id) }
         copy.resume = resume.filter { $0.value > 0 }
+        copy.watchedEpisodes = watchedEpisodes
+            .mapValues { $0.uniqued { $0 } }
+            .filter { !$0.value.isEmpty }
         return copy
     }
 }
@@ -417,22 +452,31 @@ final class ChannelsStore: ObservableObject {
         apply(list, source: source)
     }
 
-    /// Imports a playlist file picked in the Files app.
-    func importFile(_ url: URL) -> Bool {
-        let scoped = url.startAccessingSecurityScopedResource()
-        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-        guard let raw = try? Data(contentsOf: url) else {
+    /// Imports a playlist file picked in the Files app. Reading and parsing a big
+    /// playlist takes a while, so it is done off the main thread.
+    func importFile(_ url: URL) async -> Bool {
+        guard !isLoading else { return false }
+        isLoading = true
+        defer { isLoading = false }
+        let target = localFile
+        let outcome = await Task.detached(priority: .userInitiated) { () -> (list: [Channel], readable: Bool) in
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            guard let raw = try? Data(contentsOf: url) else { return ([], false) }
+            let list = M3UParser.parse(String(decoding: raw, as: UTF8.self))
+            if !list.isEmpty { try? raw.write(to: target, options: .atomic) }
+            return (list, true)
+        }.value
+        guard outcome.readable else {
             error = "Не удалось прочитать файл."
             return false
         }
-        let list = M3UParser.parse(String(decoding: raw, as: UTF8.self))
-        guard !list.isEmpty else {
+        guard !outcome.list.isEmpty else {
             error = "В файле не найдено каналов."
             return false
         }
-        try? raw.write(to: localFile, options: .atomic)
         error = nil
-        apply(list, source: ChannelsStore.localMarker)
+        apply(outcome.list, source: ChannelsStore.localMarker)
         return true
     }
 }

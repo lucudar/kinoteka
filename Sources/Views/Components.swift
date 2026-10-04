@@ -152,6 +152,8 @@ struct PosterCard: View {
     @EnvironmentObject private var library: LibraryStore
     let item: MediaItem
     var width: CGFloat? = nil
+    /// Replaces the year and country line (the role of an actor, for example).
+    var caption: String? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -188,7 +190,7 @@ struct PosterCard: View {
                 .foregroundStyle(.white)
                 .lineLimit(2, reservesSpace: true)
                 .multilineTextAlignment(.leading)
-            Text(item.subtitleLine)
+            Text(caption ?? item.subtitleLine)
                 .font(.caption2)
                 .foregroundStyle(Theme.secondary)
                 .lineLimit(1)

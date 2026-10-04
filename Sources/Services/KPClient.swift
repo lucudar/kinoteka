@@ -179,6 +179,31 @@ final class KPClient {
         try await get("/api/v2.2/films/filters", ttl: TTL.month)
     }
 
+    func person(_ id: Int) async throws -> KPPerson {
+        try await get("/api/v1/staff/\(id)", ttl: TTL.month)
+    }
+
+    /// Answers not used for two months are removed once per launch, in the background:
+    /// otherwise the cache grows with every film page ever opened.
+    func pruneCache(olderThan age: TimeInterval = 60 * 60 * 24 * 60) {
+        let dir = cacheDir
+        DispatchQueue.global(qos: .background).asyncAfter(deadline: .now() + 20) {
+            let manager = FileManager.default
+            let files = (try? manager.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
+            let now = Date()
+            var removed = 0
+            for file in files {
+                let date = (try? file.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? now
+                if now.timeIntervalSince(date) > age, (try? manager.removeItem(at: file)) != nil {
+                    removed += 1
+                }
+            }
+            if removed > 0 {
+                AppDiagnostics.shared.log("cache", "Удалено старых ответов Кинопоиска: \(removed)")
+            }
+        }
+    }
+
     func clearCache() {
         try? FileManager.default.removeItem(at: cacheDir)
         try? FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)

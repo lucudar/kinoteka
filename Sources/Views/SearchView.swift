@@ -10,11 +10,18 @@ struct SearchView: View {
     @State private var totalPages = 1
     @State private var loading = false
     @State private var error: String?
+    @State private var kindFilter: MediaKind?
+    @State private var path = NavigationPath()
 
     private var trimmedQuery: String { query.trimmed }
 
+    private var visibleResults: [MediaItem] {
+        guard let kind = kindFilter else { return results }
+        return results.filter { $0.kind == kind }
+    }
+
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $path) {
             ScrollView {
                 content
                     .padding(.vertical, 8)
@@ -25,6 +32,10 @@ struct SearchView: View {
             .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Фильмы и сериалы")
             .onSubmit(of: .search) {
                 library.addQuery(query)
+            }
+            .onChange(of: path.count) { old, new in
+                // A result was opened: the query was useful, keep it in "Недавние запросы".
+                if old == 0, new > 0, trimmedQuery == searchedQuery { library.addQuery(searchedQuery) }
             }
             .task(id: trimmedQuery) {
                 let q = trimmedQuery
@@ -40,6 +51,7 @@ struct SearchView: View {
                 await search(q)
             }
             .navigationDestination(for: MediaItem.self) { DetailsView(item: $0) }
+            .navigationDestination(for: PersonRoute.self) { PersonView(route: $0) }
         }
     }
 
@@ -59,15 +71,39 @@ struct SearchView: View {
                     .padding(.top, 40)
             }
         } else {
-            MediaGrid(items: results) { item in
-                if item.id == results.last?.id {
+            if kindFilter != nil
+                || (results.contains(where: { $0.kind == .series }) && results.contains(where: { $0.kind == .movie })) {
+                kindPicker
+            }
+            MediaGrid(items: visibleResults) { item in
+                if item.id == visibleResults.last?.id {
                     Task { await loadMore() }
                 }
             }
             if loading {
                 ProgressView().padding()
+            } else if visibleResults.isEmpty {
+                Text(kindFilter == .series ? "Сериалов среди найденного нет" : "Фильмов среди найденного нет")
+                    .font(.subheadline)
+                    .foregroundStyle(Theme.secondary)
+                    .padding(.top, 30)
+                if page < totalPages {
+                    Button("Искать дальше") { Task { await loadMore() } }
+                        .buttonStyle(.bordered)
+                }
             }
         }
+    }
+
+    private var kindPicker: some View {
+        Picker("Тип", selection: $kindFilter) {
+            Text("Всё").tag(MediaKind?.none)
+            Text("Фильмы").tag(MediaKind?.some(.movie))
+            Text("Сериалы").tag(MediaKind?.some(.series))
+        }
+        .pickerStyle(.segmented)
+        .padding(.horizontal, 16)
+        .padding(.bottom, 4)
     }
 
     @ViewBuilder

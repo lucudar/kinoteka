@@ -36,6 +36,7 @@ struct KinotekaApp: App {
         MemoryPressure.start()
         _ = NetworkMonitor.shared
         TorrServer.shared.start()
+        KPClient.shared.pruneCache()
     }
 
     var body: some Scene {
