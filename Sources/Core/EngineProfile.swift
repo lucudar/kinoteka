@@ -1,20 +1,26 @@
 import Foundation
 
-/// When the torrent traffic is encrypted. Mobile operators often slow down BitTorrent traffic
-/// they recognise; an encrypted connection looks like random data to them.
+/// Whether the engine may talk to peers without encryption.
 enum EngineEncryptionMode: String, CaseIterable, Identifiable, Sendable {
+    /// The engine default: it offers every peer an encrypted connection first and connects
+    /// without encryption to the peers that do not support it.
     case automatic
+    /// Encrypted connections only (ForceEncrypt): an operator cannot recognise and slow down
+    /// the traffic, but the peers without encryption are lost.
     case always
-    case never
 
     var id: String { rawValue }
 
     var title: String {
         switch self {
-        case .automatic: return "В мобильной сети"
+        case .automatic: return "Когда возможно"
         case .always: return "Всегда"
-        case .never: return "Не требовать"
         }
+    }
+
+    /// The saved choice; a value of an older version ("never") or an unknown one is the default.
+    static func stored(_ value: String?) -> EngineEncryptionMode {
+        value.flatMap(EngineEncryptionMode.init(rawValue:)) ?? .automatic
     }
 }
 
@@ -23,7 +29,6 @@ struct EngineEnvironment: Hashable, Sendable {
     var connection: ConnectionClass
     var isExpensive = false
     var isConstrained = false
-    var supportsIPv6 = false
     /// Free space of the device; nil when unknown (the cache then stays in memory).
     var freeBytes: Int64?
     /// Folder of the disk cache.
@@ -74,13 +79,18 @@ enum EngineSettingValue: Hashable, Sendable {
 ///   (the engine prioritises pieces only inside its cache window, so a bigger cache also means
 ///   more pieces downloaded in parallel from more peers) and the video decoder keeps the memory;
 /// - more peer connections on Wi‑Fi;
-/// - on a mobile network the traffic is encrypted and TCP only (operators throttle recognised
-///   BitTorrent traffic and UDP), and the upload is limited so it does not choke the download.
+/// - on a mobile network TCP only (operators slow down UDP) and a limited upload, so it does not
+///   choke the download.
+///
+/// Encryption is not forced by default: the engine already prefers encrypted connections and
+/// falls back to plain ones, while forcing it can leave a torrent without peers. IPv6, UPnP and
+/// the discovery of devices nearby stay off: on iOS they do not help (no port forwarding,
+/// no multicast) and the IPv6 support of a network changes with every VPN switch.
 struct EngineProfile: Hashable, Sendable {
     enum Kind: String, Sendable {
         /// Wi‑Fi or wired network: big disk buffer, many peers, TCP and uTP.
         case fast
-        /// Mobile network or a hotspot: smaller buffer, TCP only, encrypted, limited upload.
+        /// Mobile network or a hotspot: smaller buffer, TCP only, limited upload.
         case mobile
         /// Low Data Mode: the smallest buffer and nothing read in advance.
         case economy
@@ -92,11 +102,9 @@ struct EngineProfile: Hashable, Sendable {
     var cachePath: String
     var connections: Int
     var utp: Bool
-    var upnp: Bool
     var forceEncrypt: Bool
     /// KB/s, 0 = unlimited.
     var uploadLimit: Int
-    var ipv6: Bool
     /// Bytes read in advance from the start and from the end of the file a film page will play
     /// (players read the header at the start and the index at the end before the first frame).
     var warmupHead: Int64
@@ -124,13 +132,6 @@ struct EngineProfile: Hashable, Sendable {
         case .economy: limit = 128 << 20
         }
         let disk = diskCache(freeBytes: env.freeBytes).map { min($0, limit) }
-        let encrypt: Bool
-        switch env.encryption {
-        case .always: encrypt = true
-        case .never: encrypt = false
-        case .automatic: encrypt = mobileNetwork
-        }
-        let homeNetwork = env.connection == .wifi || env.connection == .wired
         return EngineProfile(
             kind: kind,
             cacheBytes: disk ?? memoryCache,
@@ -138,10 +139,8 @@ struct EngineProfile: Hashable, Sendable {
             cachePath: env.cachePath,
             connections: kind == .fast ? 60 : (kind == .mobile ? 40 : 25),
             utp: kind == .fast,
-            upnp: kind == .fast && homeNetwork,
-            forceEncrypt: encrypt,
+            forceEncrypt: env.encryption == .always,
             uploadLimit: kind == .fast ? 0 : (kind == .mobile ? 100 : 32),
-            ipv6: env.supportsIPv6,
             warmupHead: kind == .fast ? 8 << 20 : (kind == .mobile ? 4 << 20 : 0),
             warmupTail: kind == .fast ? 4 << 20 : (kind == .mobile ? 2 << 20 : 0)
         )
@@ -170,14 +169,17 @@ struct EngineProfile: Hashable, Sendable {
             "ConnectionsLimit": .int(Int64(connections)),
             "DisableTCP": .bool(false),
             "DisableUTP": .bool(!utp),
-            "DisableUPNP": .bool(!upnp),
+            "DisableUPNP": .bool(true),
             "DisableDHT": .bool(false),
             "DisablePEX": .bool(false),
             "DisableUpload": .bool(false),
             "ForceEncrypt": .bool(forceEncrypt),
             "UploadRateLimit": .int(Int64(uploadLimit)),
             "DownloadRateLimit": .int(0),
-            "EnableIPv6": .bool(ipv6),
+            "EnableIPv6": .bool(false),
+            // A random port for every connect: a fixed one stays busy for a while after the
+            // engine reconnects (its uTP socket closes late), and the reconnect then fails.
+            "PeersListenPort": .int(0),
             "RetrackersMode": .int(1),
             "TorrentDisconnectTimeout": .int(Int64(EngineProfile.keepAliveSeconds)),
             // Discovery of other devices is not needed inside the app; it only adds
@@ -217,9 +219,8 @@ struct EngineProfile: Hashable, Sendable {
         parts.append("кэш " + EngineProfile.sizeText(cacheBytes) + (useDisk ? " на диске" : " в памяти"))
         parts.append("до \(connections) пиров")
         parts.append(utp ? "TCP и uTP" : "только TCP")
-        if forceEncrypt { parts.append("шифрование") }
+        if forceEncrypt { parts.append("только шифрование") }
         if uploadLimit > 0 { parts.append("отдача до \(uploadLimit) КБ/с") }
-        if ipv6 { parts.append("IPv6") }
         return parts.joined(separator: " · ")
     }
 
@@ -235,9 +236,9 @@ struct EngineProfile: Hashable, Sendable {
     /// Trackers added to every torrent (TorrServer reads them from trackers.txt), besides the
     /// ones of the release and the engine's list. Russian retrackers first: the rutracker ones
     /// know its releases even when the magnet link has no trackers, and they answer on
-    /// mobile networks where foreign trackers can be slowed down.
+    /// mobile networks where foreign trackers can be slowed down. No retracker.local: iOS
+    /// resolves .local names only by multicast in the local network, never through the provider.
     static let trackers = [
-        "http://retracker.local/announce",
         "http://bt.t-ru.org/ann?magnet",
         "http://bt2.t-ru.org/ann?magnet",
         "http://bt3.t-ru.org/ann?magnet",

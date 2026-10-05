@@ -600,9 +600,13 @@ struct DetailsView: View {
     /// Adds the torrent the button will play to the engine a moment after the page opens
     /// (not while scrolling through pages) and keeps it connected while the page is open.
     private func warmUp(_ key: WarmupKey) async {
-        guard let link = key.link, TorrentWarmup.shared.isEnabled else { return }
         try? await Task.sleep(nanoseconds: 800_000_000)
         guard !Task.isCancelled else { return }
+        guard let link = key.link, TorrentWarmup.shared.isEnabled else {
+            // Not prepared in advance: the engine is still tuned for the current network before "Смотреть".
+            await TorrServer.shared.prepareForPage()
+            return
+        }
         await TorrentWarmup.shared.prepare(link: link, title: current.title, poster: current.posterURL, target: key.target)
         while !Task.isCancelled {
             try? await Task.sleep(nanoseconds: 45_000_000_000)

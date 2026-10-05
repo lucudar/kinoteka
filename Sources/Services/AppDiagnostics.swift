@@ -468,6 +468,10 @@ final class AppDiagnostics: NSObject, MXMetricManagerSubscriber, @unchecked Send
         Сейчас: \(AppDiagnostics.memorySummary())
 
         """
+        let server = TorrServer.shared
+        let engine = server.isRunning ? "запущен" : "не запущен" + (server.startError.map { " (\($0))" } ?? "")
+        let profile = server.activeProfile.map { "профиль " + $0.summary } ?? "профиль не проверен"
+        report += "Движок: \(engine), порт \(server.port), \(profile)\n"
         func section(_ title: String, _ url: URL, tail: Int? = nil) {
             let data: Data?
             if let tail = tail {
