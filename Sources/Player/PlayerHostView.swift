@@ -315,12 +315,15 @@ struct PlayerHostView: View {
     }
 
     private func resolveTorrent(_ torrent: String) async throws {
+        // The player closed meanwhile: it must not stay marked as playing.
+        guard !closing else { throw CancellationError() }
         phase = .resolving
         statusText = fallbackCount > 0 ? "Пробуем запасную раздачу…" : "Запуск торрент-движка…"
         detailText = ""
         TorrServer.shared.setPlayerActive(true)
-        // A new playback may retune the engine for the network it runs on now.
-        try await TorrServer.shared.ensureRunning(applyNetworkChanges: true)
+        // Only the first check after the start may tune the engine here: a retune for another
+        // network is made by a film page, it would close the torrent prepared for this playback.
+        try await TorrServer.shared.ensureRunning(retune: true)
         statusText = "Получение данных торрента…"
         let status = try await TorrServer.shared.add(link: torrent, title: request.item?.title ?? request.title, poster: request.item?.posterURL)
         try Task.checkCancellation()

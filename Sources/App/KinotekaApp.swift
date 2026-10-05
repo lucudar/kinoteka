@@ -34,9 +34,14 @@ struct KinotekaApp: App {
         // Video needs the memory more: API responses are small, images have their own cache.
         URLCache.shared = URLCache(memoryCapacity: 16 * 1024 * 1024, diskCapacity: 256 * 1024 * 1024)
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
+        // 0.9.0 had a "never" choice; an unknown value would leave the picker without a choice.
+        let encryption = UserDefaults.standard.string(forKey: SettingsKeys.engineEncryption)
+        if let value = encryption, EngineEncryptionMode(rawValue: value) == nil {
+            UserDefaults.standard.set(EngineEncryptionMode.stored(value).rawValue, forKey: SettingsKeys.engineEncryption)
+        }
         MemoryPressure.start()
         _ = NetworkMonitor.shared
-        TorrServer.shared.start()
+        TorrServer.shared.launch()
         KPClient.shared.pruneCache()
     }
 

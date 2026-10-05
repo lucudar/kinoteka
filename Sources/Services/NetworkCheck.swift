@@ -219,7 +219,7 @@ final class NetworkCheck: ObservableObject {
         }
         line("main", title, .running, "запуск движка…")
         do {
-            try await server.ensureRunning(applyNetworkChanges: true)
+            try await server.ensureRunning(retune: true)
         } catch {
             line("main", title, .failed, error.localizedDescription)
             return

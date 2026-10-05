@@ -390,7 +390,7 @@ struct SettingsView: View {
                     Task {
                         engineStatus = "Запуск…"
                         do {
-                            try await TorrServer.shared.ensureRunning()
+                            try await TorrServer.shared.ensureRunning(retune: true)
                         } catch {
                             message = error.localizedDescription
                         }
@@ -419,7 +419,7 @@ struct SettingsView: View {
             } header: {
                 Text("Торренты")
             } footer: {
-                Text("Встроенный TorrServer MatriX раздаёт видео плееру прямо на устройстве. Движок сам настраивается под сеть: по Wi‑Fi — буфер до 2 ГБ на диске (по свободному месту) и до 60 пиров; в мобильной сети — меньший буфер, только TCP, ограниченная отдача и шифрование. Видео целиком не сохраняется: буфер очищается при закрытии раздачи и при следующем запуске.\n\nШифрование мешает оператору распознать и замедлить торрент-трафик, но часть пиров без шифрования будет недоступна. Если в мобильной сети раздачи качаются медленно, проверьте, помогает ли «Всегда»; если пиров слишком мало — «Не требовать».")
+                Text("Встроенный TorrServer MatriX раздаёт видео плееру прямо на устройстве. Движок сам настраивается под сеть, когда открывается фильм: по Wi‑Fi — буфер до 2 ГБ на диске (по свободному месту) и до 60 пиров; в мобильной сети — меньший буфер, только TCP и ограниченная отдача. Видео целиком не сохраняется: буфер очищается при закрытии раздачи и при следующем запуске.\n\nШифрование: движок сначала предлагает пиру зашифрованное соединение, а с теми, кто его не поддерживает, соединяется без шифрования. «Всегда» оставляет только зашифрованные соединения — оператору труднее распознать и замедлить торрент-трафик, но пиров меньше. Включайте, только если без этого раздачи в мобильной сети почти не качаются.")
             }
 
             Section {
@@ -532,7 +532,7 @@ struct SettingsView: View {
                 // Retuning closes the torrents of the engine, so not while a film plays.
                 let server = TorrServer.shared
                 if server.isRunning, !server.isPlayerActive {
-                    try? await server.ensureRunning(applyNetworkChanges: true)
+                    try? await server.ensureRunning(retune: true)
                 }
                 refreshProfile()
             }
@@ -545,7 +545,7 @@ struct SettingsView: View {
         let server = TorrServer.shared
         let desired = server.desiredProfile
         if let active = server.activeProfile, active != desired {
-            profileText = active.summary + "\nДля текущей сети при следующем запуске раздачи: " + desired.summary
+            profileText = active.summary + "\nДля текущей сети — при открытии фильма: " + desired.summary
         } else {
             profileText = desired.summary
         }

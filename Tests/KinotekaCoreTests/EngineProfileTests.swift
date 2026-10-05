@@ -5,10 +5,10 @@ final class EngineProfileTests: XCTestCase {
     private let gb: Int64 = 1 << 30
 
     private func env(_ connection: ConnectionClass, free: Int64? = 20 << 30, expensive: Bool = false,
-                     constrained: Bool = false, ipv6: Bool = false,
+                     constrained: Bool = false,
                      encryption: EngineEncryptionMode = .automatic) -> EngineEnvironment {
         EngineEnvironment(connection: connection, isExpensive: expensive, isConstrained: constrained,
-                          supportsIPv6: ipv6, freeBytes: free, cachePath: "/tmp/cache", encryption: encryption)
+                          freeBytes: free, cachePath: "/tmp/cache", encryption: encryption)
     }
 
     func testDiskCacheFollowsFreeSpace() {
@@ -27,31 +27,46 @@ final class EngineProfileTests: XCTestCase {
         XCTAssertTrue(profile.useDisk)
         XCTAssertEqual(profile.connections, 60)
         XCTAssertTrue(profile.utp)
-        XCTAssertTrue(profile.upnp)
         XCTAssertFalse(profile.forceEncrypt)
         XCTAssertEqual(profile.uploadLimit, 0)
         XCTAssertEqual(profile.warmupHead, 8 << 20)
         XCTAssertEqual(profile.warmupTail, 4 << 20)
     }
 
-    func testMobileNetworkIsEncryptedAndTCPOnly() {
-        let profile = EngineProfile.make(env(.cellular, ipv6: true))
+    func testMobileNetworkIsTCPOnlyWithLimitedUpload() {
+        let profile = EngineProfile.make(env(.cellular))
         XCTAssertEqual(profile.kind, .mobile)
         XCTAssertEqual(profile.cacheBytes, 256 << 20)
         XCTAssertTrue(profile.useDisk)
         XCTAssertEqual(profile.connections, 40)
         XCTAssertFalse(profile.utp)
-        XCTAssertFalse(profile.upnp)
-        XCTAssertTrue(profile.forceEncrypt)
+        XCTAssertFalse(profile.forceEncrypt)
         XCTAssertEqual(profile.uploadLimit, 100)
-        XCTAssertTrue(profile.ipv6)
     }
 
     func testHotspotCountsAsMobile() {
         let profile = EngineProfile.make(env(.wifi, expensive: true))
         XCTAssertEqual(profile.kind, .mobile)
-        XCTAssertFalse(profile.upnp)
-        XCTAssertTrue(profile.forceEncrypt)
+        XCTAssertFalse(profile.forceEncrypt)
+    }
+
+    func testIPv6UPnPAndAFixedPortStayOff() {
+        for connection in [ConnectionClass.wifi, .cellular, .wired, .other] {
+            let settings = EngineProfile.make(env(connection)).settings
+            XCTAssertEqual(settings["EnableIPv6"], .bool(false))
+            XCTAssertEqual(settings["DisableUPNP"], .bool(true))
+            XCTAssertEqual(settings["PeersListenPort"], .int(0))
+            XCTAssertEqual(settings["ForceEncrypt"], .bool(false))
+        }
+    }
+
+    func testOnlyTheKindOfNetworkChangesTheProfile() {
+        // Wi‑Fi, a cable and a VPN interface need no retune of the engine between them.
+        let wifi = EngineProfile.make(env(.wifi))
+        XCTAssertEqual(wifi, EngineProfile.make(env(.wired)))
+        XCTAssertEqual(wifi, EngineProfile.make(env(.other)))
+        XCTAssertNotEqual(wifi, EngineProfile.make(env(.cellular)))
+        XCTAssertEqual(EngineProfile.make(env(.cellular)), EngineProfile.make(env(.wifi, expensive: true)))
     }
 
     func testLowDataModeSavesTraffic() {
@@ -72,8 +87,14 @@ final class EngineProfileTests: XCTestCase {
 
     func testEncryptionChoice() {
         XCTAssertTrue(EngineProfile.make(env(.wifi, encryption: .always)).forceEncrypt)
-        XCTAssertFalse(EngineProfile.make(env(.cellular, encryption: .never)).forceEncrypt)
-        XCTAssertTrue(EngineProfile.make(env(.cellular, encryption: .automatic)).forceEncrypt)
+        XCTAssertTrue(EngineProfile.make(env(.cellular, encryption: .always)).forceEncrypt)
+        XCTAssertFalse(EngineProfile.make(env(.cellular, encryption: .automatic)).forceEncrypt)
+        XCTAssertEqual(EngineEncryptionMode.stored("always"), .always)
+        XCTAssertEqual(EngineEncryptionMode.stored("automatic"), .automatic)
+        // The "never" choice of 0.9.0 and missing values are the default.
+        XCTAssertEqual(EngineEncryptionMode.stored("never"), .automatic)
+        XCTAssertEqual(EngineEncryptionMode.stored(nil), .automatic)
+        XCTAssertEqual(EngineEncryptionMode.allCases, [.automatic, .always])
     }
 
     func testChangesAgainstEngineSettings() throws {
@@ -82,13 +103,15 @@ final class EngineProfileTests: XCTestCase {
          "ReaderReadAHead": 95, "PreloadCache": 50, "ResponsiveMode": true, "ConnectionsLimit": 25,
          "DisableTCP": false, "DisableUTP": false, "DisableUPNP": false, "DisableDHT": false,
          "DisablePEX": false, "DisableUpload": false, "ForceEncrypt": false, "UploadRateLimit": 0,
-         "DownloadRateLimit": 0, "EnableIPv6": false, "RetrackersMode": 1, "TorrentDisconnectTimeout": 30,
+         "DownloadRateLimit": 0, "EnableIPv6": false, "PeersListenPort": 0, "RetrackersMode": 1,
+         "TorrentDisconnectTimeout": 30,
          "EnableDLNA": false, "EnableRutorSearch": false}
         """
         let current = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
         let profile = EngineProfile.make(env(.wifi))
         XCTAssertEqual(profile.changes(from: current),
-                       ["CacheSize", "ConnectionsLimit", "RemoveCacheOnDrop", "TorrentDisconnectTimeout", "TorrentsSavePath", "UseDisk"])
+                       ["CacheSize", "ConnectionsLimit", "DisableUPNP", "RemoveCacheOnDrop", "TorrentDisconnectTimeout",
+                        "TorrentsSavePath", "UseDisk"])
 
         // What the engine stores and returns after the change.
         let merged = profile.merged(into: current)
@@ -100,7 +123,8 @@ final class EngineProfileTests: XCTestCase {
         // Another network changes only what differs.
         let mobile = EngineProfile.make(env(.cellular))
         XCTAssertEqual(mobile.changes(from: reloaded),
-                       ["CacheSize", "ConnectionsLimit", "DisableUPNP", "DisableUTP", "ForceEncrypt", "UploadRateLimit"])
+                       ["CacheSize", "ConnectionsLimit", "DisableUTP", "UploadRateLimit"])
+        XCTAssertEqual(EngineProfile.make(env(.wifi, encryption: .always)).changes(from: reloaded), ["ForceEncrypt"])
     }
 
     func testMissingKeysAreZeroValues() {
@@ -119,7 +143,8 @@ final class EngineProfileTests: XCTestCase {
         let summary = EngineProfile.make(env(.cellular)).summary
         XCTAssertTrue(summary.contains("кэш 256 МБ на диске"))
         XCTAssertTrue(summary.contains("только TCP"))
-        XCTAssertTrue(summary.contains("шифрование"))
+        XCTAssertFalse(summary.contains("шифрование"))
+        XCTAssertTrue(EngineProfile.make(env(.cellular, encryption: .always)).summary.contains("только шифрование"))
         XCTAssertTrue(EngineProfile.make(env(.wifi, free: gb)).summary.contains("кэш 64 МБ в памяти"))
     }
 

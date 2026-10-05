@@ -37,7 +37,7 @@ final class TorrentWarmup {
         let current = generation
         do {
             // A page opened on another network retunes the engine before its torrent is added.
-            try await TorrServer.shared.ensureRunning(applyNetworkChanges: true)
+            try await TorrServer.shared.ensureRunning(retune: true)
         } catch {
             // Preparing is only a speed-up: playback will try again and show the error.
             return
@@ -148,8 +148,8 @@ final class TorrentWarmup {
         }
     }
 
-    /// The engine was retuned and has closed all its torrents.
-    func engineDidReset() {
+    /// The engine is about to be retuned and closes all its torrents: their reading stops now.
+    func engineWillReset() {
         warmHash = nil
         warmLink = nil
         pageHash = nil
