@@ -253,9 +253,8 @@ struct FeaturedCard: View {
                     .foregroundStyle(.white)
                     .contentTransition(.symbolEffect(.replace))
                     .frame(width: 40, height: 40)
-                    .glassSurface(Circle(), style: .clear, interactive: true)
             }
-            .buttonStyle(.plain)
+            .glassButton(Circle(), style: .clear)
             .padding(12)
             .accessibilityLabel(library.isWatchLater(item) ? "Убрать из «Смотреть позже»" : "Смотреть позже")
         }

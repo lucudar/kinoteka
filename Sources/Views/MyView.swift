@@ -1,5 +1,4 @@
 import SwiftUI
-import UniformTypeIdentifiers
 
 enum LibraryListKind: Hashable {
     case favorites(MediaKind)
@@ -36,6 +35,7 @@ private enum LibrarySort: String, CaseIterable, Identifiable {
 
 struct MyView: View {
     @EnvironmentObject private var library: LibraryStore
+    @ObservedObject private var downloads = DownloadManager.shared
 
     var body: some View {
         NavigationStack {
@@ -63,6 +63,22 @@ struct MyView: View {
                         ItemsGridScreen(kind: .watchLater)
                     } label: {
                         row("Смотреть позже", "bookmark", library.data.watchLater.count)
+                    }
+                    NavigationLink {
+                        DownloadsView()
+                    } label: {
+                        HStack {
+                            Label("Загрузки", systemImage: "arrow.down.circle")
+                            Spacer()
+                            if let active = downloads.activeItem {
+                                Text("\(Int(active.progress * 100))%")
+                                    .monospacedDigit()
+                                    .foregroundStyle(Theme.accent)
+                            } else if !downloads.items.isEmpty {
+                                Text("\(downloads.items.count)")
+                                    .foregroundStyle(Theme.secondary)
+                            }
+                        }
                     }
                 }
 
@@ -235,362 +251,6 @@ struct FavoriteChannelsScreen: View {
         .background(Theme.background)
         .navigationTitle("Избранные каналы")
         .navigationBarTitleDisplayMode(.inline)
-    }
-}
-
-struct SettingsView: View {
-    @EnvironmentObject private var library: LibraryStore
-    @EnvironmentObject private var channels: ChannelsStore
-    @ObservedObject private var network = NetworkMonitor.shared
-    @AppStorage(SettingsKeys.kpToken) private var token = ""
-    @AppStorage(SettingsKeys.playlistURL) private var playlistURL = ""
-    @AppStorage(SettingsKeys.autoNext) private var autoNext = true
-    @AppStorage(SettingsKeys.savePlayerSettings) private var savePlayerSettings = true
-    @AppStorage(SettingsKeys.backgroundAudio) private var backgroundAudio = true
-    @AppStorage(SettingsKeys.searchServer) private var searchServer = TorrentSearchService.defaultServer
-    @AppStorage(SettingsKeys.searchApiKey) private var searchApiKey = ""
-    @AppStorage(SettingsKeys.zonaIndex) private var zonaIndex = true
-    @AppStorage(SettingsKeys.preferredQuality) private var preferredQuality = ReleaseQuality.fullHD.rawValue
-    @AppStorage(SettingsKeys.preferredVoice) private var preferredVoice = "auto"
-    @AppStorage(SettingsKeys.autoPlayBest) private var autoPlayBest = true
-    @AppStorage(SettingsKeys.prepareTorrent) private var prepareTorrent = true
-    @AppStorage(SettingsKeys.smartQuality) private var smartQuality = true
-    @AppStorage(SettingsKeys.automaticFallback) private var automaticFallback = true
-    @AppStorage(SettingsKeys.automaticRecovery) private var automaticRecovery = true
-    @AppStorage(SettingsKeys.preloadNextEpisode) private var preloadNextEpisode = true
-    @AppStorage(SettingsKeys.playerGestures) private var playerGestures = true
-    @AppStorage(SettingsKeys.engineEncryption) private var engineEncryption = EngineEncryptionMode.automatic.rawValue
-    @State private var checkingSearch = false
-    @State private var engineStatus = "Проверка…"
-    @State private var profileText = ""
-    @State private var cacheSize = ""
-    @State private var diagnosticsSize = ""
-    @State private var reportVersion = 0
-    @State private var message: String?
-    @State private var importingBackup = false
-    @State private var backupURL: URL?
-
-    var body: some View {
-        Form {
-            Section {
-                SecureField("Ключ API", text: $token)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                PasteButton(payloadType: String.self) { strings in
-                    Task { @MainActor in
-                        if let first = strings.first { token = first.trimmed }
-                    }
-                }
-                if let url = URL(string: "https://kinopoiskapiunofficial.tech/signup") {
-                    Link(destination: url) {
-                        Label("Получить ключ бесплатно", systemImage: "arrow.up.right.square")
-                    }
-                }
-            } header: {
-                Text("Кинопоиск")
-            } footer: {
-                Text(token.trimmed.isEmpty
-                     ? "Необязательно: без ключа каталог, поиск и описания берутся из индекса Zona. С ключом — подробнее (названия серий, возрастной рейтинг, трейлеры). Зарегистрируйтесь на kinopoiskapiunofficial.tech, скопируйте токен из профиля и вставьте сюда. Бесплатно — 500 запросов в сутки, ответы кэшируются на устройстве."
-                     : "Ключ сохранён. Бесплатный тариф — 500 запросов в сутки, ответы кэшируются на устройстве. Если Кинопоиск не отвечает (без VPN его сервер за рубежом часто замедляют) или лимит исчерпан, каталог временно берётся из индекса Zona.")
-            }
-
-            Section {
-                NavigationLink {
-                    PlaylistSetupView()
-                        .navigationTitle("Плейлист")
-                        .navigationBarTitleDisplayMode(.inline)
-                } label: {
-                    HStack {
-                        Label("Плейлист M3U", systemImage: "tv")
-                        Spacer()
-                        Text(playlistSummary)
-                            .foregroundStyle(Theme.secondary)
-                            .lineLimit(1)
-                    }
-                }
-            } header: {
-                Text("ТВ-каналы")
-            }
-
-            Section {
-                Toggle("Индекс Zona", isOn: $zonaIndex)
-                    .onChange(of: zonaIndex) { _, _ in
-                        TorrentSearchService.shared.clearCache()
-                    }
-                Toggle("Сразу включать лучшую раздачу", isOn: $autoPlayBest)
-                Picker("Качество по умолчанию", selection: $preferredQuality) {
-                    ForEach(ReleaseQuality.choices) { quality in
-                        Text(quality.title).tag(quality.rawValue)
-                    }
-                }
-                Picker("Озвучка по умолчанию", selection: $preferredVoice) {
-                    Text("Авто").tag("auto")
-                    ForEach(VoiceKind.audioChoices, id: \.rawValue) { voice in
-                        Text(voice.title).tag(ReleaseVoiceOption.kind(voice).settingValue)
-                    }
-                }
-                Toggle("Автокачество по сети", isOn: $smartQuality)
-                Toggle("Готовить раздачу заранее", isOn: $prepareTorrent)
-                Toggle("Автоматически менять нерабочую раздачу", isOn: $automaticFallback)
-                LabeledContent("Текущая сеть", value: network.title)
-                LabeledContent("Сервер") {
-                    TextField(TorrentSearchService.defaultServer, text: $searchServer)
-                        .multilineTextAlignment(.trailing)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .keyboardType(.URL)
-                }
-                LabeledContent("API-ключ") {
-                    SecureField("не нужен для jac.red", text: $searchApiKey)
-                        .multilineTextAlignment(.trailing)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                }
-                Button {
-                    checkSearch()
-                } label: {
-                    HStack {
-                        Text("Проверить поиск")
-                        Spacer()
-                        if checkingSearch {
-                            ProgressView()
-                        }
-                    }
-                }
-                .disabled(checkingSearch)
-                if searchServer.trimmed != TorrentSearchService.defaultServer {
-                    Button("Вернуть сервер по умолчанию") {
-                        searchServer = TorrentSearchService.defaultServer
-                        searchApiKey = ""
-                        TorrentSearchService.shared.clearCache()
-                    }
-                }
-            } header: {
-                Text("Поиск раздач")
-            } footer: {
-                Text("«Индекс Zona»: раздачи фильма берутся, как в приложении Zona, из её поискового индекса — по фильму, с уже распознанными озвучкой и качеством. Его сервер и постеры в России, поэтому он работает без VPN; без ключа Кинопоиска оттуда же берётся каталог. Раздачи с jac.red добавляются к ним — одинаковые торренты объединяются.\n\n«Автокачество по сети» ограничивает мобильную сеть до 720p; Wi‑Fi использует выбранное качество. При нерабочей раздаче приложение само попробует следующую подходящую.\n\nЕсли jac.red не отвечает (в мобильной сети зарубежные серверы часто замедляют), поиск сам переходит на его зеркала в России — jr.maxvol.pro и jac-red.ru, а в мобильной сети спрашивает их первыми.\n\n«Готовить раздачу заранее»: пока открыта страница фильма, его раздача подключается к пирам и заранее скачивает начало и конец видео — плеер стартует быстрее. Тратит немного трафика.")
-            }
-
-            Section {
-                Toggle("Автопереход к следующей серии", isOn: $autoNext)
-                Toggle("Запоминать скорость и пропорции", isOn: $savePlayerSettings)
-                Toggle("Звук в фоне", isOn: $backgroundAudio)
-                Toggle("Восстанавливать после зависания", isOn: $automaticRecovery)
-                Toggle("Готовить следующую серию", isOn: $preloadNextEpisode)
-                Toggle("Жесты в плеере", isOn: $playerGestures)
-            } header: {
-                Text("Плеер")
-            } footer: {
-                Text("При зависании поток переподключится с сохранённого места, затем попробует более лёгкую раздачу. Следующая серия заранее получает небольшой начальный буфер только не в мобильной сети.\n\nЖесты: по горизонтали — перемотка, слева по вертикали — яркость, справа — громкость, двойное касание слева или справа — 10 секунд назад или вперёд (каждое следующее касание добавляет ещё 10).")
-            }
-
-            Section {
-                HStack {
-                    Text("Торрент-движок")
-                    Spacer()
-                    Text(engineStatus)
-                        .foregroundStyle(Theme.secondary)
-                }
-                Button("Проверить и запустить движок") {
-                    Task {
-                        engineStatus = "Запуск…"
-                        do {
-                            try await TorrServer.shared.ensureRunning(retune: true)
-                        } catch {
-                            message = error.localizedDescription
-                        }
-                        await refreshStatus()
-                    }
-                }
-                Picker("Шифрование трафика", selection: $engineEncryption) {
-                    ForEach(EngineEncryptionMode.allCases) { mode in
-                        Text(mode.title).tag(mode.rawValue)
-                    }
-                }
-                if !profileText.isEmpty {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("Настройка движка")
-                        Text(profileText)
-                            .font(.footnote)
-                            .foregroundStyle(Theme.secondary)
-                    }
-                }
-                Button("Очистить список торрентов", role: .destructive) {
-                    Task {
-                        await TorrServer.shared.wipe()
-                        message = "Список торрентов очищен"
-                    }
-                }
-            } header: {
-                Text("Торренты")
-            } footer: {
-                Text("Встроенный TorrServer MatriX раздаёт видео плееру прямо на устройстве. Движок сам настраивается под сеть, когда открывается фильм: по Wi‑Fi — буфер до 2 ГБ на диске (по свободному месту) и до 60 пиров; в мобильной сети — меньший буфер, только TCP и ограниченная отдача. Видео целиком не сохраняется: буфер очищается при закрытии раздачи и при следующем запуске.\n\nШифрование: движок сначала предлагает пиру зашифрованное соединение, а с теми, кто его не поддерживает, соединяется без шифрования. «Всегда» оставляет только зашифрованные соединения — оператору труднее распознать и замедлить торрент-трафик, но пиров меньше. Включайте, только если без этого раздачи в мобильной сети почти не качаются.")
-            }
-
-            Section {
-                HStack {
-                    Text("Кэш каталога")
-                    Spacer()
-                    Text(cacheSize)
-                        .foregroundStyle(Theme.secondary)
-                }
-                Button("Очистить кэш", role: .destructive) {
-                    KPClient.shared.clearCache()
-                    URLCache.shared.removeAllCachedResponses()
-                    cacheSize = KPClient.shared.cacheSizeText
-                    message = "Кэш очищен"
-                }
-                if !library.data.blockedReleaseIDs.isEmpty {
-                    Button("Вернуть скрытые раздачи (\(library.data.blockedReleaseIDs.count))") {
-                        library.clearBlockedReleases()
-                        message = "Скрытые раздачи снова будут предлагаться"
-                    }
-                }
-            } header: {
-                Text("Данные")
-            }
-
-            Section {
-                if let backupURL = backupURL {
-                    ShareLink(item: backupURL) {
-                        Label("Экспортировать резервную копию", systemImage: "square.and.arrow.up")
-                    }
-                }
-                Button {
-                    importingBackup = true
-                } label: {
-                    Label("Восстановить из файла", systemImage: "square.and.arrow.down")
-                }
-            } header: {
-                Text("Резервная копия")
-            } footer: {
-                Text("Сохраняются медиатека, прогресс, история, свои раздачи и обычные настройки. Ключи API и адрес плейлиста в файл не попадают.")
-            }
-
-            Section {
-                HStack {
-                    Text("Размер журнала")
-                    Spacer()
-                    Text(diagnosticsSize)
-                        .foregroundStyle(Theme.secondary)
-                }
-                NavigationLink {
-                    NetworkCheckView()
-                } label: {
-                    Label("Проверка сети", systemImage: "network")
-                }
-                DiagnosticsReportLink()
-                    .id(reportVersion)
-                Button("Очистить журнал", role: .destructive) {
-                    AppDiagnostics.shared.clear()
-                    diagnosticsSize = AppDiagnostics.shared.sizeText
-                    reportVersion += 1
-                    message = "Журнал диагностики очищен"
-                }
-            } header: {
-                Text("Диагностика")
-            } footer: {
-                Text("«Проверка сети» показывает, что в текущей сети доступно без VPN: индекс и постеры Zona, Кинопоиск, поиск раздач и его зеркала, трекеры, DHT и реальная скорость торрента.\n\nОтчёт хранится только на iPhone: события плеера и движка, память, зависания, сбои прошлых запусков и системные отчёты iOS (MetricKit). Он отправляется только через кнопку выше — например, в Telegram или по почте.")
-            }
-
-            Section {
-                HStack {
-                    Text("Версия")
-                    Spacer()
-                    Text(AppInfo.version)
-                        .foregroundStyle(Theme.secondary)
-                }
-            }
-        }
-        .scrollContentBackground(.hidden)
-        .background(Theme.background)
-        .navigationTitle("Настройки")
-        .navigationBarTitleDisplayMode(.inline)
-        .alert(message ?? "", isPresented: Binding(get: { message != nil }, set: { if !$0 { message = nil } })) {
-            Button("OK", role: .cancel) {}
-        }
-        .fileImporter(isPresented: $importingBackup, allowedContentTypes: [.json]) { result in
-            switch result {
-            case .success(let url):
-                do {
-                    let backup = try BackupService.load(from: url)
-                    backup.settings.apply()
-                    library.replaceData(backup.library)
-                    backupURL = BackupService.exportURL(library: library.data)
-                    message = "Резервная копия восстановлена"
-                } catch {
-                    message = error.localizedDescription
-                }
-            case .failure(let error):
-                message = error.localizedDescription
-            }
-        }
-        .task {
-            cacheSize = KPClient.shared.cacheSizeText
-            diagnosticsSize = AppDiagnostics.shared.sizeText
-            backupURL = BackupService.exportURL(library: library.data)
-            await refreshStatus()
-        }
-        .onChange(of: engineEncryption) { _, _ in
-            refreshProfile()
-            Task {
-                // Retuning closes the torrents of the engine, so not while a film plays.
-                let server = TorrServer.shared
-                if server.isRunning, !server.isPlayerActive {
-                    try? await server.ensureRunning(retune: true)
-                }
-                refreshProfile()
-            }
-        }
-        .onChange(of: network.connection) { _, _ in refreshProfile() }
-    }
-
-    /// What the engine runs with now, or what it will use for the current network.
-    private func refreshProfile() {
-        let server = TorrServer.shared
-        let desired = server.desiredProfile
-        if let active = server.activeProfile, active != desired {
-            profileText = active.summary + "\nДля текущей сети — при открытии фильма: " + desired.summary
-        } else {
-            profileText = desired.summary
-        }
-    }
-
-    private func checkSearch() {
-        checkingSearch = true
-        Task {
-            defer { checkingSearch = false }
-            let query = TorrentSearchQuery(title: "Матрица", originalTitle: "The Matrix", year: 1999, isSeries: false)
-            do {
-                let result = try await TorrentSearchService.shared.search(query, force: true)
-                let host = result.server.flatMap(SearchMirrors.host).map { " Ответил \($0)." } ?? ""
-                if result.releases.isEmpty {
-                    message = "Сервер ответил, но раздач «Матрицы» не нашёл (результатов: \(result.found)). Проверьте адрес и API-ключ." + host
-                } else {
-                    message = "Поиск работает. Раздач «Матрицы»: \(result.releases.count)." + host
-                }
-            } catch {
-                message = error.localizedDescription
-            }
-        }
-    }
-
-    private var playlistSummary: String {
-        if playlistURL.isEmpty { return "не задан" }
-        if playlistURL == ChannelsStore.localMarker { return "файл" }
-        return URL(string: playlistURL)?.host ?? playlistURL
-    }
-
-    private func refreshStatus() async {
-        refreshProfile()
-        let ok = await TorrServer.shared.ping()
-        if ok {
-            engineStatus = "работает"
-        } else if let error = TorrServer.shared.startError {
-            engineStatus = "ошибка: \(error)"
-        } else {
-            engineStatus = "не отвечает"
-        }
     }
 }
 

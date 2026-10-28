@@ -176,3 +176,28 @@ struct FilledActionButtonStyle: ButtonStyle {
             .animation(.easeOut(duration: 0.15), value: configuration.isPressed)
     }
 }
+
+/// A button drawn as a glass shape. The whole shape takes the tap: an interactive glass effect
+/// inside a button label catches the touches around the glyph on iOS 26, so a small button
+/// (the cross of the player) reacted only to a precise tap. The press is shown by the button itself.
+struct GlassShapeButtonStyle<S: Shape>: ButtonStyle {
+    let shape: S
+    var style: GlassStyle = .regular
+    var tint: Color?
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .contentShape(shape)
+            .glassSurface(shape, style: style, tint: tint)
+            .scaleEffect(configuration.isPressed ? 0.92 : 1)
+            .opacity(configuration.isPressed ? 0.75 : 1)
+            .animation(.spring(duration: 0.22), value: configuration.isPressed)
+    }
+}
+
+extension View {
+    /// A button with a glass background of the given shape that reacts to a tap anywhere on it.
+    func glassButton<S: Shape>(_ shape: S, style: GlassStyle = .regular, tint: Color? = nil) -> some View {
+        buttonStyle(GlassShapeButtonStyle(shape: shape, style: style, tint: tint))
+    }
+}
