@@ -367,7 +367,7 @@ struct CircleAction: View {
                     .foregroundStyle(active ? Theme.accent : Color.white)
                     .contentTransition(.symbolEffect(.replace))
                     .frame(width: 48, height: 48)
-                    .glassSurface(Circle(), tint: active ? Theme.accent.opacity(0.28) : nil, interactive: true)
+                    .glassSurface(Circle(), tint: active ? Theme.accent.opacity(0.28) : nil)
                 Text(title)
                     .font(.caption2)
                     .foregroundStyle(Theme.secondary)
@@ -451,9 +451,8 @@ struct Chip: View {
                 .foregroundStyle(.white)
                 .padding(.horizontal, 14)
                 .padding(.vertical, 8)
-                .glassSurface(Capsule(), tint: selected ? Theme.accent : nil, interactive: true)
         }
-        .buttonStyle(.plain)
+        .glassButton(Capsule(), tint: selected ? Theme.accent : nil)
         .animation(.smooth(duration: 0.25), value: selected)
     }
 }
