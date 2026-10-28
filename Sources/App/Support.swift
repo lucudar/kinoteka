@@ -34,6 +34,67 @@ enum SettingsKeys {
     static let searchMirrorDate = "torrentSearchMirrorDate"
     /// Torrents and the catalog also come from Zona's index (hosted in Russia, no key).
     static let zonaIndex = "zonaIndexEnabled"
+    /// iOS moves the video to Picture in Picture when the app is closed during playback.
+    static let pipAuto = "pictureInPictureAutomatic"
+    static let downloadsWifiOnly = "downloadsWifiOnly"
+    static let downloadsPauseWhileWatching = "downloadsPauseWhileWatching"
+    static let downloadsKeepAwake = "downloadsKeepAwake"
+    /// OpenSubtitles: the language to look for ("ru"), English as a second choice, automatic search.
+    static let subtitleLanguage = "subtitleSearchLanguage"
+    static let subtitleEnglishFallback = "subtitleSearchEnglishFallback"
+    static let subtitleAuto = "subtitleSearchAutomatic"
+    static let openSubtitlesKey = "openSubtitlesApiKey"
+    static let openSubtitlesUser = "openSubtitlesUsername"
+}
+
+/// The screen stays on while something needs it: the player, downloads (a setting).
+@MainActor
+enum IdleTimer {
+    private static var reasons: Set<String> = []
+
+    static func set(_ reason: String, active: Bool) {
+        if active {
+            reasons.insert(reason)
+        } else {
+            reasons.remove(reason)
+        }
+        let disabled = !reasons.isEmpty
+        if UIApplication.shared.isIdleTimerDisabled != disabled {
+            UIApplication.shared.isIdleTimerDisabled = disabled
+        }
+    }
+}
+
+/// Lets the screen turn only to the current orientation while the player's controls are locked.
+@MainActor
+enum OrientationLock {
+    private(set) static var mask: UIInterfaceOrientationMask = .allButUpsideDown
+
+    static func lockCurrent() {
+        guard UIDevice.current.userInterfaceIdiom == .phone, let scene = OrientationHelper.scene else { return }
+        let locked: UIInterfaceOrientationMask
+        switch scene.interfaceOrientation {
+        case .portrait: locked = .portrait
+        case .landscapeLeft: locked = .landscapeLeft
+        case .landscapeRight: locked = .landscapeRight
+        default: return
+        }
+        apply(locked)
+    }
+
+    static func unlock() {
+        apply(.allButUpsideDown)
+    }
+
+    private static func apply(_ value: UIInterfaceOrientationMask) {
+        guard mask != value else { return }
+        mask = value
+        for scene in UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }) {
+            for window in scene.windows {
+                window.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
+            }
+        }
+    }
 }
 
 enum TimeFormat {
