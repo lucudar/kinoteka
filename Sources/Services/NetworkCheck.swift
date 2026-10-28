@@ -581,8 +581,9 @@ enum NetworkProbes {
         guard let url = announceURL(tracker.url, hash: speedHash) else { return item }
         let result = await HTTPProbe.run(URLRequest(url: url), idle: 10, total: 15, keepBody: 64 << 10)
         if let failure = failureText(result) {
-            item.state = .failed
-            item.detail = failure
+            // One unreachable tracker is not fatal: the engine asks all of them, plus DHT and PEX.
+            item.state = .warning
+            item.detail = failure + " — не критично: пиры найдутся через другие трекеры и DHT"
             return item
         }
         guard result.status == 200 else {
@@ -682,6 +683,11 @@ enum NetworkProbes {
         let bytes = [UInt8](body)
         if let at = index(of: Array("14:failure reason".utf8), in: bytes) {
             let reason = bencodedString(bytes, at: at + 17).map { String(decoding: $0.value, as: UTF8.self) } ?? ""
+            // Retrackers of a tracker site (rutracker) only know its own torrents, not the test one.
+            let lower = reason.lowercased()
+            if lower.contains("regist") || lower.contains("not found") || lower.contains("unknown torrent") {
+                return (.ok, "доступен (тестовую раздачу не знает — пиров даёт только для своих торрентов)")
+            }
             return (.warning, "доступен, ответ: «\(reason.prefix(80))»")
         }
         if let at = index(of: Array("5:peers".utf8), in: bytes) {
