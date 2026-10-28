@@ -20,10 +20,11 @@ defaults:
 
 jobs:
   build:
-    runs-on: macos-15
+    # macOS 26 + Xcode 26: the iOS 26 SDK gives the app the Liquid Glass design.
+    runs-on: macos-26
     timeout-minutes: 60
     env:
-      TORRSERVER_TAG: MatriX.145.1
+      TORRSERVER_TAG: MatriX.147.1
       HOMEBREW_NO_AUTO_UPDATE: "1"
       HOMEBREW_NO_INSTALL_CLEANUP: "1"
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -50,6 +51,8 @@ jobs:
             xcrun --sdk iphoneos --show-sdk-version
             xcrun simctl list runtimes || true
           } 2>&1 | tee -a steps.log
+          # Shown in the build comment: Liquid Glass needs the iOS 26 SDK (Xcode 26 or newer).
+          echo "XCODE_INFO=$(xcodebuild -version | head -1), iOS SDK $(xcrun --sdk iphoneos --show-sdk-version)" >> "$GITHUB_ENV"
 
       - name: Install XcodeGen
         run: brew install xcodegen 2>&1 | tee -a steps.log
@@ -122,16 +125,16 @@ jobs:
             gh release create "$TAG" $FILES \
               --target "$GITHUB_SHA" \
               --title "Кинотека — сборка ${{ github.run_number }}" \
-              --notes "Коммит ${GITHUB_SHA::7}. Файл Kinoteka.ipa ставится на iPhone через Sideloadly (см. README)." \
+              --notes "Коммит ${GITHUB_SHA::7}, ${XCODE_INFO}, движок ${TORRSERVER_TAG}. Файл Kinoteka.ipa ставится на iPhone через Sideloadly (см. README)." \
               --latest
           else
             gh release create "$TAG" $FILES \
               --target "$GITHUB_SHA" \
               --title "Кинотека — тестовая сборка ${{ github.run_number }} ($GITHUB_REF_NAME)" \
-              --notes "Тестовая сборка из ветки $GITHUB_REF_NAME, коммит ${GITHUB_SHA::7}. Основные сборки — из main." \
+              --notes "Тестовая сборка из ветки $GITHUB_REF_NAME, коммит ${GITHUB_SHA::7}, ${XCODE_INFO}, движок ${TORRSERVER_TAG}. Основные сборки — из main." \
               --prerelease --latest=false
           fi
-          gh issue comment "$STATUS_ISSUE" --body "✅ Сборка №${{ github.run_number }} ($GITHUB_REF_NAME) готова: ${{ github.server_url }}/${{ github.repository }}/releases/tag/$TAG" || true
+          gh issue comment "$STATUS_ISSUE" --body "✅ Сборка №${{ github.run_number }} ($GITHUB_REF_NAME, ${XCODE_INFO}) готова: ${{ github.server_url }}/${{ github.repository }}/releases/tag/$TAG" || true
 
       - uses: actions/upload-artifact@v4
         if: failure()

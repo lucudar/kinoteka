@@ -184,7 +184,11 @@ struct PosterCard: View {
                     }
                     .padding(6)
                 }
-                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .stroke(Color.white.opacity(0.08), lineWidth: 0.75)
+                }
             Text(item.title)
                 .font(.footnote.weight(.semibold))
                 .foregroundStyle(.white)
@@ -247,7 +251,7 @@ struct PlaceholderRow: View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 12) {
                 ForEach(0..<6, id: \.self) { _ in
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
                         .fill(Theme.card)
                         .frame(width: cardWidth, height: cardWidth * 1.5)
                 }
@@ -255,6 +259,7 @@ struct PlaceholderRow: View {
             .padding(.horizontal, 16)
         }
         .scrollDisabled(true)
+        .modifier(LoadingPulse())
     }
 }
 
@@ -299,9 +304,10 @@ struct CircleAction: View {
             VStack(spacing: 6) {
                 Image(systemName: systemImage)
                     .font(.system(size: 18, weight: .semibold))
-                    .frame(width: 46, height: 46)
-                    .background(Circle().fill(active ? Theme.accent.opacity(0.22) : Theme.card))
                     .foregroundStyle(active ? Theme.accent : Color.white)
+                    .contentTransition(.symbolEffect(.replace))
+                    .frame(width: 48, height: 48)
+                    .glassSurface(Circle(), tint: active ? Theme.accent.opacity(0.28) : nil, interactive: true)
                 Text(title)
                     .font(.caption2)
                     .foregroundStyle(Theme.secondary)
@@ -330,7 +336,7 @@ struct ErrorView: View {
                 .foregroundStyle(Theme.secondary)
             if let retry = retry {
                 Button("Повторить", action: retry)
-                    .buttonStyle(.borderedProminent)
+                    .prominentButtonStyle()
             }
         }
         .padding(24)
@@ -375,13 +381,26 @@ struct Chip: View {
     var body: some View {
         Button(action: action) {
             Text(title)
-                .font(.subheadline.weight(.medium))
+                .font(.subheadline.weight(selected ? .semibold : .medium))
                 .lineLimit(1)
                 .foregroundStyle(.white)
                 .padding(.horizontal, 14)
                 .padding(.vertical, 8)
-                .background(Capsule().fill(selected ? Theme.accent : Theme.card))
+                .glassSurface(Capsule(), tint: selected ? Theme.accent : nil, interactive: true)
         }
         .buttonStyle(.plain)
+        .animation(.smooth(duration: 0.25), value: selected)
+    }
+}
+
+/// The placeholders of a loading row breathe instead of standing still.
+struct LoadingPulse: ViewModifier {
+    @State private var dimmed = false
+
+    func body(content: Content) -> some View {
+        content
+            .opacity(dimmed ? 0.45 : 1)
+            .animation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true), value: dimmed)
+            .onAppear { dimmed = true }
     }
 }

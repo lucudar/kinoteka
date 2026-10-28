@@ -58,7 +58,7 @@ struct CatalogView: View {
                             ErrorView(message: error) { Task { await loadMore() } }
                         } else if page > 0 && page < totalPages && visibleItems.count < 12 {
                             Button("Загрузить ещё") { Task { await loadMore() } }
-                                .buttonStyle(.bordered)
+                                .secondaryActionStyle()
                                 .padding()
                         } else if page > 0 && visibleItems.isEmpty {
                             ContentUnavailableView("Ничего не найдено", systemImage: "film.stack", description: Text("Попробуйте изменить фильтры"))

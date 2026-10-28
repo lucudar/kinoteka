@@ -153,6 +153,20 @@ struct PlayerHostView: View {
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
+            if showsBackdrop, let poster = request.item?.poster {
+                // While the video is prepared: the poster, blurred, under the glass panel.
+                Color.clear
+                    .overlay {
+                        PosterImage(url: poster, maxPixel: 300)
+                            .scaleEffect(1.2)
+                            .blur(radius: 40)
+                            .opacity(0.5)
+                    }
+                    .clipped()
+                    .ignoresSafeArea()
+                    .allowsHitTesting(false)
+                    .transition(.opacity)
+            }
             switch phase {
             case .resolving:
                 resolvingView
@@ -945,6 +959,12 @@ struct PlayerHostView: View {
 
     // MARK: - Screens
 
+    /// The blurred poster is shown until the video plays.
+    private var showsBackdrop: Bool {
+        if case .playing = phase { return false }
+        return true
+    }
+
     private var resolvingView: some View {
         VStack(spacing: 14) {
             ProgressView()
@@ -964,17 +984,20 @@ struct PlayerHostView: View {
                 .multilineTextAlignment(.center)
             HStack(spacing: 12) {
                 Button("Отмена") { close() }
-                    .buttonStyle(.bordered)
+                    .secondaryActionStyle()
                     .tint(.white)
                 if hasOtherReleases {
                     Button("Другая раздача") { showQuality = true }
-                        .buttonStyle(.bordered)
+                        .secondaryActionStyle()
                         .tint(.white)
                 }
             }
             .padding(.top, 10)
         }
         .foregroundStyle(.white)
+        .padding(28)
+        .frame(maxWidth: 460)
+        .glassSurface(RoundedRectangle(cornerRadius: 30, style: .continuous))
         .padding(24)
     }
 
@@ -991,19 +1014,22 @@ struct PlayerHostView: View {
                 .multilineTextAlignment(.center)
             HStack(spacing: 12) {
                 Button("Повторить") { startResolve() }
-                    .buttonStyle(.borderedProminent)
+                    .prominentButtonStyle()
                 if hasOtherReleases {
                     Button("Другая раздача") { showQuality = true }
-                        .buttonStyle(.bordered)
+                        .secondaryActionStyle()
                         .tint(.white)
                 }
                 Button("Закрыть") { close() }
-                    .buttonStyle(.bordered)
+                    .secondaryActionStyle()
                     .tint(.white)
             }
             .padding(.top, 8)
         }
         .foregroundStyle(.white)
+        .padding(28)
+        .frame(maxWidth: 460)
+        .glassSurface(RoundedRectangle(cornerRadius: 30, style: .continuous))
         .padding(24)
     }
 
@@ -1094,7 +1120,7 @@ struct PlayerHostView: View {
                     .foregroundStyle(.white)
                     .padding(.horizontal, 22)
                     .padding(.vertical, 14)
-                    .background(Color.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    .glassSurface(RoundedRectangle(cornerRadius: 20, style: .continuous))
                     .allowsHitTesting(false)
                 }
                 if showControls && !controlsLocked && !model.failed {
@@ -1111,10 +1137,11 @@ struct PlayerHostView: View {
                             } label: {
                                 Label("Разблокировать", systemImage: "lock.open.fill")
                                     .font(.subheadline.weight(.semibold))
-                                    .padding(.horizontal, 14)
-                                    .padding(.vertical, 9)
-                                    .background(Color.black.opacity(0.68), in: Capsule())
+                                    .padding(.horizontal, 16)
+                                    .padding(.vertical, 11)
+                                    .glassSurface(Capsule(), interactive: true)
                             }
+                            .buttonStyle(.plain)
                         }
                         Spacer()
                     }
@@ -1127,7 +1154,7 @@ struct PlayerHostView: View {
                         switchBanner(release)
                         Spacer()
                     }
-                    .padding(.top, showControls && !controlsLocked ? 64 : 16)
+                    .padding(.top, showControls && !controlsLocked ? 72 : 16)
                     .padding(.horizontal, 20)
                     .transition(.opacity)
                 }
@@ -1141,10 +1168,10 @@ struct PlayerHostView: View {
                         .foregroundStyle(.white)
                         .padding(.horizontal, 16)
                         .padding(.vertical, 10)
-                        .background(Color.black.opacity(0.75), in: Capsule())
+                        .glassSurface(Capsule())
                         Spacer()
                     }
-                    .padding(.top, showControls && !controlsLocked ? 64 : 16)
+                    .padding(.top, showControls && !controlsLocked ? 72 : 16)
                     .padding(.horizontal, 20)
                 }
                 if let playerNotice = playerNotice {
@@ -1155,7 +1182,7 @@ struct PlayerHostView: View {
                             .foregroundStyle(.white)
                             .padding(.horizontal, 16)
                             .padding(.vertical, 10)
-                            .background(Color.black.opacity(0.75), in: Capsule())
+                            .glassSurface(Capsule())
                     }
                     .padding(.bottom, 24)
                     .transition(.opacity)
@@ -1177,22 +1204,22 @@ struct PlayerHostView: View {
                                         showNextEpisodePrompt = false
                                         switchTo(next)
                                     }
-                                    .buttonStyle(.borderedProminent)
+                                    .prominentButtonStyle()
                                     Button("Отмена") {
                                         autoNextCancelled = true
                                         showNextEpisodePrompt = false
                                     }
-                                    .buttonStyle(.bordered)
+                                    .secondaryActionStyle()
                                     .tint(.white)
                                 }
                             }
                             .foregroundStyle(.white)
                             .padding(16)
-                            .background(Color.black.opacity(0.82), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                            .glassSurface(RoundedRectangle(cornerRadius: 22, style: .continuous))
                         }
                     }
                     .padding(.horizontal, 22)
-                    .padding(.bottom, showControls ? 72 : 22)
+                    .padding(.bottom, showControls ? 124 : 22)
                     .transition(.move(edge: .trailing).combined(with: .opacity))
                 }
             }
@@ -1362,7 +1389,7 @@ struct PlayerHostView: View {
         .foregroundStyle(.white)
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
-        .background(Color.black.opacity(0.75), in: Capsule())
+        .glassSurface(Capsule())
     }
 
     private var playbackFailedOverlay: some View {
@@ -1375,26 +1402,26 @@ struct PlayerHostView: View {
                 .multilineTextAlignment(.center)
             HStack(spacing: 12) {
                 Button("Повторить") { retryPlayback() }
-                    .buttonStyle(.borderedProminent)
+                    .prominentButtonStyle()
                 if hasOtherReleases {
                     Button("Другая раздача") { showQuality = true }
-                        .buttonStyle(.bordered)
+                        .secondaryActionStyle()
                         .tint(.white)
                 }
                 Button("Закрыть") { close() }
-                    .buttonStyle(.bordered)
+                    .secondaryActionStyle()
                     .tint(.white)
             }
         }
         .foregroundStyle(.white)
         .padding(24)
-        .background(Color.black.opacity(0.65), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .glassSurface(RoundedRectangle(cornerRadius: 26, style: .continuous))
         .padding(24)
     }
 
     private var controls: some View {
         ZStack {
-            LinearGradient(colors: [Color.black.opacity(0.75), .clear, .clear, Color.black.opacity(0.8)], startPoint: .top, endPoint: .bottom)
+            LinearGradient(colors: [Color.black.opacity(0.6), .clear, .clear, Color.black.opacity(0.65)], startPoint: .top, endPoint: .bottom)
                 .ignoresSafeArea()
                 .allowsHitTesting(false)
             VStack(spacing: 0) {
@@ -1410,95 +1437,122 @@ struct PlayerHostView: View {
     }
 
     private var topBar: some View {
-        HStack(spacing: 22) {
-            Button {
-                close()
-            } label: {
-                Image(systemName: "xmark")
-            }
-            VStack(alignment: .leading, spacing: 2) {
-                Text(request.item?.title ?? request.title)
-                    .font(.headline)
-                    .lineLimit(1)
-                if let file = currentFile, files.count > 1 {
-                    Text(fileLabel(file))
-                        .font(.caption)
-                        .foregroundStyle(.white.opacity(0.75))
+        GlassGroup(spacing: 8) {
+            HStack(spacing: 12) {
+                Button {
+                    close()
+                } label: {
+                    Image(systemName: "xmark")
+                        .frame(width: 44, height: 44)
+                        .glassSurface(Circle(), interactive: true)
+                }
+                .accessibilityLabel("Закрыть")
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(request.item?.title ?? request.title)
+                        .font(.headline)
                         .lineLimit(1)
+                    if let file = currentFile, files.count > 1 {
+                        Text(fileLabel(file))
+                            .font(.caption)
+                            .foregroundStyle(.white.opacity(0.75))
+                            .lineLimit(1)
+                    }
                 }
-            }
-            Spacer(minLength: 8)
-            if let sleepStatusText = sleepStatusText {
-                Button {
-                    showOptions = true
-                } label: {
-                    Label(sleepStatusText, systemImage: "moon.zzz.fill")
-                        .font(.caption.weight(.semibold))
+                .shadow(color: .black.opacity(0.45), radius: 4)
+                Spacer(minLength: 8)
+                if let sleepStatusText = sleepStatusText {
+                    Button {
+                        showOptions = true
+                    } label: {
+                        Label(sleepStatusText, systemImage: "moon.zzz.fill")
+                            .font(.caption.weight(.semibold))
+                            .padding(.horizontal, 14)
+                            .frame(height: 44)
+                            .glassSurface(Capsule(), interactive: true)
+                    }
                 }
-            }
-            if files.count > 1 {
-                Button {
-                    showFiles = true
-                } label: {
-                    Image(systemName: "list.bullet")
+                // The actions of the player in one glass capsule, like a system toolbar.
+                HStack(spacing: 0) {
+                    if files.count > 1 {
+                        topBarButton("list.bullet", label: "Серии и файлы") {
+                            showFiles = true
+                        }
+                    }
+                    topBarButton("slider.horizontal.3", label: "Настройки плеера") {
+                        showOptions = true
+                    }
+                    topBarButton("lock.fill", label: "Заблокировать экран") {
+                        hideToken += 1
+                        controlsLocked = true
+                        withAnimation(.easeInOut(duration: 0.2)) { showControls = false }
+                    }
+                    if OrientationHelper.isPhone {
+                        topBarButton("rotate.right", label: "Повернуть экран") {
+                            OrientationHelper.toggle()
+                            bumpControls()
+                        }
+                    }
                 }
-            }
-            Button {
-                showOptions = true
-            } label: {
-                Image(systemName: "slider.horizontal.3")
-            }
-            Button {
-                hideToken += 1
-                controlsLocked = true
-                withAnimation(.easeInOut(duration: 0.2)) { showControls = false }
-            } label: {
-                Image(systemName: "lock.fill")
-            }
-            if OrientationHelper.isPhone {
-                Button {
-                    OrientationHelper.toggle()
-                    bumpControls()
-                } label: {
-                    Image(systemName: "rotate.right")
-                }
+                .padding(.horizontal, 4)
+                .glassSurface(Capsule())
             }
         }
         .font(.title3.weight(.semibold))
         .foregroundStyle(.white)
+        .buttonStyle(.plain)
+    }
+
+    private func topBarButton(_ systemImage: String, label: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
+        }
+        .accessibilityLabel(label)
     }
 
     private var centerButtons: some View {
-        HStack(spacing: 60) {
-            if !request.isLive {
-                Button {
-                    model.jump(-10)
-                    bumpControls()
-                } label: {
-                    Image(systemName: "gobackward.10")
-                        .font(.system(size: 32, weight: .medium))
+        GlassGroup(spacing: 24) {
+            HStack(spacing: 36) {
+                if !request.isLive {
+                    Button {
+                        model.jump(-10)
+                        bumpControls()
+                    } label: {
+                        Image(systemName: "gobackward.10")
+                            .font(.system(size: 26, weight: .semibold))
+                            .frame(width: 64, height: 64)
+                            .glassSurface(Circle(), interactive: true)
+                    }
+                    .accessibilityLabel("Назад на 10 секунд")
                 }
-            }
-            Button {
-                model.togglePlay()
-                bumpControls()
-            } label: {
-                Image(systemName: model.isPlaying ? "pause.fill" : "play.fill")
-                    .font(.system(size: 44, weight: .bold))
-                    .frame(width: 64, height: 64)
-            }
-            if !request.isLive {
                 Button {
-                    model.jump(10)
+                    model.togglePlay()
                     bumpControls()
                 } label: {
-                    Image(systemName: "goforward.10")
-                        .font(.system(size: 32, weight: .medium))
+                    Image(systemName: model.isPlaying ? "pause.fill" : "play.fill")
+                        .font(.system(size: 36, weight: .bold))
+                        .contentTransition(.symbolEffect(.replace))
+                        .frame(width: 88, height: 88)
+                        .glassSurface(Circle(), interactive: true)
+                }
+                .accessibilityLabel(model.isPlaying ? "Пауза" : "Смотреть")
+                if !request.isLive {
+                    Button {
+                        model.jump(10)
+                        bumpControls()
+                    } label: {
+                        Image(systemName: "goforward.10")
+                            .font(.system(size: 26, weight: .semibold))
+                            .frame(width: 64, height: 64)
+                            .glassSurface(Circle(), interactive: true)
+                    }
+                    .accessibilityLabel("Вперёд на 10 секунд")
                 }
             }
         }
+        .buttonStyle(.plain)
         .foregroundStyle(.white)
-        .shadow(color: .black.opacity(0.5), radius: 6)
     }
 
     /// The length of the video, or the time left ("−12:34") after a tap on it.
@@ -1515,8 +1569,37 @@ struct PlayerHostView: View {
     }
 
     private var bottomBar: some View {
-        VStack(spacing: 6) {
+        VStack(spacing: 10) {
+            HStack {
+                if request.isLive {
+                    Label("Прямой эфир", systemImage: "dot.radiowaves.left.and.right")
+                        .font(.caption.weight(.semibold))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 7)
+                        .glassSurface(Capsule(), tint: Color.red.opacity(0.45))
+                } else if abs(model.rate - 1) > 0.01 {
+                    Text(String(format: "Скорость %.2g×", Double(model.rate)))
+                        .font(.caption.weight(.semibold))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 7)
+                        .glassSurface(Capsule())
+                }
+                Spacer()
+                if let next = nextFile {
+                    Button {
+                        switchTo(next)
+                    } label: {
+                        Label("Следующая серия", systemImage: "forward.end.fill")
+                            .font(.subheadline.weight(.semibold))
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 10)
+                            .glassSurface(Capsule(), interactive: true)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
             if !request.isLive {
+                // The timeline in a glass capsule at the bottom, where the thumb reaches it.
                 HStack(spacing: 12) {
                     Text(TimeFormat.string(ms: displayedTime))
                     Slider(value: Binding(get: { scrubbing ? scrubValue : model.progress },
@@ -1542,24 +1625,9 @@ struct PlayerHostView: View {
                     .buttonStyle(.plain)
                 }
                 .font(.caption.monospacedDigit())
-            }
-            HStack {
-                if request.isLive {
-                    Label("Прямой эфир", systemImage: "dot.radiowaves.left.and.right")
-                        .font(.caption.weight(.semibold))
-                } else if abs(model.rate - 1) > 0.01 {
-                    Text(String(format: "Скорость %.2g×", Double(model.rate)))
-                        .font(.caption.weight(.semibold))
-                }
-                Spacer()
-                if let next = nextFile {
-                    Button {
-                        switchTo(next)
-                    } label: {
-                        Label("Следующая серия", systemImage: "forward.end.fill")
-                            .font(.subheadline.weight(.semibold))
-                    }
-                }
+                .padding(.horizontal, 18)
+                .padding(.vertical, 8)
+                .glassSurface(Capsule())
             }
         }
         .foregroundStyle(.white)

@@ -70,23 +70,26 @@ struct RootView: View {
     @State private var tab: AppTab = .home
 
     var body: some View {
+        // On iOS 26 the tab bar is Liquid Glass: it floats over the content, shrinks while a list
+        // scrolls down, and the search tab is a separate round button that turns into the field.
         TabView(selection: $tab) {
-            HomeView()
-                .tabItem { Label("Главная", systemImage: "house.fill") }
-                .tag(AppTab.home)
-            CatalogView()
-                .tabItem { Label("Каталог", systemImage: "square.grid.2x2.fill") }
-                .tag(AppTab.catalog)
-            TVChannelsView()
-                .tabItem { Label("ТВ-каналы", systemImage: "tv.fill") }
-                .tag(AppTab.tv)
-            SearchView()
-                .tabItem { Label("Поиск", systemImage: "magnifyingglass") }
-                .tag(AppTab.search)
-            MyView()
-                .tabItem { Label("Моё", systemImage: "heart.fill") }
-                .tag(AppTab.my)
+            Tab("Главная", systemImage: "house.fill", value: AppTab.home) {
+                HomeView()
+            }
+            Tab("Каталог", systemImage: "square.grid.2x2.fill", value: AppTab.catalog) {
+                CatalogView()
+            }
+            Tab("ТВ-каналы", systemImage: "tv.fill", value: AppTab.tv) {
+                TVChannelsView()
+            }
+            Tab("Моё", systemImage: "heart.fill", value: AppTab.my) {
+                MyView()
+            }
+            Tab("Поиск", systemImage: "magnifyingglass", value: AppTab.search, role: .search) {
+                SearchView()
+            }
         }
+        .tabBarMinimizesOnScroll()
         .onChange(of: scenePhase) { _, phase in
             // The phases themselves are logged by AppDiagnostics.
             if phase == .active {
