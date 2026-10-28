@@ -35,6 +35,12 @@ struct DetailsView: View {
     @State private var appliedDefaultVoice = false
     /// The season below was chosen automatically once (the one being watched).
     @State private var seasonPreselected = false
+    /// The header has scrolled away: the title is shown in the navigation bar.
+    @State private var titleInBar = false
+    @State private var stretch = HeaderStretch()
+
+    /// The picture of the header goes under the navigation bar (Liquid Glass buttons float over it).
+    private static let backdropHeight: CGFloat = 330
 
     private var current: MediaItem { film?.item ?? item }
     private var isSeries: Bool { film?.isSeries ?? (item.kind == .series) }
@@ -252,10 +258,28 @@ struct DetailsView: View {
             }
             .padding(.bottom, 32)
         }
+        .ignoresSafeArea(edges: .top)
+        .onScrollGeometryChange(for: CGFloat.self) { geometry in
+            geometry.contentOffset.y + geometry.contentInsets.top
+        } action: { _, offset in
+            // Only the picture of the header follows the pull, not the whole page.
+            let pull = max(0, -offset)
+            if stretch.pull != pull { stretch.pull = pull }
+            let scrolled = offset > 250
+            if scrolled != titleInBar {
+                withAnimation(.easeInOut(duration: 0.2)) { titleInBar = scrolled }
+            }
+        }
         .background(Theme.background)
         .navigationTitle(current.title)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
+            ToolbarItem(placement: .principal) {
+                Text(current.title)
+                    .font(.headline)
+                    .lineLimit(1)
+                    .opacity(titleInBar ? 1 : 0)
+            }
             ToolbarItem(placement: .topBarTrailing) {
                 ShareLink(item: shareURL) {
                     Image(systemName: "square.and.arrow.up")
@@ -292,29 +316,19 @@ struct DetailsView: View {
 
     private var header: some View {
         ZStack(alignment: .bottomLeading) {
-            Color.clear
-                .frame(height: 250)
-                .frame(maxWidth: .infinity)
-                .overlay {
-                    if let cover = film?.coverUrl, let url = URL(string: cover) {
-                        PosterImage(url: url, maxPixel: 1300)
-                    } else {
-                        PosterImage(url: current.poster)
-                            .blur(radius: 24)
-                            .opacity(0.55)
-                    }
-                }
-                .overlay {
-                    LinearGradient(colors: [Theme.background.opacity(0.1), Theme.background], startPoint: .top, endPoint: .bottom)
-                }
-                .clipped()
+            StretchyBackdrop(stretch: stretch, height: DetailsView.backdropHeight,
+                             cover: film?.coverUrl.flatMap { URL(string: $0) }, poster: current.poster)
 
             HStack(alignment: .bottom, spacing: 14) {
                 Color.clear
-                    .frame(width: 108, height: 162)
+                    .frame(width: 112, height: 168)
                     .overlay { PosterImage(url: URL(string: current.posterURL ?? "") ?? current.poster) }
-                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                    .shadow(color: .black.opacity(0.5), radius: 10)
+                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .stroke(Color.white.opacity(0.12), lineWidth: 0.75)
+                    }
+                    .shadow(color: .black.opacity(0.5), radius: 14, y: 6)
                 VStack(alignment: .leading, spacing: 6) {
                     Text(current.title)
                         .font(.title2.weight(.bold))
@@ -373,12 +387,12 @@ struct DetailsView: View {
                     }
                 }
                 .font(.headline)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 14)
-                .background(Theme.accent, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                 .foregroundStyle(.white)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, LiquidGlassSupport.isAvailable ? 5 : 14)
             }
-            .buttonStyle(.plain)
+            .primaryActionStyle()
+            .controlSize(.large)
             .disabled(searchingRelease)
 
             qualityChips
@@ -1009,5 +1023,42 @@ struct SimilarBlock: View {
                 loaded = true
             }
         }
+    }
+}
+
+/// How far the page is pulled down past its top.
+@Observable
+final class HeaderStretch {
+    var pull: CGFloat = 0
+}
+
+/// The picture at the top of a film page. It goes under the navigation bar and grows when the
+/// page is pulled down, instead of leaving an empty gap above it.
+private struct StretchyBackdrop: View {
+    let stretch: HeaderStretch
+    let height: CGFloat
+    let cover: URL?
+    let poster: URL?
+
+    var body: some View {
+        Color.clear
+            .frame(height: height)
+            .frame(maxWidth: .infinity)
+            .overlay {
+                if let cover = cover {
+                    PosterImage(url: cover, maxPixel: 1300)
+                } else {
+                    PosterImage(url: poster)
+                        .blur(radius: 24)
+                        .opacity(0.55)
+                }
+            }
+            .overlay {
+                LinearGradient(colors: [Theme.background.opacity(0.35), Theme.background.opacity(0.05),
+                                        Theme.background.opacity(0.6), Theme.background],
+                               startPoint: .top, endPoint: .bottom)
+            }
+            .clipped()
+            .scaleEffect(1 + max(0, stretch.pull) / max(height, 1), anchor: .bottom)
     }
 }

@@ -15,6 +15,12 @@ struct SearchView: View {
 
     private var trimmedQuery: String { query.trimmed }
 
+    /// iOS 26: the field is at the bottom, where the search tab button of the glass tab bar is;
+    /// before it: always visible under the title.
+    private static var fieldPlacement: SearchFieldPlacement {
+        LiquidGlassSupport.isAvailable ? .automatic : .navigationBarDrawer(displayMode: .always)
+    }
+
     private var visibleResults: [MediaItem] {
         guard let kind = kindFilter else { return results }
         return results.filter { $0.kind == kind }
@@ -29,7 +35,7 @@ struct SearchView: View {
             .scrollDismissesKeyboard(.immediately)
             .background(Theme.background)
             .navigationTitle("Поиск")
-            .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Фильмы и сериалы")
+            .searchable(text: $query, placement: SearchView.fieldPlacement, prompt: "Фильмы и сериалы")
             .onSubmit(of: .search) {
                 library.addQuery(query)
             }
@@ -89,7 +95,7 @@ struct SearchView: View {
                     .padding(.top, 30)
                 if page < totalPages {
                     Button("Искать дальше") { Task { await loadMore() } }
-                        .buttonStyle(.bordered)
+                        .secondaryActionStyle()
                 }
             }
         }

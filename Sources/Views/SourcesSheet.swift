@@ -289,7 +289,7 @@ struct SourcesSheet: View {
                         .foregroundStyle(Theme.secondary)
                         .multilineTextAlignment(.center)
                     Button("Повторить") { startSearch() }
-                        .buttonStyle(.borderedProminent)
+                        .prominentButtonStyle()
                 }
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 12)
