@@ -9,8 +9,16 @@ struct TorrentSearchQuery: Hashable, Sendable {
     var isSeries: Bool
     /// Free text typed by the user instead of the title.
     var custom: String? = nil
+    /// The Kinopoisk id of the film: its torrents are also taken from Zona's index.
+    var kinopoiskId: Int? = nil
 
     var isCustom: Bool { custom?.nonEmpty != nil }
+
+    /// Zona's index knows torrents by the film, not by free text.
+    var zonaId: Int? {
+        guard !isCustom, let id = kinopoiskId, id > 0 else { return nil }
+        return id
+    }
 
     var filter: ReleaseFilter {
         ReleaseFilter(title: title, originalTitle: originalTitle, year: year, isSeries: isSeries, strict: !isCustom)

@@ -122,6 +122,13 @@ struct KPPage: Decodable {
     let totalPages: Int
     let items: [MediaItem]
 
+    /// A page made from another source (Zona's index).
+    init(totalPages: Int, items: [MediaItem]) {
+        self.totalPages = max(1, totalPages)
+        var seen = Set<Int>()
+        self.items = items.filter { seen.insert($0.id).inserted }
+    }
+
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: AnyKey.self)
         totalPages = max(1, c.int("totalPages", "pagesCount") ?? 1)
@@ -318,7 +325,8 @@ struct CatalogFilter: Equatable, Codable {
     var order: String = "NUM_VOTE"
     var genreId: Int? = nil
     var countryId: Int? = nil
-    /// Names for the summary line ("драма, США"); not sent to the server.
+    /// Names for the summary line ("драма, США"). The Kinopoisk API filters by the ids, Zona's
+    /// index by the names (a genre or country chosen without the API has no id).
     var genreName: String? = nil
     var countryName: String? = nil
     var decade: String = "all"
@@ -326,7 +334,8 @@ struct CatalogFilter: Equatable, Codable {
     var hideWatched: Bool = false
 
     var isDefault: Bool {
-        order == "NUM_VOTE" && genreId == nil && countryId == nil && decade == "all" && ratingFrom == 0 && !hideWatched
+        order == "NUM_VOTE" && genreId == nil && countryId == nil && genreName == nil && countryName == nil
+            && decade == "all" && ratingFrom == 0 && !hideWatched
     }
 
     var query: [(String, String)] {
@@ -342,6 +351,11 @@ struct CatalogFilter: Equatable, Codable {
         if let g = genreId { q.append(("genres", String(g))) }
         if let c = countryId { q.append(("countries", String(c))) }
         return q
+    }
+
+    /// A genre or country the Kinopoisk API cannot filter by: chosen while it was not available.
+    var needsNames: Bool {
+        (genreName != nil && genreId == nil) || (countryName != nil && countryId == nil)
     }
 }
 
@@ -466,6 +480,21 @@ struct KPPerson: Decodable {
 
     var name: String { nameRu?.nonEmpty ?? nameEn ?? "" }
 
+    init(personId: Int, nameRu: String?, nameEn: String?, posterUrl: String?, birthday: String? = nil,
+         death: String? = nil, age: Int? = nil, birthplace: String? = nil, profession: String? = nil,
+         films: [KPPersonFilm]) {
+        self.personId = personId
+        self.nameRu = nameRu
+        self.nameEn = nameEn
+        self.posterUrl = posterUrl
+        self.birthday = birthday
+        self.death = death
+        self.age = age
+        self.birthplace = birthplace
+        self.profession = profession
+        self.films = films
+    }
+
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: AnyKey.self)
         personId = c.int("personId", "kinopoiskId") ?? 0
@@ -491,6 +520,17 @@ struct KPPersonFilm: Decodable, Hashable {
     /// The character or the kind of work.
     let role: String?
     let professionKey: String
+
+    init(filmId: Int?, nameRu: String?, nameEn: String?, rating: Double?, general: Bool = false,
+         role: String? = nil, professionKey: String) {
+        self.filmId = filmId
+        self.nameRu = nameRu
+        self.nameEn = nameEn
+        self.rating = rating
+        self.general = general
+        self.role = role
+        self.professionKey = professionKey
+    }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: AnyKey.self)

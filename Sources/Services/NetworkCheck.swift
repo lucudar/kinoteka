@@ -138,8 +138,12 @@ final class NetworkCheck: ObservableObject {
         }
         // Placeholders keep the order of the lines while the answers come in any order.
         put(NetworkCheckItem(id: "provider", group: .network, title: "Провайдер"))
+        put(NetworkCheckItem(id: "reference", group: .network, title: "Контрольный сайт (ya.ru)"))
         put(NetworkCheckItem(id: "kp", group: .catalog, title: "Кинопоиск"))
         put(NetworkCheckItem(id: "posters", group: .catalog, title: "Постеры"))
+        put(NetworkCheckItem(id: "zona-catalog", group: .catalog, title: "Каталог Zona (Россия)"))
+        put(NetworkCheckItem(id: "zona-posters", group: .catalog, title: "Постеры Zona"))
+        put(NetworkCheckItem(id: "zona-releases", group: .catalog, title: "Раздачи Zona (по фильму)"))
         for server in servers {
             put(NetworkProbes.searchPlaceholder(server))
         }
@@ -152,8 +156,12 @@ final class NetworkCheck: ObservableObject {
 
         await withTaskGroup(of: NetworkCheckItem.self) { group in
             group.addTask { await NetworkProbes.checkProvider() }
+            group.addTask { await NetworkProbes.checkReference() }
             group.addTask { await NetworkProbes.checkKinopoisk(token: token) }
             group.addTask { await NetworkProbes.checkPosters() }
+            group.addTask { await NetworkProbes.checkZonaCatalog() }
+            group.addTask { await NetworkProbes.checkZonaPosters() }
+            group.addTask { await NetworkProbes.checkZonaReleases() }
             for server in servers {
                 group.addTask { await NetworkProbes.checkSearch(server, apiKey: SearchMirrors.isBuiltIn(server) ? "" : apiKey) }
             }
@@ -168,6 +176,28 @@ final class NetworkCheck: ObservableObject {
                 self.put(item)
             }
         }
+        if !Task.isCancelled, let verdict = verdictItem() {
+            items.insert(verdict, at: 0)
+        }
+    }
+
+    /// When no server of the app answers, one line says why instead of a column of crosses.
+    private func verdictItem() -> NetworkCheckItem? {
+        let remote = items.filter { $0.group == .catalog }
+        guard !remote.isEmpty, remote.allSatisfy({ $0.state == .failed }) else { return nil }
+        var item = NetworkCheckItem(id: "verdict", group: .network, title: "Итог")
+        if items.first(where: { $0.id == "reference" })?.state == .ok {
+            item.state = .warning
+            item.detail = "открываются только отдельные российские сайты, а серверы приложения недоступны — даже российские. "
+                + "Похоже на ограничение мобильного интернета у оператора («белые списки»): в это время не работают ни Zona, ни VPN. "
+                + "Подождите или подключитесь к Wi‑Fi"
+        } else {
+            item.state = .failed
+            item.detail = "соединения не проходят ни к одному серверу, даже к российским: интернет в этой сети сейчас не работает "
+                + "(ограничение у оператора, закончился пакет или баланс, слабый сигнал). Приложение тут ни при чём — "
+                + "повторите проверку позже или через Wi‑Fi"
+        }
+        return item
     }
 
     private func connectionItem() -> NetworkCheckItem {
@@ -406,6 +436,22 @@ enum NetworkProbes {
         return item
     }
 
+    /// A Russian site that opens in every network of the country, even when the operator lets only
+    /// a «white list» of services through: tells a dead connection from blocked servers.
+    static func checkReference() async -> NetworkCheckItem {
+        var item = NetworkCheckItem(id: "reference", group: .network, title: "Контрольный сайт (ya.ru)")
+        guard let url = URL(string: "https://ya.ru/") else { return item }
+        let result = await HTTPProbe.run(URLRequest(url: url), idle: 8, total: 12, limit: 64 << 10)
+        if let failure = failureText(result) {
+            item.state = .failed
+            item.detail = failure
+            return item
+        }
+        item.state = result.status == nil ? .warning : .ok
+        item.detail = "открывается за \(secondsText(result.firstByte ?? result.elapsed))"
+        return item
+    }
+
     // MARK: Catalog and search
 
     static func checkKinopoisk(token: String) async -> NetworkCheckItem {
@@ -426,8 +472,8 @@ enum NetworkProbes {
             item.state = .ok
             item.detail = "отвечает за \(time)"
         case 401:
-            item.state = token.isEmpty ? .warning : .failed
-            item.detail = token.isEmpty ? "сервер доступен (\(time)), но ключ API не задан" : "сервер доступен, но ключ API не принят"
+            item.state = token.isEmpty ? .info : .failed
+            item.detail = token.isEmpty ? "сервер доступен (\(time)), ключ API не задан — каталог из индекса Zona" : "сервер доступен, но ключ API не принят"
         case 402, 429:
             item.state = .warning
             item.detail = "сервер доступен, лимит запросов на сегодня исчерпан"
@@ -448,6 +494,84 @@ enum NetworkProbes {
         } else {
             item.state = .failed
             item.detail = failureText(result) ?? "ошибка HTTP \(result.status ?? 0)"
+        }
+        return item
+    }
+
+    // MARK: Zona's index (hosted in Russia)
+
+    /// The catalog of Zona's index: what the app shows without the Kinopoisk API or when it fails.
+    static func checkZonaCatalog() async -> NetworkCheckItem {
+        var item = NetworkCheckItem(id: "zona-catalog", group: .catalog, title: "Каталог Zona (Россия)")
+        guard let url = ZonaIndex.listURL(ZonaIndex.collection("TOP_POPULAR_ALL"), page: 1) else { return item }
+        var request = URLRequest(url: url)
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        let result = await HTTPProbe.run(request, idle: 12, total: 25, keepBody: 4 << 20)
+        if let failure = failureText(result) {
+            item.state = .failed
+            item.detail = failure
+            return item
+        }
+        guard result.status == 200 else {
+            item.state = .failed
+            item.detail = "ошибка HTTP \(result.status ?? 0)"
+            return item
+        }
+        guard let page = try? JSONDecoder().decode(ZonaPage<ZonaMovie>.self, from: result.body), !page.docs.isEmpty else {
+            item.state = .warning
+            item.detail = "неожиданный ответ (\(sizeText(result.bytes)))"
+            return item
+        }
+        item.state = result.elapsed < 5 ? .ok : .warning
+        var detail = "отвечает за \(secondsText(result.elapsed)), \(sizeText(result.bytes))"
+        if let reason = KPClient.shared.fallbackReason {
+            detail += "; сейчас каталог отсюда: \(reason)"
+        }
+        item.detail = detail
+        return item
+    }
+
+    static func checkZonaPosters() async -> NetworkCheckItem {
+        var item = NetworkCheckItem(id: "zona-posters", group: .catalog, title: "Постеры Zona")
+        guard let url = URL(string: ZonaIndex.posterURL(kinopoiskId: 301)) else { return item }
+        let result = await HTTPProbe.run(URLRequest(url: url), idle: 12, total: 25)
+        if result.status == 200, result.errorText == nil, result.bytes > 0 {
+            item.state = .ok
+            item.detail = "\(sizeText(result.bytes)) за \(secondsText(result.elapsed))"
+        } else {
+            item.state = .failed
+            item.detail = failureText(result) ?? "ошибка HTTP \(result.status ?? 0)"
+        }
+        return item
+    }
+
+    /// The torrents of «Матрица» in Zona's index, as the film page asks for them.
+    static func checkZonaReleases() async -> NetworkCheckItem {
+        var item = NetworkCheckItem(id: "zona-releases", group: .catalog, title: "Раздачи Zona (по фильму)")
+        guard let url = ZonaIndex.releasesURL(kinopoiskId: 301) else { return item }
+        var request = URLRequest(url: url)
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        let result = await HTTPProbe.run(request, idle: 15, total: 40, keepBody: 8 << 20)
+        if let failure = failureText(result) {
+            item.state = .failed
+            item.detail = failure
+            return item
+        }
+        guard result.status == 200 else {
+            item.state = .failed
+            item.detail = "ошибка HTTP \(result.status ?? 0)"
+            return item
+        }
+        guard let page = try? JSONDecoder().decode(ZonaPage<ZonaTorrent>.self, from: result.body) else {
+            item.state = .warning
+            item.detail = "неожиданный ответ (\(sizeText(result.bytes)))"
+            return item
+        }
+        let releases = ZonaReleases.build(from: page.docs)
+        item.state = result.elapsed < 8 && !releases.isEmpty ? .ok : .warning
+        item.detail = "\(sizeText(result.bytes)) за \(secondsText(result.elapsed)), раздач: \(releases.count)"
+        if !TorrentSearchService.isZonaEnabled {
+            item.detail += " (выключено в настройках)"
         }
         return item
     }
@@ -497,8 +621,9 @@ enum NetworkProbes {
         guard let url = announceURL(tracker.url, hash: speedHash) else { return item }
         let result = await HTTPProbe.run(URLRequest(url: url), idle: 10, total: 15, keepBody: 64 << 10)
         if let failure = failureText(result) {
-            item.state = .failed
-            item.detail = failure
+            // One unreachable tracker is not fatal: the engine asks all of them, plus DHT and PEX.
+            item.state = .warning
+            item.detail = failure + " — не критично: пиры найдутся через другие трекеры и DHT"
             return item
         }
         guard result.status == 200 else {
@@ -598,6 +723,11 @@ enum NetworkProbes {
         let bytes = [UInt8](body)
         if let at = index(of: Array("14:failure reason".utf8), in: bytes) {
             let reason = bencodedString(bytes, at: at + 17).map { String(decoding: $0.value, as: UTF8.self) } ?? ""
+            // Retrackers of a tracker site (rutracker) only know its own torrents, not the test one.
+            let lower = reason.lowercased()
+            if lower.contains("regist") || lower.contains("not found") || lower.contains("unknown torrent") {
+                return (.ok, "доступен (тестовую раздачу не знает — пиров даёт только для своих торрентов)")
+            }
             return (.warning, "доступен, ответ: «\(reason.prefix(80))»")
         }
         if let at = index(of: Array("5:peers".utf8), in: bytes) {
@@ -839,7 +969,9 @@ final class HTTPProbe: NSObject, URLSessionDataDelegate, @unchecked Sendable {
             // Cancelled by the limits: the bytes counted so far are the result.
             if !(result.stopped && code == URLError.Code.cancelled.rawValue) {
                 result.errorCode = code
-                result.errorText = error.localizedDescription
+                result.errorText = code == URLError.Code.appTransportSecurityRequiresSecureConnection.rawValue
+                    ? "iOS запретила http-запрос (App Transport Security) — это настройка приложения, а не блокировка в сети"
+                    : error.localizedDescription
             }
         }
         let value = result

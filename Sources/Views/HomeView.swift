@@ -26,16 +26,23 @@ struct HomeSection: Identifiable, Hashable {
 struct HomeView: View {
     @EnvironmentObject private var library: LibraryStore
     @AppStorage(SettingsKeys.kpToken) private var token = ""
+    @AppStorage(SettingsKeys.zonaIndex) private var zonaIndex = true
     @State private var path = NavigationPath()
+
+    /// Without a key the collections come from Zona's index.
+    private var catalogAvailable: Bool { !token.trimmed.isEmpty || zonaIndex }
+
+    /// The rows load again when the key or the source changes.
+    private var sourceKey: String { token.trimmed + (zonaIndex ? "|zona" : "") }
 
     var body: some View {
         NavigationStack(path: $path) {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 26) {
-                    if token.trimmed.isEmpty {
-                        TokenBanner()
+                    if catalogAvailable {
+                        FeaturedCarousel(section: HomeSection.featured, token: sourceKey)
                     } else {
-                        FeaturedCarousel(section: HomeSection.featured, token: token)
+                        TokenBanner()
                     }
                     if !library.data.continueWatching.isEmpty {
                         ContinueWatchingRow(entries: library.data.continueWatching) { item in
@@ -48,12 +55,15 @@ struct HomeView: View {
                             MediaRow(items: Array(library.data.watchLater.prefix(12)))
                         }
                     }
-                    if !token.trimmed.isEmpty {
+                    if catalogAvailable {
                         if RecommendationService.hasProfile(library.data) {
-                            PersonalizedRow(data: library.data, token: token)
+                            PersonalizedRow(data: library.data, token: sourceKey)
                         }
                         ForEach(HomeSection.rows) { section in
-                            CollectionRow(section: section, token: token)
+                            CollectionRow(section: section, token: sourceKey)
+                        }
+                        if token.trimmed.isEmpty {
+                            TokenBanner()
                         }
                     }
                 }

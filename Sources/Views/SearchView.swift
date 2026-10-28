@@ -3,6 +3,7 @@ import SwiftUI
 struct SearchView: View {
     @EnvironmentObject private var library: LibraryStore
     @AppStorage(SettingsKeys.kpToken) private var token = ""
+    @AppStorage(SettingsKeys.zonaIndex) private var zonaIndex = true
     @State private var query = ""
     @State private var results: [MediaItem] = []
     @State private var searchedQuery = ""
@@ -65,7 +66,7 @@ struct SearchView: View {
     private var content: some View {
         if trimmedQuery.count < 2 {
             recentBlock
-        } else if token.trimmed.isEmpty {
+        } else if token.trimmed.isEmpty && !zonaIndex {
             TokenBanner()
         } else if let error = error, results.isEmpty {
             ErrorView(message: error) { Task { await search(trimmedQuery) } }
