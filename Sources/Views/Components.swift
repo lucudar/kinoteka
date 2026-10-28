@@ -12,6 +12,8 @@ final class ImageCache: @unchecked Sendable {
     private let memory = NSCache<NSString, UIImage>()
     private let urlCache: URLCache
     private let session: URLSession
+    /// For posters of the Kinopoisk API (abroad): gives up soon, Zona's copies are asked then.
+    private let quickSession: URLSession
     private let lock = NSLock()
     private var inFlight: [String: Task<UIImage?, Never>] = [:]
 
@@ -25,6 +27,11 @@ final class ImageCache: @unchecked Sendable {
         config.requestCachePolicy = .returnCacheDataElseLoad
         config.timeoutIntervalForRequest = 30
         session = URLSession(configuration: config)
+        let quick = URLSessionConfiguration.default
+        quick.urlCache = urlCache
+        quick.requestCachePolicy = .returnCacheDataElseLoad
+        quick.timeoutIntervalForRequest = 8
+        quickSession = URLSession(configuration: quick)
     }
 
     private static func key(_ url: URL, _ maxPixel: Int) -> String {
@@ -44,9 +51,10 @@ final class ImageCache: @unchecked Sendable {
             task = existing
         } else {
             let session = session
+            let quick = quickSession
             let size = max(64, min(maxPixel, 2000))
             task = Task {
-                guard let (data, _) = try? await session.data(from: url),
+                guard let data = await ImageCache.download(url, session: session, quick: quick),
                       let image = ImageCache.downsample(data, maxPixel: size) else { return nil }
                 return await image.byPreparingForDisplay() ?? image
             }
@@ -63,6 +71,58 @@ final class ImageCache: @unchecked Sendable {
         let cost = pixels.isFinite ? Int(min(max(pixels * 4, 0), 64 * 1024 * 1024)) : 0
         memory.setObject(prepared, forKey: key as NSString, cost: cost)
         return prepared
+    }
+
+    /// One picture. Posters of the Kinopoisk API come from abroad, which Russian networks often slow
+    /// down: when one does not come quickly (or the host is known to be slow), Zona's copy (hosted
+    /// in Russia) is asked as well and the first to come is shown.
+    private static func download(_ url: URL, session: URLSession, quick: URLSession) async -> Data? {
+        let backups = ZonaIndex.posterFallbacks(for: url)
+        guard !backups.isEmpty else { return try? await picture(url, session: session) }
+        if HostHealth.shared.isDown(KPClient.host) {
+            if let data = await firstPicture(backups, session: session) { return data }
+            return try? await picture(url, session: quick)
+        }
+        let primary = Task<Data, Error> { try await picture(url, session: quick) }
+        if let early = await TaskWait.result(of: primary, within: 2.5) {
+            switch early {
+            case .success(let data):
+                return data
+            case .failure(let error):
+                if HostHealth.isHostFailure(error) {
+                    HostHealth.shared.markDown(KPClient.host, for: 5 * 60, reason: "не отвечает")
+                }
+                return await firstPicture(backups, session: session)
+            }
+        }
+        let zona = Task<Data, Error> {
+            guard let data = await firstPicture(backups, session: session) else { throw URLError(.resourceUnavailable) }
+            return data
+        }
+        let winner = await TaskWait.firstSuccess([primary, zona])
+        if winner.index == 1, case .success = winner.result {
+            HostHealth.shared.markDown(KPClient.host, for: 3 * 60, reason: "отвечает медленно")
+        }
+        return try? winner.result.get()
+    }
+
+    private static func firstPicture(_ urls: [URL], session: URLSession) async -> Data? {
+        for url in urls {
+            if let data = try? await picture(url, session: session) { return data }
+        }
+        return nil
+    }
+
+    /// The body of a successful answer that is a picture.
+    private static func picture(_ url: URL, session: URLSession) async throws -> Data {
+        let (data, response) = try await session.data(from: url)
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            throw URLError(.fileDoesNotExist)
+        }
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil), CGImageSourceGetCount(source) > 0 else {
+            throw URLError(.cannotDecodeContentData)
+        }
+        return data
     }
 
     /// Memory warning: decoded images are dropped, the files stay in the disk cache.
@@ -344,19 +404,24 @@ struct ErrorView: View {
     }
 }
 
+/// Without a key the catalog comes from Zona's index; the banner tells it and leads to the settings.
 struct TokenBanner: View {
+    @AppStorage(SettingsKeys.zonaIndex) private var zonaIndex = true
+
     var body: some View {
         NavigationLink {
             SettingsView()
         } label: {
             HStack(alignment: .top, spacing: 12) {
-                Image(systemName: "key.fill")
+                Image(systemName: zonaIndex ? "info.circle.fill" : "key.fill")
                     .foregroundStyle(Theme.accent)
                     .font(.title3)
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Нужен ключ API Кинопоиска")
+                    Text(zonaIndex ? "Каталог из индекса Zona" : "Нужен ключ API Кинопоиска")
                         .font(.subheadline.weight(.semibold))
-                    Text("Каталог, поиск и описания берутся из неофициального API Кинопоиска. Ключ бесплатный: зарегистрируйтесь на kinopoiskapiunofficial.tech и вставьте его в настройках.")
+                    Text(zonaIndex
+                         ? "Ключ API Кинопоиска не задан: фильмы, поиск и описания берутся из индекса Zona — он в России и работает без VPN. С бесплатным ключом с kinopoiskapiunofficial.tech будут названия серий, возрастной рейтинг и трейлеры."
+                         : "Каталог, поиск и описания берутся из неофициального API Кинопоиска. Ключ бесплатный: зарегистрируйтесь на kinopoiskapiunofficial.tech и вставьте его в настройках. Или включите «Индекс Zona» в настройках поиска раздач.")
                         .font(.caption)
                         .foregroundStyle(Theme.secondary)
                         .multilineTextAlignment(.leading)

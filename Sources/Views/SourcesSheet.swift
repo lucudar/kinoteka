@@ -12,6 +12,7 @@ struct SourcesSheet: View {
     @AppStorage(SettingsKeys.preferredQuality) private var preferredRaw = ReleaseQuality.fullHD.rawValue
     @AppStorage(SettingsKeys.smartQuality) private var smartQuality = true
     @AppStorage(SettingsKeys.searchServer) private var server = TorrentSearchService.defaultServer
+    @AppStorage(SettingsKeys.zonaIndex) private var zonaIndex = true
 
     let item: MediaItem
     var episode: KPEpisode? = nil
@@ -32,6 +33,8 @@ struct SourcesSheet: View {
     @State private var found = 0
     /// The search mirror that answered.
     @State private var answeredServer: String?
+    /// Where the releases came from: "Zona", "jr.maxvol.pro".
+    @State private var answeredSources: [String] = []
     @State private var season: Int?
     @State private var quality: ReleaseQuality?
     @State private var voice: ReleaseVoiceOption?
@@ -56,7 +59,7 @@ struct SourcesSheet: View {
 
     private var query: TorrentSearchQuery {
         TorrentSearchQuery(title: item.title, originalTitle: item.originalTitle, year: item.year,
-                           isSeries: isSeries, custom: customQuery)
+                           isSeries: isSeries, custom: customQuery, kinopoiskId: item.id > 0 ? item.id : nil)
     }
 
     private var seasonOptions: [Int] {
@@ -152,6 +155,19 @@ struct SourcesSheet: View {
                 if let current = voice, !voiceOptions.contains(current) { voice = nil }
             }
             .refreshable { await load(force: true) }
+            .onReceive(NotificationCenter.default.publisher(for: TorrentSearchService.updated)) { note in
+                // The slower source (Zona's index or Jacred) answered: its releases join the list.
+                let request = query
+                guard state == .loaded, let key = note.object as? String,
+                      key == TorrentSearchService.shared.identifier(for: request) else { return }
+                Task {
+                    guard let result = await TorrentSearchService.shared.cachedResult(request), request == query else { return }
+                    releases = result.releases
+                    found = result.found
+                    answeredServer = result.server
+                    answeredSources = result.sources ?? []
+                }
+            }
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Закрыть") { dismiss() }
@@ -399,7 +415,15 @@ struct SourcesSheet: View {
     }
 
     private var footerText: String {
-        var text = "Раздачи ищутся на \(serverHost) по названию и году. Потяните список вниз, чтобы обновить."
+        var text: String
+        if zonaIndex && customQuery == nil && item.id > 0 {
+            text = "Раздачи берутся из индекса Zona (по фильму, сервер в России) и с \(serverHost) (по названию и году). Потяните список вниз, чтобы обновить."
+            if !answeredSources.isEmpty {
+                text += " Ответили: " + answeredSources.joined(separator: ", ") + "."
+            }
+        } else {
+            text = "Раздачи ищутся на \(serverHost) по названию и году. Потяните список вниз, чтобы обновить."
+        }
         if state == .loaded && !releases.isEmpty {
             let hidden = releases.count - availableReleases.count
             text = "Найдено: \(releases.count)." + (hidden > 0 ? " Скрыто: \(hidden)." : "") + " " + text
@@ -435,6 +459,7 @@ struct SourcesSheet: View {
             releases = result.releases
             found = result.found
             answeredServer = result.server
+            answeredSources = result.sources ?? []
             state = .loaded
             if let current = quality, !result.releases.contains(where: { $0.quality == current }) {
                 quality = nil

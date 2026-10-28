@@ -295,6 +295,16 @@ struct DetailsView: View {
         }
         .task(id: token) { await load() }
         .task(id: searchQuery) { await prefetchReleases() }
+        .onReceive(NotificationCenter.default.publisher(for: TorrentSearchService.updated)) { note in
+            // The slower source (Zona's index or Jacred) answered: its releases join the plan.
+            guard let query = searchQuery, let key = note.object as? String,
+                  key == TorrentSearchService.shared.identifier(for: query) else { return }
+            Task {
+                guard let result = await TorrentSearchService.shared.cachedResult(query), searchQuery == query else { return }
+                releases = result.releases
+                releasesFailed = false
+            }
+        }
         .task(id: warmupKey) { await warmUp(warmupKey) }
         .onChange(of: qualityOptions) { _, options in
             if let quality = chosenQuality, !options.contains(quality) { chosenQuality = nil }

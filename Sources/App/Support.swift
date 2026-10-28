@@ -32,6 +32,8 @@ enum SettingsKeys {
     /// The Jacred mirror that answered last and when (the built-in search).
     static let searchMirror = "torrentSearchMirror"
     static let searchMirrorDate = "torrentSearchMirrorDate"
+    /// Torrents and the catalog also come from Zona's index (hosted in Russia, no key).
+    static let zonaIndex = "zonaIndexEnabled"
 }
 
 enum TimeFormat {

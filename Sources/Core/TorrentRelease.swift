@@ -139,8 +139,19 @@ struct TorrentRelease: Identifiable, Hashable, Codable, Sendable {
     var year: Int?
     var isSeries: Bool?
     var detailsURL: String?
+    /// Audio languages read from the files ("ru", "en"), known for releases of Zona's index.
+    var languages: [String]? = nil
+    /// How many times Zona's players started the torrent and failed to start it.
+    var knownStarts: Int? = nil
+    var knownFailures: Int? = nil
 
     var voices: [String] { voiceKinds.map { $0.title } + studios }
+
+    /// Only foreign audio is known to be in the files (and no Russian voice-over is mentioned).
+    var isOriginalOnly: Bool {
+        guard let languages = languages, !languages.isEmpty, !languages.contains("ru") else { return false }
+        return !voiceKinds.contains { $0 != .subtitles }
+    }
 
     var sizeText: String {
         size > 0 ? ByteCountFormatter.string(fromByteCount: size, countStyle: .file) : ""
@@ -318,18 +329,22 @@ enum ReleaseSort: String, CaseIterable, Identifiable, Sendable {
 
 enum ReleaseRanking {
     static func sorted(_ list: [TorrentRelease], by order: ReleaseSort) -> [TorrentRelease] {
+        let ordered: [TorrentRelease]
         switch order {
         case .seeders:
-            return list.sorted { ($0.seeders, $0.quality.rawValue, $0.size) > ($1.seeders, $1.quality.rawValue, $1.size) }
+            ordered = list.sorted { ($0.seeders, $0.quality.rawValue, $0.size) > ($1.seeders, $1.quality.rawValue, $1.size) }
         case .quality:
-            return list.sorted {
+            ordered = list.sorted {
                 ($0.quality.rawValue, $0.isHDR ? 1 : 0, $0.seeders) > ($1.quality.rawValue, $1.isHDR ? 1 : 0, $1.seeders)
             }
         case .size:
-            return list.sorted { ($0.size, $0.seeders) > ($1.size, $1.seeders) }
+            ordered = list.sorted { ($0.size, $0.seeders) > ($1.size, $1.seeders) }
         case .date:
-            return list.sorted { ($0.published ?? Date.distantPast, $0.seeders) > ($1.published ?? Date.distantPast, $1.seeders) }
+            ordered = list.sorted { ($0.published ?? Date.distantPast, $0.seeders) > ($1.published ?? Date.distantPast, $1.seeders) }
         }
+        // Russian voice-over is wanted: torrents known to have only the original audio (many of
+        // Zona's index, from international trackers) come after the others in every order.
+        return ordered.filter { !$0.isOriginalOnly } + ordered.filter { $0.isOriginalOnly }
     }
 
     /// How good a release is for streaming: preferred quality, live seeders, Russian dub,
@@ -356,6 +371,18 @@ enum ReleaseRanking {
         }
 
         if release.isCamRip { score -= 45 }
+
+        // Russian voice-over is wanted: a release with only the original audio comes after.
+        if release.isOriginalOnly { score -= 18 }
+
+        // Zona's players report the torrents that do not start.
+        let starts = release.knownStarts ?? 0
+        let failures = release.knownFailures ?? 0
+        if failures >= 3 && failures > starts * 2 {
+            score -= 10
+        } else if starts >= 3 && failures * 2 <= starts {
+            score += 3
+        }
 
         // Huge files (remuxes) stream badly over a torrent on a phone; for 4K the limits are higher
         // and the penalty is milder, so a preferred 4K still wins over 1080p.

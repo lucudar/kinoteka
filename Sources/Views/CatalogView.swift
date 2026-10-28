@@ -3,6 +3,7 @@ import SwiftUI
 struct CatalogView: View {
     @EnvironmentObject private var library: LibraryStore
     @AppStorage(SettingsKeys.kpToken) private var token = ""
+    @AppStorage(SettingsKeys.zonaIndex) private var zonaIndex = true
     @State private var filter = CatalogFilter.restored()
     @State private var items: [MediaItem] = []
     @State private var page = 0
@@ -15,15 +16,22 @@ struct CatalogView: View {
     private struct LoadKey: Equatable {
         let filter: CatalogFilter
         let token: String
+        let zona: Bool
     }
 
-    /// Filter as sent to the server ("hide watched" is applied locally).
+    /// Without a key the catalog comes from Zona's index.
+    private var catalogAvailable: Bool { !token.trimmed.isEmpty || zonaIndex }
+
+    /// Filter as sent to the server ("hide watched" is applied locally). The names stay: Zona's
+    /// index filters by them.
     private var serverFilter: CatalogFilter {
         var f = filter
         f.hideWatched = false
-        f.genreName = nil
-        f.countryName = nil
         return f
+    }
+
+    private var loadKey: LoadKey {
+        LoadKey(filter: serverFilter, token: token, zona: zonaIndex)
     }
 
     private var visibleItems: [MediaItem] {
@@ -41,7 +49,7 @@ struct CatalogView: View {
                     .pickerStyle(.segmented)
                     .padding(.horizontal, 16)
 
-                    if token.trimmed.isEmpty {
+                    if !catalogAvailable {
                         TokenBanner()
                     } else {
                         if !filter.isDefault {
@@ -77,7 +85,7 @@ struct CatalogView: View {
                     } label: {
                         Image(systemName: filter.isDefault ? "line.3.horizontal.decrease.circle" : "line.3.horizontal.decrease.circle.fill")
                     }
-                    .disabled(token.trimmed.isEmpty)
+                    .disabled(!catalogAvailable)
                 }
             }
             .sheet(isPresented: $showFilters) {
@@ -88,8 +96,8 @@ struct CatalogView: View {
             .onChange(of: filter) { _, newFilter in
                 newFilter.save()
             }
-            .task(id: LoadKey(filter: serverFilter, token: token)) {
-                let key = LoadKey(filter: serverFilter, token: token)
+            .task(id: loadKey) {
+                let key = loadKey
                 if key == loadedKey && !items.isEmpty { return }
                 loadedKey = key
                 await reload()
@@ -125,8 +133,8 @@ struct CatalogView: View {
         case "YEAR": parts.append("по дате выхода")
         default: break
         }
-        if filter.genreId != nil { parts.append(filter.genreName?.lowercased() ?? "жанр") }
-        if filter.countryId != nil { parts.append(filter.countryName ?? "страна") }
+        if filter.genreId != nil || filter.genreName != nil { parts.append(filter.genreName?.lowercased() ?? "жанр") }
+        if filter.countryId != nil || filter.countryName != nil { parts.append(filter.countryName ?? "страна") }
         if filter.decade != "all" { parts.append(Decade.byId(filter.decade).title) }
         if filter.ratingFrom > 0 { parts.append("рейтинг от \(filter.ratingFrom)") }
         if filter.hideWatched { parts.append("без просмотренного") }
@@ -134,7 +142,7 @@ struct CatalogView: View {
     }
 
     private func reload() async {
-        guard !token.trimmed.isEmpty else { return }
+        guard catalogAvailable else { return }
         items = []
         page = 0
         totalPages = 1
@@ -144,7 +152,7 @@ struct CatalogView: View {
     }
 
     private func loadMore() async {
-        guard !loading, page < totalPages, !token.trimmed.isEmpty else { return }
+        guard !loading, page < totalPages, catalogAvailable else { return }
         let requested = serverFilter
         loading = true
         defer { loading = false }
@@ -168,10 +176,12 @@ struct FiltersView: View {
     @State private var genres: [KPFilterValue] = []
     @State private var countries: [KPFilterValue] = []
     @State private var loadError: String?
+    private let initial: CatalogFilter
     let onApply: (CatalogFilter) -> Void
 
     init(filter: CatalogFilter, onApply: @escaping (CatalogFilter) -> Void) {
         _draft = State(initialValue: filter)
+        initial = filter
         self.onApply = onApply
     }
 
@@ -189,18 +199,19 @@ struct FiltersView: View {
                 }
 
                 Section("Параметры") {
-                    Picker("Жанр", selection: $draft.genreId) {
-                        Text("Все жанры").tag(Int?.none)
-                        ForEach(genres) { genre in
-                            Text(genre.title.capitalizedFirst).tag(genre.id)
+                    // Chosen by the name: the list from Zona's index (without the API) has no ids.
+                    Picker("Жанр", selection: $draft.genreName) {
+                        Text("Все жанры").tag(String?.none)
+                        ForEach(genres, id: \.title) { genre in
+                            Text(genre.title.capitalizedFirst).tag(Optional(genre.title))
                         }
                     }
                     .pickerStyle(.navigationLink)
 
-                    Picker("Страна", selection: $draft.countryId) {
-                        Text("Все страны").tag(Int?.none)
-                        ForEach(countries) { country in
-                            Text(country.title).tag(country.id)
+                    Picker("Страна", selection: $draft.countryName) {
+                        Text("Все страны").tag(String?.none)
+                        ForEach(countries, id: \.title) { country in
+                            Text(country.title).tag(Optional(country.title))
                         }
                     }
                     .pickerStyle(.navigationLink)
@@ -248,7 +259,7 @@ struct FiltersView: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Показать") {
-                        onApply(named(draft))
+                        onApply(resolved(draft))
                         dismiss()
                     }
                 }
@@ -257,20 +268,21 @@ struct FiltersView: View {
         }
     }
 
-    /// The names of the chosen genre and country, for the summary above the catalog.
-    private func named(_ filter: CatalogFilter) -> CatalogFilter {
+    /// The Kinopoisk ids of the chosen genre and country (the API filters by them). A list from
+    /// Zona's index has none: the earlier id stays when the name did not change, otherwise the
+    /// index filters by the name.
+    private func resolved(_ filter: CatalogFilter) -> CatalogFilter {
         var result = filter
-        if let id = result.genreId {
-            if let genre = genres.first(where: { $0.id == id }) { result.genreName = genre.title }
-        } else {
-            result.genreName = nil
-        }
-        if let id = result.countryId {
-            if let country = countries.first(where: { $0.id == id }) { result.countryName = country.title }
-        } else {
-            result.countryName = nil
-        }
+        result.genreId = id(of: filter.genreName, in: genres,
+                            previous: filter.genreName == initial.genreName ? initial.genreId : nil)
+        result.countryId = id(of: filter.countryName, in: countries,
+                              previous: filter.countryName == initial.countryName ? initial.countryId : nil)
         return result
+    }
+
+    private func id(of name: String?, in list: [KPFilterValue], previous: Int?) -> Int? {
+        guard let name = name else { return nil }
+        return list.first(where: { $0.title == name })?.id ?? previous
     }
 
     private func loadFilters() async {
@@ -278,10 +290,11 @@ struct FiltersView: View {
         do {
             let filters = try await KPClient.shared.filters()
             genres = filters.genres
-                .filter { $0.id != nil && !$0.title.isEmpty }
+                .filter { !$0.title.isEmpty }
+                .uniqued(by: \.title)
                 .sorted { $0.title.localizedCompare($1.title) == .orderedAscending }
             let popular = ["Россия", "СССР", "США", "Великобритания", "Франция", "Германия", "Италия", "Испания", "Япония", "Корея Южная", "Китай", "Индия", "Канада", "Австралия", "Турция"]
-            let valid = filters.countries.filter { $0.id != nil && !$0.title.isEmpty }
+            let valid = filters.countries.filter { !$0.title.isEmpty }.uniqued(by: \.title)
             let top = popular.compactMap { name in valid.first { $0.title == name } }
             let rest = valid
                 .filter { !popular.contains($0.title) }

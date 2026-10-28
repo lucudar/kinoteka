@@ -22,12 +22,13 @@ enum RecommendationService {
             return RecommendationResult(items: [], reason: "")
         }
 
-        let filters = try await KPClient.shared.filters()
-        let mapped = genres.compactMap { genre -> (String, Int)? in
+        // Without the Kinopoisk API the genres have no ids: Zona's index filters by the names.
+        let filters = (try? await KPClient.shared.filters()) ?? ZonaCatalog.filters()
+        let mapped = genres.compactMap { genre -> (String, Int?)? in
             guard let value = filters.genres.first(where: {
                 $0.title.compare(genre, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame
-            }), let id = value.id else { return nil }
-            return (genre, id)
+            }) else { return nil }
+            return (genre, value.id)
         }
         guard let movieGenre = mapped.first else {
             return RecommendationResult(items: [], reason: "")
@@ -38,12 +39,14 @@ enum RecommendationService {
         movieFilter.type = "FILM"
         movieFilter.order = "RATING"
         movieFilter.genreId = movieGenre.1
+        movieFilter.genreName = movieGenre.0
         movieFilter.ratingFrom = 6
 
         var seriesFilter = CatalogFilter()
         seriesFilter.type = "TV_SERIES"
         seriesFilter.order = "RATING"
         seriesFilter.genreId = seriesGenre.1
+        seriesFilter.genreName = seriesGenre.0
         seriesFilter.ratingFrom = 6
 
         async let moviesRequest = KPClient.shared.films(movieFilter, page: 1)

@@ -29,7 +29,8 @@ struct KinotekaApp: App {
             SettingsKeys.automaticRecovery: true,
             SettingsKeys.preloadNextEpisode: true,
             SettingsKeys.playerGestures: true,
-            SettingsKeys.engineEncryption: EngineEncryptionMode.automatic.rawValue
+            SettingsKeys.engineEncryption: EngineEncryptionMode.automatic.rawValue,
+            SettingsKeys.zonaIndex: true
         ])
         // Video needs the memory more: API responses are small, images have their own cache.
         URLCache.shared = URLCache(memoryCapacity: 16 * 1024 * 1024, diskCapacity: 256 * 1024 * 1024)
@@ -43,6 +44,7 @@ struct KinotekaApp: App {
         _ = NetworkMonitor.shared
         TorrServer.shared.launch()
         KPClient.shared.pruneCache()
+        ZonaCatalog.shared.pruneCache()
     }
 
     var body: some Scene {
