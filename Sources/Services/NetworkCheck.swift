@@ -138,6 +138,7 @@ final class NetworkCheck: ObservableObject {
         }
         // Placeholders keep the order of the lines while the answers come in any order.
         put(NetworkCheckItem(id: "provider", group: .network, title: "Провайдер"))
+        put(NetworkCheckItem(id: "reference", group: .network, title: "Контрольный сайт (ya.ru)"))
         put(NetworkCheckItem(id: "kp", group: .catalog, title: "Кинопоиск"))
         put(NetworkCheckItem(id: "posters", group: .catalog, title: "Постеры"))
         put(NetworkCheckItem(id: "zona-catalog", group: .catalog, title: "Каталог Zona (Россия)"))
@@ -155,6 +156,7 @@ final class NetworkCheck: ObservableObject {
 
         await withTaskGroup(of: NetworkCheckItem.self) { group in
             group.addTask { await NetworkProbes.checkProvider() }
+            group.addTask { await NetworkProbes.checkReference() }
             group.addTask { await NetworkProbes.checkKinopoisk(token: token) }
             group.addTask { await NetworkProbes.checkPosters() }
             group.addTask { await NetworkProbes.checkZonaCatalog() }
@@ -174,6 +176,28 @@ final class NetworkCheck: ObservableObject {
                 self.put(item)
             }
         }
+        if !Task.isCancelled, let verdict = verdictItem() {
+            items.insert(verdict, at: 0)
+        }
+    }
+
+    /// When no server of the app answers, one line says why instead of a column of crosses.
+    private func verdictItem() -> NetworkCheckItem? {
+        let remote = items.filter { $0.group == .catalog }
+        guard !remote.isEmpty, remote.allSatisfy({ $0.state == .failed }) else { return nil }
+        var item = NetworkCheckItem(id: "verdict", group: .network, title: "Итог")
+        if items.first(where: { $0.id == "reference" })?.state == .ok {
+            item.state = .warning
+            item.detail = "открываются только отдельные российские сайты, а серверы приложения недоступны — даже российские. "
+                + "Похоже на ограничение мобильного интернета у оператора («белые списки»): в это время не работают ни Zona, ни VPN. "
+                + "Подождите или подключитесь к Wi‑Fi"
+        } else {
+            item.state = .failed
+            item.detail = "соединения не проходят ни к одному серверу, даже к российским: интернет в этой сети сейчас не работает "
+                + "(ограничение у оператора, закончился пакет или баланс, слабый сигнал). Приложение тут ни при чём — "
+                + "повторите проверку позже или через Wi‑Fi"
+        }
+        return item
     }
 
     private func connectionItem() -> NetworkCheckItem {
@@ -409,6 +433,22 @@ enum NetworkProbes {
         let org = (json["org"] as? String)?.nonEmpty ?? "неизвестен"
         let country = (json["country"] as? String)?.nonEmpty
         item.detail = country.map { "\(org), \($0)" } ?? org
+        return item
+    }
+
+    /// A Russian site that opens in every network of the country, even when the operator lets only
+    /// a «white list» of services through: tells a dead connection from blocked servers.
+    static func checkReference() async -> NetworkCheckItem {
+        var item = NetworkCheckItem(id: "reference", group: .network, title: "Контрольный сайт (ya.ru)")
+        guard let url = URL(string: "https://ya.ru/") else { return item }
+        let result = await HTTPProbe.run(URLRequest(url: url), idle: 8, total: 12, limit: 64 << 10)
+        if let failure = failureText(result) {
+            item.state = .failed
+            item.detail = failure
+            return item
+        }
+        item.state = result.status == nil ? .warning : .ok
+        item.detail = "открывается за \(secondsText(result.firstByte ?? result.elapsed))"
         return item
     }
 
