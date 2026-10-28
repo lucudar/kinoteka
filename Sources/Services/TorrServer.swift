@@ -312,6 +312,9 @@ final class TorrServer {
     private var profileTask: Task<Void, Never>?
     private var loggedProfile: EngineProfile?
     private var playerActive = false
+    /// Files are being saved for offline viewing: no retune, their torrents are not dropped.
+    private var downloadsActive = false
+    private var pinnedHashes: Set<String> = []
     private var measuredFreeSpace: Int64??
     private var lastReconnect: Date?
 
@@ -326,6 +329,25 @@ final class TorrServer {
         lock.lock()
         playerActive = active
         lock.unlock()
+    }
+
+    func setDownloadsActive(_ active: Bool) {
+        lock.lock()
+        downloadsActive = active
+        lock.unlock()
+    }
+
+    /// Torrents of unfinished downloads: closing them would stop the download.
+    func setPinned(_ hashes: Set<String>) {
+        lock.lock()
+        pinnedHashes = Set(hashes.map { $0.lowercased() })
+        lock.unlock()
+    }
+
+    private func isPinned(_ hash: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return pinnedHashes.contains(hash.lowercased())
     }
 
     /// The profile the engine runs with; nil until it is checked after the start.
@@ -411,7 +433,7 @@ final class TorrServer {
         if let running = profileTask { return running }
         if profileVerified {
             // Another network or encryption choice: only when nothing plays.
-            guard retune, !playerActive, appliedProfile != desired else { return nil }
+            guard retune, !playerActive, !downloadsActive, appliedProfile != desired else { return nil }
         } else if playerActive && !retune {
             // Not checked yet (the check failed): a film may play now, the check waits for
             // a new playback.
@@ -580,6 +602,7 @@ final class TorrServer {
     }
 
     func drop(hash: String) async {
+        guard !isPinned(hash) else { return }
         _ = try? await post(["action": "drop", "hash": hash])
     }
 
