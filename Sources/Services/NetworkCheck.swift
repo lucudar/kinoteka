@@ -923,7 +923,9 @@ final class HTTPProbe: NSObject, URLSessionDataDelegate, @unchecked Sendable {
             // Cancelled by the limits: the bytes counted so far are the result.
             if !(result.stopped && code == URLError.Code.cancelled.rawValue) {
                 result.errorCode = code
-                result.errorText = error.localizedDescription
+                result.errorText = code == URLError.Code.appTransportSecurityRequiresSecureConnection.rawValue
+                    ? "iOS запретила http-запрос (App Transport Security) — это настройка приложения, а не блокировка в сети"
+                    : error.localizedDescription
             }
         }
         let value = result

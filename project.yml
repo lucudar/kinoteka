@@ -9,7 +9,7 @@ settings:
   base:
     SWIFT_VERSION: "5.0"
     MARKETING_VERSION: "0.11.0"
-    CURRENT_PROJECT_VERSION: "12"
+    CURRENT_PROJECT_VERSION: "13"
 packages:
   VLCKitSPM:
     url: https://github.com/tylerjonesio/vlckit-spm
@@ -54,9 +54,10 @@ targets:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
+        # Only NSAllowsArbitraryLoads: with NSAllowsLocalNetworking (or the *ForMedia / *InWebContent
+        # keys) next to it, iOS 10+ ignores NSAllowsArbitraryLoads and blocks every plain-http load.
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
-          NSAllowsLocalNetworking: true
         NSLocalNetworkUsageDescription: Торрент-движок работает внутри приложения и передаёт видео плееру по локальной сети устройства.
         ITSAppUsesNonExemptEncryption: false
 schemes:
