@@ -168,6 +168,21 @@ struct PlayerHostView: View {
     private static let subtitleExtensions: Set<String> = ["srt", "ass", "ssa", "vtt", "sub", "smi"]
 
     var body: some View {
+        systemObservers(playbackObservers(screen))
+            .sheet(isPresented: $showFiles) { filesSheet }
+            .sheet(isPresented: $showOptions) { optionsSheet }
+            .sheet(isPresented: $showQuality) { qualitySheet }
+            .alert("Не удалось сменить раздачу",
+                   isPresented: Binding(get: { switchError != nil }, set: { if !$0 { switchError = nil } })) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(switchError ?? "")
+            }
+    }
+
+    /// The screen of the player with its system options and the tasks of the playback.
+    /// (The modifiers are split into parts: one long chain is too much for the type checker.)
+    private var screen: some View {
         ZStack {
             Color.black.ignoresSafeArea()
             if showsBackdrop, let poster = request.item?.poster {
@@ -223,97 +238,98 @@ struct PlayerHostView: View {
         .onDisappear {
             finish()
         }
-        .onChange(of: model.timeMs) { _, _ in
-            periodicSave()
-            prepareNextEpisodeIfNeeded()
-            updateNextEpisodePrompt()
-        }
-        .onChange(of: model.ended) { _, ended in
-            if ended { handleEnded() }
-        }
-        .onChange(of: model.isPlaying) { _, playing in
-            if playing {
-                IdleTimer.set("player", active: true)
-                bumpControls()
-            } else if !controlsLocked {
-                withAnimation { showControls = true }
+    }
+
+    /// Reactions to the playback.
+    private func playbackObservers<Content: View>(_ content: Content) -> some View {
+        content
+            .onChange(of: model.timeMs) { _, _ in
+                periodicSave()
+                prepareNextEpisodeIfNeeded()
+                updateNextEpisodePrompt()
             }
-        }
-        .onChange(of: model.started) { _, started in
-            if started { playbackDidStart() }
-        }
-        .onChange(of: model.failed) { _, failed in
-            if failed { scheduleRecovery(reason: "ошибка VLC", delay: 1) }
-        }
-        .onChange(of: model.isBuffering) { _, buffering in
-            if buffering && model.started {
-                scheduleRecovery(reason: "поток завис", delay: 12)
-            } else if !buffering && !model.failed {
-                recoveryTask?.cancel()
-                recoveryTask = nil
-                recoveryText = nil
+            .onChange(of: model.ended) { _, ended in
+                if ended { handleEnded() }
             }
-        }
-        .onChange(of: model.audioTracks) { _, _ in
-            applyPreferredAudio()
-        }
-        .onChange(of: model.subtitleTracks) { _, _ in
-            applyPreferredSubtitle()
-        }
-        .onChange(of: showOptions) { _, open in
-            if !open {
-                optionsPath = []
-                bumpControls()
-            }
-        }
-        .onChange(of: showFiles) { _, open in
-            if !open { bumpControls() }
-        }
-        .onChange(of: scenePhase) { _, newPhase in
-            switch newPhase {
-            case .active:
-                model.setVideoEnabled(true)
-                model.recoverVideoLayer()
-                // iOS moved the video to the window when the app was closed: back in the app,
-                // it returns to the player.
-                if model.pipActive, model.pipStartedAutomatically, !coordinator.minimized {
-                    model.exitPictureInPicture()
+            .onChange(of: model.isPlaying) { _, playing in
+                if playing {
+                    IdleTimer.set("player", active: true)
+                    bumpControls()
+                } else if !controlsLocked {
+                    withAnimation { showControls = true }
                 }
-            case .background:
-                recoveryTask?.cancel()
-                startupWatchdogTask?.cancel()
-                saveProgress(final: true)
-                if model.pipActive || (pipAuto && model.renderMode == .sampleBuffer && model.isPlaying) {
-                    // The picture stays in Picture in Picture; checked again once it has started.
-                    Task { @MainActor in
-                        try? await Task.sleep(nanoseconds: 1_500_000_000)
-                        guard UIApplication.shared.applicationState == .background, !model.pipActive, !closing else { return }
+            }
+            .onChange(of: model.started) { _, started in
+                if started { playbackDidStart() }
+            }
+            .onChange(of: model.failed) { _, failed in
+                if failed { scheduleRecovery(reason: "ошибка VLC", delay: 1) }
+            }
+            .onChange(of: model.isBuffering) { _, buffering in
+                if buffering && model.started {
+                    scheduleRecovery(reason: "поток завис", delay: 12)
+                } else if !buffering && !model.failed {
+                    recoveryTask?.cancel()
+                    recoveryTask = nil
+                    recoveryText = nil
+                }
+            }
+            .onChange(of: model.audioTracks) { _, _ in
+                applyPreferredAudio()
+            }
+            .onChange(of: model.subtitleTracks) { _, _ in
+                applyPreferredSubtitle()
+            }
+            .onChange(of: showOptions) { _, open in
+                if !open {
+                    optionsPath = []
+                    bumpControls()
+                }
+            }
+            .onChange(of: showFiles) { _, open in
+                if !open { bumpControls() }
+            }
+    }
+
+    /// Reactions to the app going to the background and to Picture in Picture.
+    private func systemObservers<Content: View>(_ content: Content) -> some View {
+        content
+            .onChange(of: scenePhase) { _, newPhase in
+                switch newPhase {
+                case .active:
+                    model.setVideoEnabled(true)
+                    model.recoverVideoLayer()
+                    // iOS moved the video to the window when the app was closed: back in the app,
+                    // it returns to the player.
+                    if model.pipActive, model.pipStartedAutomatically, !coordinator.minimized {
+                        model.exitPictureInPicture()
+                    }
+                case .background:
+                    recoveryTask?.cancel()
+                    startupWatchdogTask?.cancel()
+                    saveProgress(final: true)
+                    if model.pipActive || (pipAuto && model.renderMode == .sampleBuffer && model.isPlaying) {
+                        // The picture stays in Picture in Picture; checked again once it has started.
+                        Task { @MainActor in
+                            try? await Task.sleep(nanoseconds: 1_500_000_000)
+                            guard UIApplication.shared.applicationState == .background, !model.pipActive, !closing else { return }
+                            enteredBackgroundWithoutWindow()
+                        }
+                    } else {
                         enteredBackgroundWithoutWindow()
                     }
-                } else {
-                    enteredBackgroundWithoutWindow()
+                default:
+                    saveProgress(final: true)
                 }
-            default:
-                saveProgress(final: true)
             }
-        }
-        .onChange(of: model.pipStarts) { _, _ in pictureInPictureStarted() }
-        .onChange(of: model.pipRestoreRequests) { _, _ in restoreFromPictureInPicture() }
-        .onChange(of: model.pipClosedRequests) { _, _ in pictureInPictureClosed() }
-        .onChange(of: model.pipMessage) { _, text in
-            guard let text else { return }
-            showNotice(text)
-            model.clearPipMessage()
-        }
-        .sheet(isPresented: $showFiles) { filesSheet }
-        .sheet(isPresented: $showOptions) { optionsSheet }
-        .sheet(isPresented: $showQuality) { qualitySheet }
-        .alert("Не удалось сменить раздачу",
-               isPresented: Binding(get: { switchError != nil }, set: { if !$0 { switchError = nil } })) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text(switchError ?? "")
-        }
+            .onChange(of: model.pipStarts) { _, _ in pictureInPictureStarted() }
+            .onChange(of: model.pipRestoreRequests) { _, _ in restoreFromPictureInPicture() }
+            .onChange(of: model.pipClosedRequests) { _, _ in pictureInPictureClosed() }
+            .onChange(of: model.pipMessage) { _, text in
+                guard let text else { return }
+                showNotice(text)
+                model.clearPipMessage()
+            }
     }
 
     // MARK: - Resolving the link
