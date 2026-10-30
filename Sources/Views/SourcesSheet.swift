@@ -43,6 +43,9 @@ struct SourcesSheet: View {
     @State private var customQuery: String?
     @State private var loadToken = 0
     @State private var didStart = false
+    /// A release is being opened to add its files to "Загрузки".
+    @State private var preparingDownload = false
+    @State private var downloadMessage: String?
 
     private var isSeries: Bool { item.kind == .series }
     private var preferred: ReleaseQuality {
@@ -155,6 +158,27 @@ struct SourcesSheet: View {
                 if let current = voice, !voiceOptions.contains(current) { voice = nil }
             }
             .refreshable { await load(force: true) }
+            .overlay(alignment: .bottom) {
+                if preparingDownload {
+                    HStack(spacing: 10) {
+                        ProgressView()
+                        Text("Готовим загрузку…")
+                            .font(.subheadline.weight(.medium))
+                    }
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 12)
+                    .glassSurface(Capsule())
+                    .padding(.bottom, 16)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
+            }
+            .animation(.easeInOut(duration: 0.2), value: preparingDownload)
+            .alert("Загрузки", isPresented: Binding(get: { downloadMessage != nil },
+                                                    set: { if !$0 { downloadMessage = nil } })) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(downloadMessage ?? "")
+            }
             .onReceive(NotificationCenter.default.publisher(for: TorrentSearchService.updated)) { note in
                 // The slower source (Zona's index or Jacred) answered: its releases join the list.
                 let request = query
@@ -385,6 +409,12 @@ struct SourcesSheet: View {
                 }
             }
             Button {
+                download(release)
+            } label: {
+                Label(downloadTitle(release), systemImage: "arrow.down.circle")
+            }
+            .disabled(preparingDownload)
+            Button {
                 UIPasteboard.general.string = release.link
             } label: {
                 Label("Скопировать ссылку", systemImage: "doc.on.doc")
@@ -475,6 +505,42 @@ struct SourcesSheet: View {
             if releases.isEmpty {
                 state = .failed(error.localizedDescription)
             }
+        }
+    }
+
+    // MARK: Downloads
+
+    /// The season a download takes: the episode's, the filtered one or the only season of the release.
+    private func downloadSeason(_ release: TorrentRelease) -> Int? {
+        guard isSeries else { return nil }
+        return episode?.seasonNumber ?? season ?? (release.seasons.count == 1 ? release.seasons.first : nil)
+    }
+
+    private func downloadTitle(_ release: TorrentRelease) -> String {
+        guard isSeries else { return "Скачать фильм" }
+        if episode != nil { return "Скачать серию" }
+        if let number = downloadSeason(release) { return "Скачать \(number) сезон" }
+        return "Скачать все серии"
+    }
+
+    private func download(_ release: TorrentRelease) {
+        guard !preparingDownload else { return }
+        let source = SavedSource(release: release)
+        library.addSource(source, for: item.key)
+        preparingDownload = true
+        let season = downloadSeason(release)
+        Task {
+            do {
+                let count = try await DownloadManager.shared.enqueue(link: source.link, title: item.title, item: item,
+                                                                     itemKey: item.key, season: season,
+                                                                     episode: episode?.episodeNumber)
+                downloadMessage = count > 0
+                    ? "Добавлено: " + Plural.ru(count, "файл", "файла", "файлов") + ". Ход загрузки — в разделе «Моё → Загрузки»."
+                    : "Эти файлы уже в загрузках."
+            } catch {
+                downloadMessage = "Не удалось начать загрузку: " + error.localizedDescription
+            }
+            preparingDownload = false
         }
     }
 

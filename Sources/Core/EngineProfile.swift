@@ -78,7 +78,8 @@ enum EngineSettingValue: Hashable, Sendable {
 /// - the pieces are kept on disk, so the buffer ahead of the playback is hundreds of megabytes
 ///   (the engine prioritises pieces only inside its cache window, so a bigger cache also means
 ///   more pieces downloaded in parallel from more peers) and the video decoder keeps the memory;
-/// - more peer connections on Wi‑Fi;
+/// - more peer connections (100 on Wi‑Fi, as in the "performance" preset of TorrServer): the
+///   engine downloads up to that many pieces ahead of the playback at the same time;
 /// - on a mobile network TCP only (operators slow down UDP) and a limited upload, so it does not
 ///   choke the download.
 ///
@@ -106,7 +107,8 @@ struct EngineProfile: Hashable, Sendable {
     /// KB/s, 0 = unlimited.
     var uploadLimit: Int
     /// Bytes read in advance from the start and from the end of the file a film page will play
-    /// (players read the header at the start and the index at the end before the first frame).
+    /// (players read the header at the start and the index at the end before the first frame;
+    /// on Wi‑Fi the start also covers the first seconds of the film, so it plays at once).
     var warmupHead: Int64
     var warmupTail: Int64
 
@@ -137,11 +139,11 @@ struct EngineProfile: Hashable, Sendable {
             cacheBytes: disk ?? memoryCache,
             useDisk: disk != nil,
             cachePath: env.cachePath,
-            connections: kind == .fast ? 60 : (kind == .mobile ? 40 : 25),
+            connections: kind == .fast ? 100 : (kind == .mobile ? 60 : 30),
             utp: kind == .fast,
             forceEncrypt: env.encryption == .always,
             uploadLimit: kind == .fast ? 0 : (kind == .mobile ? 100 : 32),
-            warmupHead: kind == .fast ? 8 << 20 : (kind == .mobile ? 4 << 20 : 0),
+            warmupHead: kind == .fast ? 16 << 20 : (kind == .mobile ? 4 << 20 : 0),
             warmupTail: kind == .fast ? 4 << 20 : (kind == .mobile ? 2 << 20 : 0)
         )
     }
@@ -181,6 +183,10 @@ struct EngineProfile: Hashable, Sendable {
             // engine reconnects (its uTP socket closes late), and the reconnect then fails.
             "PeersListenPort": .int(0),
             "RetrackersMode": .int(1),
+            // The engine adds a list of public trackers to every torrent; until it is downloaded
+            // (or when GitHub does not answer) it uses this one. Its default has dead trackers,
+            // WebTorrent ones (useless here) and retracker.local, which iOS cannot resolve.
+            "DefaultTrackers": .string(EngineProfile.trackers.joined(separator: "\n")),
             "TorrentDisconnectTimeout": .int(Int64(EngineProfile.keepAliveSeconds)),
             // Discovery of other devices is not needed inside the app; it only adds
             // multicast traffic and work while the phone plays.
@@ -213,7 +219,7 @@ struct EngineProfile: Hashable, Sendable {
         }
     }
 
-    /// "Wi‑Fi · кэш 1 ГБ на диске · до 60 пиров · TCP и uTP".
+    /// "Wi‑Fi · кэш 1 ГБ на диске · до 100 пиров · TCP и uTP".
     var summary: String {
         var parts = [title]
         parts.append("кэш " + EngineProfile.sizeText(cacheBytes) + (useDisk ? " на диске" : " в памяти"))

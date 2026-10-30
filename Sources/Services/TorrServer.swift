@@ -72,10 +72,16 @@ enum TorrServerError: LocalizedError {
         case .server(let text):
             return text.isEmpty ? "Торрент-движок вернул ошибку." : "Торрент-движок: \(text)"
         case .timeout:
-            return "Не удалось получить данные торрента: нет пиров или ссылка неверна."
+            return "Не удалось получить данные торрента: найденные пиры их не отдают или пиров нет. Повторная попытка продолжит поиск с уже найденными пирами."
         case .noVideo:
             return "В торренте нет видеофайлов."
         }
+    }
+
+    /// No peer has sent the torrent data (the file list) in time.
+    var isTimeout: Bool {
+        if case .timeout = self { return true }
+        return false
     }
 
     /// The engine has no torrent client: it did not reconnect after its settings were saved.
@@ -224,6 +230,24 @@ final class TorrServer {
         start()
         Task.detached(priority: .utility) {
             try? await self.ensureRunning()
+            // For the diagnostics: the engine built with the changes of Kinoteka ends with "-kinoteka".
+            if let version = await self.version() {
+                AppDiagnostics.shared.log("torrent", "Движок \(version)")
+            }
+        }
+    }
+
+    /// The version the engine reports.
+    func version() async -> String? {
+        guard let url = URL(string: base + "/echo") else { return nil }
+        var request = URLRequest(url: url, timeoutInterval: 3)
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        do {
+            let (data, response) = try await session.data(for: request)
+            guard (response as? HTTPURLResponse)?.statusCode == 200 else { return nil }
+            return String(data: data, encoding: .utf8)?.trimmed.nonEmpty
+        } catch {
+            return nil
         }
     }
 
@@ -312,6 +336,9 @@ final class TorrServer {
     private var profileTask: Task<Void, Never>?
     private var loggedProfile: EngineProfile?
     private var playerActive = false
+    /// Files are being saved for offline viewing: no retune, their torrents are not dropped.
+    private var downloadsActive = false
+    private var pinnedHashes: Set<String> = []
     private var measuredFreeSpace: Int64??
     private var lastReconnect: Date?
 
@@ -326,6 +353,25 @@ final class TorrServer {
         lock.lock()
         playerActive = active
         lock.unlock()
+    }
+
+    func setDownloadsActive(_ active: Bool) {
+        lock.lock()
+        downloadsActive = active
+        lock.unlock()
+    }
+
+    /// Torrents of unfinished downloads: closing them would stop the download.
+    func setPinned(_ hashes: Set<String>) {
+        lock.lock()
+        pinnedHashes = Set(hashes.map { $0.lowercased() })
+        lock.unlock()
+    }
+
+    private func isPinned(_ hash: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return pinnedHashes.contains(hash.lowercased())
     }
 
     /// The profile the engine runs with; nil until it is checked after the start.
@@ -411,7 +457,7 @@ final class TorrServer {
         if let running = profileTask { return running }
         if profileVerified {
             // Another network or encryption choice: only when nothing plays.
-            guard retune, !playerActive, appliedProfile != desired else { return nil }
+            guard retune, !playerActive, !downloadsActive, appliedProfile != desired else { return nil }
         } else if playerActive && !retune {
             // Not checked yet (the check failed): a film may play now, the check waits for
             // a new playback.
@@ -580,6 +626,7 @@ final class TorrServer {
     }
 
     func drop(hash: String) async {
+        guard !isPinned(hash) else { return }
         _ = try? await post(["action": "drop", "hash": hash])
     }
 
@@ -615,27 +662,8 @@ final class TorrServer {
         return comps?.url
     }
 
-    /// Reads a tiny range of the next episode so TorrServer starts requesting
-    /// its pieces before the current episode ends. Best effort only.
-    func prefetch(hash: String, file: TorrentFile, bytes: Int = 256 * 1024) async {
-        await waitForProfileTask()
-        guard bytes > 0, let url = streamURL(hash: hash, file: file) else { return }
-        var request = URLRequest(url: url, timeoutInterval: 6)
-        request.setValue("bytes=0-\(bytes - 1)", forHTTPHeaderField: "Range")
-        request.cachePolicy = .reloadIgnoringLocalCacheData
-        do {
-            let (_, response) = try await session.data(for: request)
-            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-            AppDiagnostics.shared.log("torrent", "Подготовлена следующая серия, HTTP \(code)")
-        } catch {
-            if !Task.isCancelled {
-                AppDiagnostics.shared.log("torrent", "Подготовка серии не удалась: \(error.localizedDescription)")
-            }
-        }
-    }
-
     /// Reads a range of the file through the engine, so it downloads those pieces now: the start
-    /// and the end of the film the open page will play. Returns the bytes read.
+    /// and the end of the film the open page or the player will play. Returns the bytes read.
     func readAhead(hash: String, file: TorrentFile, offset: Int64, length: Int64, idleTimeout: TimeInterval = 20) async -> Int64 {
         await waitForProfileTask()
         guard !Task.isCancelled, length > 0, offset >= 0, offset < file.length,

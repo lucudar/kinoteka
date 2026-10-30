@@ -23,6 +23,9 @@ struct PlayerHostView: View {
     @AppStorage(SettingsKeys.preloadNextEpisode) private var preloadNextEpisode = true
     @AppStorage(SettingsKeys.playerGestures) private var playerGestures = true
     @AppStorage(SettingsKeys.playerShowRemaining) private var showRemaining = false
+    @AppStorage(SettingsKeys.pipAuto) private var pipAuto = false
+    @AppStorage(SettingsKeys.subtitleAuto) private var subtitleAuto = false
+    @AppStorage(SettingsKeys.openSubtitlesKey) private var openSubtitlesKey = ""
 
     enum Phase: Equatable {
         case resolving
@@ -56,6 +59,11 @@ struct PlayerHostView: View {
             case .endOfVideo: return "До конца фильма или серии"
             }
         }
+    }
+
+    /// Pages of the player's settings: a short menu, every choice on its own page.
+    private enum OptionsPage: Hashable {
+        case release, audio, subtitles, subtitleSearch, speed, aspect, sync, sleep, download, torrent
     }
 
     @State private var phase: Phase = .resolving
@@ -95,6 +103,13 @@ struct PlayerHostView: View {
     @State private var resolveTask: Task<Void, Never>?
     @State private var attemptedLinks: Set<String> = []
     @State private var fallbackCount = 0
+    /// Other releases of the film searched for their torrent data (the file list) at the same time
+    /// as the one that opens, by hash: the first one whose peers send it plays.
+    @State private var racers: [String: TorrentRelease] = [:]
+    /// Racers being added now (the engine has not answered yet).
+    @State private var racersPending = 0
+    /// Changes when the racers are closed: a racer added after that is not needed.
+    @State private var racingGeneration = 0
     @State private var attemptStartedAt = Date()
     @State private var playbackBeganAt = Date.distantPast
     @State private var playbackSuccessRecorded = false
@@ -134,6 +149,15 @@ struct PlayerHostView: View {
     @State private var lastTapSide = 0
     @State private var seekStreakSide = 0
     @State private var seekStreakSeconds = 0
+    @State private var lockHintVisible = false
+    @State private var lockHintToken = 0
+    @State private var optionsPath: [OptionsPage] = []
+    /// The file plays from the iPhone (downloaded), not through the engine.
+    @State private var playingLocal = false
+    /// The torrent is open in the engine, not only its saved file list.
+    @State private var engineAttached = false
+    @State private var preferEngine = false
+    @State private var autoSubtitleTried: Set<String> = []
 
     init(request: PlayRequest) {
         self.request = request
@@ -149,8 +173,25 @@ struct PlayerHostView: View {
 
     private static let audioExtensions: Set<String> = ["mka", "ac3", "eac3", "dts", "aac", "mp3", "flac", "ogg", "opus", "m4a", "wav"]
     private static let subtitleExtensions: Set<String> = ["srt", "ass", "ssa", "vtt", "sub", "smi"]
+    /// At most this many other releases are searched at the same time as the one that opens.
+    private static let maxRacers = 2
 
     var body: some View {
+        systemObservers(playbackObservers(screen))
+            .sheet(isPresented: $showFiles) { filesSheet }
+            .sheet(isPresented: $showOptions) { optionsSheet }
+            .sheet(isPresented: $showQuality) { qualitySheet }
+            .alert("Не удалось сменить раздачу",
+                   isPresented: Binding(get: { switchError != nil }, set: { if !$0 { switchError = nil } })) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(switchError ?? "")
+            }
+    }
+
+    /// The screen of the player with its system options and the tasks of the playback.
+    /// (The modifiers are split into parts: one long chain is too much for the type checker.)
+    private var screen: some View {
         ZStack {
             Color.black.ignoresSafeArea()
             if showsBackdrop, let poster = request.item?.poster {
@@ -178,8 +219,10 @@ struct PlayerHostView: View {
                 playerView
             }
         }
-        .statusBarHidden(true)
-        .persistentSystemOverlays(.hidden)
+        .statusBarHidden(!coordinator.minimized)
+        .persistentSystemOverlays(coordinator.minimized ? .automatic : .hidden)
+        // Locked: a swipe from the edge does not open the Control Center or leave the app at once.
+        .defersSystemGestures(on: controlsLocked ? .all : [])
         .task {
             if resolveTask == nil {
                 await adaptInitialLinkForNetworkFromCache()
@@ -190,7 +233,10 @@ struct PlayerHostView: View {
         .task { await loadArtwork() }
         .task(id: hash) { await pollTorrentStats() }
         .onAppear {
-            UIApplication.shared.isIdleTimerDisabled = true
+            IdleTimer.set("player", active: true)
+            // Frames for Picture in Picture from the start: iOS can move the video there by itself.
+            model.prefersSampleBuffer = pipAuto && model.pipSupported
+            model.automaticPictureInPicture = pipAuto && model.pipSupported
             if OrientationHelper.isPhone {
                 Task { @MainActor in
                     try? await Task.sleep(nanoseconds: 350_000_000)
@@ -199,79 +245,100 @@ struct PlayerHostView: View {
             }
         }
         .onDisappear {
-            UIApplication.shared.isIdleTimerDisabled = false
             finish()
         }
-        .onChange(of: model.timeMs) { _, _ in
-            periodicSave()
-            prepareNextEpisodeIfNeeded()
-            updateNextEpisodePrompt()
-        }
-        .onChange(of: model.ended) { _, ended in
-            if ended { handleEnded() }
-        }
-        .onChange(of: model.isPlaying) { _, playing in
-            if playing {
-                UIApplication.shared.isIdleTimerDisabled = true
-                bumpControls()
-            } else if !controlsLocked {
-                withAnimation { showControls = true }
+    }
+
+    /// Reactions to the playback.
+    private func playbackObservers<Content: View>(_ content: Content) -> some View {
+        content
+            .onChange(of: model.timeMs) { _, _ in
+                periodicSave()
+                prepareNextEpisodeIfNeeded()
+                updateNextEpisodePrompt()
             }
-        }
-        .onChange(of: model.started) { _, started in
-            if started { playbackDidStart() }
-        }
-        .onChange(of: model.failed) { _, failed in
-            if failed { scheduleRecovery(reason: "ошибка VLC", delay: 1) }
-        }
-        .onChange(of: model.isBuffering) { _, buffering in
-            if buffering && model.started {
-                scheduleRecovery(reason: "поток завис", delay: 12)
-            } else if !buffering && !model.failed {
-                recoveryTask?.cancel()
-                recoveryTask = nil
-                recoveryText = nil
+            .onChange(of: model.ended) { _, ended in
+                if ended { handleEnded() }
             }
-        }
-        .onChange(of: model.audioTracks) { _, _ in
-            applyPreferredAudio()
-        }
-        .onChange(of: model.subtitleTracks) { _, _ in
-            applyPreferredSubtitle()
-        }
-        .onChange(of: showOptions) { _, open in
-            if !open { bumpControls() }
-        }
-        .onChange(of: showFiles) { _, open in
-            if !open { bumpControls() }
-        }
-        .onChange(of: scenePhase) { _, newPhase in
-            switch newPhase {
-            case .active:
-                model.setVideoEnabled(true)
-            case .background:
-                recoveryTask?.cancel()
-                startupWatchdogTask?.cancel()
-                saveProgress(final: true)
-                if backgroundAudio && phase == .playing {
-                    // Keep the sound playing (lock screen, other apps); the picture is not needed.
-                    model.setVideoEnabled(false)
-                } else {
-                    model.pause()
+            .onChange(of: model.isPlaying) { _, playing in
+                if playing {
+                    IdleTimer.set("player", active: true)
+                    bumpControls()
+                } else if !controlsLocked {
+                    withAnimation { showControls = true }
                 }
-            default:
-                saveProgress(final: true)
             }
-        }
-        .sheet(isPresented: $showFiles) { filesSheet }
-        .sheet(isPresented: $showOptions) { optionsSheet }
-        .sheet(isPresented: $showQuality) { qualitySheet }
-        .alert("Не удалось сменить раздачу",
-               isPresented: Binding(get: { switchError != nil }, set: { if !$0 { switchError = nil } })) {
-            Button("OK", role: .cancel) {}
-        } message: {
-            Text(switchError ?? "")
-        }
+            .onChange(of: model.started) { _, started in
+                if started { playbackDidStart() }
+            }
+            .onChange(of: model.failed) { _, failed in
+                if failed { scheduleRecovery(reason: "ошибка VLC", delay: 1) }
+            }
+            .onChange(of: model.isBuffering) { _, buffering in
+                if buffering && model.started {
+                    scheduleRecovery(reason: "поток завис", delay: 12)
+                } else if !buffering && !model.failed {
+                    recoveryTask?.cancel()
+                    recoveryTask = nil
+                    recoveryText = nil
+                }
+            }
+            .onChange(of: model.audioTracks) { _, _ in
+                applyPreferredAudio()
+            }
+            .onChange(of: model.subtitleTracks) { _, _ in
+                applyPreferredSubtitle()
+            }
+            .onChange(of: showOptions) { _, open in
+                if !open {
+                    optionsPath = []
+                    bumpControls()
+                }
+            }
+            .onChange(of: showFiles) { _, open in
+                if !open { bumpControls() }
+            }
+    }
+
+    /// Reactions to the app going to the background and to Picture in Picture.
+    private func systemObservers<Content: View>(_ content: Content) -> some View {
+        content
+            .onChange(of: scenePhase) { _, newPhase in
+                switch newPhase {
+                case .active:
+                    model.setVideoEnabled(true)
+                    model.recoverVideoLayer()
+                    // iOS moved the video to the window when the app was closed: back in the app,
+                    // it returns to the player.
+                    if model.pipActive, model.pipStartedAutomatically, !coordinator.minimized {
+                        model.exitPictureInPicture()
+                    }
+                case .background:
+                    recoveryTask?.cancel()
+                    startupWatchdogTask?.cancel()
+                    saveProgress(final: true)
+                    if model.pipActive || (pipAuto && model.renderMode == .sampleBuffer && model.isPlaying) {
+                        // The picture stays in Picture in Picture; checked again once it has started.
+                        Task { @MainActor in
+                            try? await Task.sleep(nanoseconds: 1_500_000_000)
+                            guard UIApplication.shared.applicationState == .background, !model.pipActive, !closing else { return }
+                            enteredBackgroundWithoutWindow()
+                        }
+                    } else {
+                        enteredBackgroundWithoutWindow()
+                    }
+                default:
+                    saveProgress(final: true)
+                }
+            }
+            .onChange(of: model.pipStarts) { _, _ in pictureInPictureStarted() }
+            .onChange(of: model.pipRestoreRequests) { _, _ in restoreFromPictureInPicture() }
+            .onChange(of: model.pipClosedRequests) { _, _ in pictureInPictureClosed() }
+            .onChange(of: model.pipMessage) { _, text in
+                guard let text else { return }
+                showNotice(text)
+                model.clearPipMessage()
+            }
     }
 
     // MARK: - Resolving the link
@@ -307,8 +374,15 @@ struct PlayerHostView: View {
                 return
             } catch {
                 if Task.isCancelled || closing { return }
-                PlaybackLearning.shared.recordFailure(release)
+                // The release that plays now: another one may have given its data first meanwhile.
+                PlaybackLearning.shared.recordFailure(self.release(matching: link) ?? release)
                 AppDiagnostics.shared.log("player", "Запуск не удался: \(error.localizedDescription)")
+                // Waiting for the torrent data has tried other releases at the same time already;
+                // they stay connected, so "Повторить" goes on with the peers found.
+                if (error as? TorrServerError)?.isTimeout == true, automaticFallback, canSwitchRelease {
+                    phase = .failed(error.localizedDescription)
+                    return
+                }
                 guard await selectAutomaticFallback(preferLowerQuality: false) else {
                     phase = .failed(error.localizedDescription)
                     return
@@ -332,6 +406,16 @@ struct PlayerHostView: View {
         // The player closed meanwhile: it must not stay marked as playing.
         guard !closing else { throw CancellationError() }
         phase = .resolving
+        // A downloaded file plays from the iPhone: no engine and no peers, works without the network.
+        if !preferEngine, let saved = DownloadManager.shared.torrent(forLink: torrent),
+           let file = savedFile(in: saved) {
+            hash = saved.hash
+            allFiles = saved.files
+            files = videoFiles(saved.files)
+            AppDiagnostics.shared.log("player", "Воспроизведение скачанного файла")
+            play(file, startAt: takePendingStart())
+            return
+        }
         statusText = fallbackCount > 0 ? "Пробуем запасную раздачу…" : "Запуск торрент-движка…"
         detailText = ""
         TorrServer.shared.setPlayerActive(true)
@@ -345,17 +429,15 @@ struct PlayerHostView: View {
             throw TorrServerError.server("не удалось добавить торрент")
         }
         hash = h
+        engineAttached = true
         // Torrents that are not needed now (played before, prepared for another film) are freed.
         TorrentWarmup.shared.playbackStarted(hash: h)
-        let timeout: TimeInterval = automaticFallback && canSwitchRelease ? (fallbackCount == 0 ? 10 : 18) : 120
         let all: [TorrentFile]
         if !status.files.isEmpty {
             all = status.files
+            closeRacers(keeping: h)
         } else {
-            all = try await TorrServer.shared.waitForFiles(hash: h, timeout: timeout) { s in
-                statusText = "Подключение к пирам…"
-                detailText = s.peersText
-            }
+            all = try await waitForMetadata(of: h, link: torrent)
         }
         try Task.checkCancellation()
         allFiles = all
@@ -380,6 +462,25 @@ struct PlayerHostView: View {
         }
     }
 
+    /// The file this request wants, when it is downloaded.
+    private func savedFile(in saved: DownloadTorrent) -> TorrentFile? {
+        let list = videoFiles(saved.files)
+        let wanted: TorrentFile?
+        if let id = wantedFileId {
+            wanted = list.first { $0.id == id }
+        } else if let episode = wantedEpisode {
+            wanted = EpisodeMatcher.find(in: list, season: wantedSeason, episode: episode)
+        } else if list.count == 1 {
+            wanted = list.first
+        } else if request.item?.kind != .series {
+            wanted = dominantFile(list)
+        } else {
+            wanted = nil
+        }
+        guard let file = wanted, DownloadManager.shared.localURL(hash: saved.hash, fileId: file.id) != nil else { return nil }
+        return file
+    }
+
     private func canonicalLink(_ value: String) -> String {
         let text = value.trimmed
         return LinkInspector.kind(of: text) == .torrent ? LinkInspector.markTorrent(LinkInspector.stripMarker(text)) : text
@@ -392,6 +493,165 @@ struct PlayerHostView: View {
             return match
         }
         return alternatives.first { canonicalLink($0.link) == key }
+    }
+
+    /// Waits for the torrent data (the file list) of `primary`, which only peers send for a magnet
+    /// link. Peers of Zona's apps never send it, and some releases have almost only them, so when
+    /// it does not come soon, other releases of the film are added at the same time and the first
+    /// one with the data plays. Nothing is dropped while waiting: every torrent keeps the peers it
+    /// has found, the way a second tap on "Повторить" did before.
+    private func waitForMetadata(of primary: String, link torrent: String) async throws -> [TorrentFile] {
+        let racing = automaticFallback && canSwitchRelease
+        // With other releases the wait ends sooner: they have been tried at the same time.
+        let budget: TimeInterval = racing ? 75 : 120
+        let started = Date()
+        let primaryKey = primary.lowercased()
+        var nextRacerAt: TimeInterval = racers.isEmpty ? 8 : 10
+        var crowdChecked = false
+        var readded = false
+        var tick = 0
+        while !Task.isCancelled && !closing {
+            let elapsed = Date().timeIntervalSince(started)
+            let status: TSStatus
+            do {
+                status = try await TorrServer.shared.get(hash: primary)
+            } catch {
+                if Task.isCancelled { throw CancellationError() }
+                guard !readded else { throw error }
+                // The engine has closed the torrent meanwhile (it waits for the data for minutes,
+                // or it was restarted): it is added again.
+                readded = true
+                AppDiagnostics.shared.log("torrent", "Раздача закрыта движком, добавляем снова: \(error.localizedDescription)")
+                status = try await TorrServer.shared.add(link: torrent, title: request.item?.title ?? request.title,
+                                                         poster: request.item?.posterURL)
+            }
+            try Task.checkCancellation()
+            if !status.files.isEmpty {
+                if elapsed > 5 {
+                    AppDiagnostics.shared.log("torrent", "Данные торрента получены за \(Int(elapsed)) с")
+                }
+                closeRacers(keeping: primary)
+                return status.files
+            }
+            var active = status.activePeers ?? 0
+            var total = status.totalPeers ?? 0
+            for (racerHash, racerRelease) in racers where racerHash != primaryKey {
+                do {
+                    let racer = try await TorrServer.shared.get(hash: racerHash)
+                    try Task.checkCancellation()
+                    if !racer.files.isEmpty {
+                        if let episode = wantedEpisode,
+                           EpisodeMatcher.find(in: videoFiles(racer.files), season: wantedSeason, episode: episode) == nil {
+                            // It has no such episode: the others go on.
+                            AppDiagnostics.shared.log("fallback", "В другой раздаче нет нужной серии: \(racerRelease.qualityText)")
+                            racers[racerHash] = nil
+                            Task { await TorrServer.shared.drop(hash: racerHash) }
+                            continue
+                        }
+                        adoptRacer(racerRelease, hash: racerHash, elapsed: elapsed)
+                        return racer.files
+                    }
+                    active += racer.activePeers ?? 0
+                    total += racer.totalPeers ?? 0
+                } catch {
+                    if Task.isCancelled { throw CancellationError() }
+                    // The engine has closed it: the others go on.
+                    racers[racerHash] = nil
+                }
+            }
+            let searched = 1 + racers.count
+            statusText = elapsed < 15 ? "Подключение к пирам…" : "Ищем пиров с данными торрента…"
+            detailText = "Пиры: \(active) из \(total)" + (searched > 1 ? " · раздач: \(searched)" : "")
+            if elapsed >= budget {
+                AppDiagnostics.shared.log("torrent", "Данные торрента не получены за \(Int(budget)) с: пиры \(active) из \(total), раздач \(searched)")
+                throw TorrServerError.timeout
+            }
+
+            // Many peers connected and still no data: most likely Zona's apps, another release
+            // is added at once instead of waiting.
+            let crowdedButSilent = !crowdChecked && elapsed >= 4 && (status.activePeers ?? 0) >= 6
+            if racing, alternativesLoaded, elapsed >= nextRacerAt || crowdedButSilent,
+               racers.count + racersPending < PlayerHostView.maxRacers {
+                if crowdedButSilent { crowdChecked = true }
+                addRacer(besides: primaryKey, reason: crowdedButSilent
+                         ? "пиров \(status.activePeers ?? 0), данных нет"
+                         : "нет данных \(Int(elapsed)) с")
+                nextRacerAt = elapsed + 10
+            }
+            tick += 1
+            try await Task.sleep(nanoseconds: tick < 20 ? 250_000_000 : 500_000_000)
+        }
+        throw CancellationError()
+    }
+
+    /// Adds the next best release of the film to the engine, to wait for its torrent data at the
+    /// same time. The engine is not waited for here: the torrents being searched are checked on.
+    private func addRacer(besides primary: String, reason: String) {
+        let taken = Set(racers.keys).union([primary])
+        let racing = Set(racers.values.map { canonicalLink($0.link) })
+        let candidates = PlaybackLearning.shared.candidates(alternatives,
+                                                             preferred: effectivePreferredQuality,
+                                                             season: releaseSeason,
+                                                             voice: desiredVoice)
+        guard let next = candidates.first(where: { candidate in
+            let key = canonicalLink(candidate.link)
+            if attemptedLinks.contains(key) || racing.contains(key) { return false }
+            if let other = candidate.hash?.lowercased(), taken.contains(other) { return false }
+            return true
+        }) else { return }
+        attemptedLinks.insert(canonicalLink(next.link))
+        racersPending += 1
+        let generation = racingGeneration
+        let raw = LinkInspector.stripMarker(next.link)
+        let title = request.item?.title ?? request.title
+        let poster = request.item?.posterURL
+        AppDiagnostics.shared.log("fallback", "Параллельно ищем другую раздачу (\(reason)): \(next.qualityText), сиды \(next.seeders)")
+        Task { @MainActor in
+            let status = try? await TorrServer.shared.add(link: raw, title: title, poster: poster, saveToDB: false)
+            if generation == racingGeneration { racersPending = max(0, racersPending - 1) }
+            guard let added = status?.hash?.lowercased(), !added.isEmpty else { return }
+            guard generation == racingGeneration, !closing else {
+                // The search has ended meanwhile: this torrent is not needed.
+                if added != hash?.lowercased() { await TorrServer.shared.drop(hash: added) }
+                return
+            }
+            if !taken.contains(added) { racers[added] = next }
+        }
+    }
+
+    /// Another release has got its torrent data first: it plays instead of the one that opened.
+    private func adoptRacer(_ winner: TorrentRelease, hash winnerHash: String, elapsed: TimeInterval) {
+        // A short wait is no fault of the release that opened.
+        if elapsed >= 10 { PlaybackLearning.shared.recordFailure(release(matching: link)) }
+        link = LinkInspector.markTorrent(winner.link)
+        attemptedLinks.insert(canonicalLink(link))
+        hash = winnerHash
+        wantedFileId = nil
+        fallbackCount += 1
+        racers[winnerHash] = nil
+        if let key = request.itemKey { library.addSource(SavedSource(release: winner), for: key) }
+        // The release that opened is disconnected, so this one gets all the bandwidth.
+        TorrentWarmup.shared.playbackStarted(hash: winnerHash)
+        closeRacers(keeping: winnerHash)
+        AppDiagnostics.shared.log("fallback", "Данные торрента первой дала другая раздача за \(Int(elapsed)) с: \(winner.qualityText), сиды \(winner.seeders)")
+        // Saved to the engine's database too, like the release that opens: next time it starts at once.
+        let raw = LinkInspector.stripMarker(winner.link)
+        let title = request.item?.title ?? request.title
+        let poster = request.item?.posterURL
+        Task { _ = try? await TorrServer.shared.add(link: raw, title: title, poster: poster) }
+    }
+
+    /// Disconnects the releases searched at the same time, except `keeping`.
+    private func closeRacers(keeping: String? = nil) {
+        racingGeneration += 1
+        racersPending = 0
+        guard !racers.isEmpty else { return }
+        let keep = keeping?.lowercased()
+        let unused = racers.keys.filter { $0 != keep && $0 != hash?.lowercased() }
+        racers = [:]
+        for old in unused {
+            Task { await TorrServer.shared.drop(hash: old) }
+        }
     }
 
     /// Picks the next learned, live release. After repeated stalls it first tries
@@ -465,16 +725,36 @@ struct PlayerHostView: View {
 
     /// `startAt`: position in the file (another release of what played); otherwise the saved one.
     private func play(_ file: TorrentFile, startAt: Int32? = nil) {
-        guard let h = hash, let url = TorrServer.shared.streamURL(hash: h, file: file) else { return }
-        preloadTask?.cancel()
+        guard let h = hash else { return }
+        let local = DownloadManager.shared.localURL(hash: h, fileId: file.id)
+        if local == nil && !engineAttached {
+            // Opened from the saved file list: the engine is connected for a file that is not downloaded.
+            wantedFileId = file.id
+            if let startAt { pendingStart = startAt }
+            preferEngine = true
+            model.stop()
+            startResolve()
+            return
+        }
+        guard let url = local ?? TorrServer.shared.streamURL(hash: h, file: file) else { return }
+        // The next episode read in advance goes on reading when it is the one that starts now.
+        if nextPreparedID != file.id { preloadTask?.cancel() }
         preloadTask = nil
+        if local == nil {
+            // The end of the file is downloaded while the player reads its start.
+            TorrentWarmup.shared.playbackWillStart(hash: h, file: file)
+        }
         nextPreparedID = nil
         showNextEpisodePrompt = false
         autoNextCancelled = false
         currentFile = file
         streamKey = "\(h):\(file.id)"
         addedAudio = []
-        start(url: url, slaves: subtitleSlaves(for: file), startAt: startAt)
+        playingLocal = local != nil
+        let slaves: [(URL, VLCMediaPlaybackSlaveType)] = local != nil
+            ? DownloadManager.shared.localSubtitleURLs(hash: h, fileId: file.id).map { ($0, VLCMediaPlaybackSlaveType.subtitle) }
+            : subtitleSlaves(for: file)
+        start(url: url, slaves: slaves, startAt: startAt)
     }
 
     private func baseName(_ file: TorrentFile) -> String {
@@ -496,7 +776,7 @@ struct PlayerHostView: View {
 
     /// External dubs stored next to the video (e.g. "Rus Sound/Studio/Episode.mka").
     private var externalAudio: [TorrentFile] {
-        guard let file = currentFile else { return [] }
+        guard let file = currentFile, !playingLocal else { return [] }
         return companions(for: file, extensions: PlayerHostView.audioExtensions)
     }
 
@@ -508,6 +788,9 @@ struct PlayerHostView: View {
     private func start(url: URL, slaves: [(URL, VLCMediaPlaybackSlaveType)], startAt: Int32? = nil) {
         streamURL = url
         phase = .playing
+        closeRacers(keeping: hash)
+        // Downloads wait while a stream plays (a setting), a saved file does not need the network.
+        DownloadManager.shared.playerStreaming = !url.isFileURL
         recoveryText = nil
         preferredAudioApplied = false
         preferredSubtitleApplied = false
@@ -524,7 +807,13 @@ struct PlayerHostView: View {
         var options: [String: Any] = [:]
         if let agent = request.userAgent { options["http-user-agent"] = agent }
         if let referrer = request.referrer { options["http-referrer"] = referrer }
-        if request.isLive { options["network-caching"] = 1500 }
+        if request.isLive {
+            options["network-caching"] = 1500
+        } else if engineAttached, !url.isFileURL, TorrServer.shared.activeProfile?.kind == .fast {
+            // On Wi‑Fi the engine already keeps a big buffer ahead of the playback: a shorter one
+            // in the player (3 s by default) starts the film and every seek sooner.
+            options["network-caching"] = 2000
+        }
         let rate: Float = (savePlayerSettings && !request.isLive) ? Float(savedRate) : 1
         let aspect: AspectMode = savePlayerSettings ? (AspectMode(rawValue: savedAspect) ?? .fit) : .fit
         model.load(url: url, startAt: position, options: options, rate: rate, aspect: aspect, slaves: slaves)
@@ -628,6 +917,7 @@ struct PlayerHostView: View {
             library.removeWatchLater(item)
         }
         recordPlaybackSuccessIfPossible()
+        scheduleAutoSubtitles()
     }
 
     private func recordPlaybackSuccessIfPossible() {
@@ -694,12 +984,13 @@ struct PlayerHostView: View {
               !network.isExpensive, !network.isConstrained,
               model.lengthMs > 0, model.lengthMs - model.timeMs < 90_000,
               let next = nextFile, nextPreparedID != next.id,
-              let h = hash else { return }
+              let h = hash, engineAttached,
+              DownloadManager.shared.localURL(hash: h, fileId: next.id) == nil else { return }
         nextPreparedID = next.id
         preloadTask?.cancel()
         preloadTask = Task {
             AppDiagnostics.shared.log("series", "Подготовка \(fileLabel(next))")
-            await TorrServer.shared.prefetch(hash: h, file: next)
+            await TorrentWarmup.shared.prepareNext(hash: h, file: next)
         }
     }
 
@@ -821,23 +1112,29 @@ struct PlayerHostView: View {
     }
 
     private func close() {
-        guard !closing else { return }
-        closing = true
-        pendingTap?.cancel()
-        recoveryTask?.cancel()
-        startupWatchdogTask?.cancel()
-        preloadTask?.cancel()
-        cancelSleepTimer()
-        saveProgress(final: true)
-        model.shutdown()
-        AppDiagnostics.shared.setPlayback(nil)
-        TorrServer.shared.setPlayerActive(false)
-        coordinator.request = nil
+        if !closing {
+            closing = true
+            pendingTap?.cancel()
+            recoveryTask?.cancel()
+            startupWatchdogTask?.cancel()
+            preloadTask?.cancel()
+            cancelSleepTimer()
+            saveProgress(final: true)
+            model.shutdown()
+            AppDiagnostics.shared.setPlayback(nil)
+            TorrServer.shared.setPlayerActive(false)
+            DownloadManager.shared.playerStreaming = false
+            OrientationLock.unlock()
+        }
+        closeRacers()
+        // Always: a second tap on the cross must close the player even if the first one stopped it.
+        coordinator.close(request.id)
     }
 
     private func finish() {
         resolveTask?.cancel()
         switchTask?.cancel()
+        closeRacers()
         recoveryTask?.cancel()
         startupWatchdogTask?.cancel()
         preloadTask?.cancel()
@@ -848,8 +1145,13 @@ struct PlayerHostView: View {
         }
         // Final: the VLC player is released off the main thread once it has stopped.
         model.shutdown()
+        OrientationLock.unlock()
+        // Another video may already be open (chosen while this one was in Picture in Picture).
+        guard coordinator.request == nil || coordinator.request?.id == request.id else { return }
         AppDiagnostics.shared.setPlayback(nil)
         TorrServer.shared.setPlayerActive(false)
+        DownloadManager.shared.playerStreaming = false
+        IdleTimer.set("player", active: false)
         // The torrent is not dropped here: TorrServer keeps it for a few minutes
         // (reopening or the next episode starts without reconnecting) and closes it itself.
         if OrientationHelper.isPhone {
@@ -867,7 +1169,7 @@ struct PlayerHostView: View {
     private func pollTorrentStats() async {
         guard let h = hash else { return }
         while !Task.isCancelled {
-            if phase == .playing && model.isBuffering, let s = try? await TorrServer.shared.get(hash: h) {
+            if phase == .playing && model.isBuffering && !playingLocal, let s = try? await TorrServer.shared.get(hash: h) {
                 bufferInfo = "\(s.speedText) · \(s.peersText)"
             }
             try? await Task.sleep(nanoseconds: 2_000_000_000)
@@ -913,7 +1215,7 @@ struct PlayerHostView: View {
             sleepDeadline = nil
             sleepTask = nil
             model.pause()
-            UIApplication.shared.isIdleTimerDisabled = false
+            IdleTimer.set("player", active: false)
             showNotice("Таймер сна остановил воспроизведение")
         }
     }
@@ -1041,7 +1343,10 @@ struct PlayerHostView: View {
                 } label: {
                     Image(systemName: "xmark")
                         .font(.title3.weight(.semibold))
+                        .frame(width: 44, height: 44)
                 }
+                .glassButton(Circle())
+                .accessibilityLabel("Закрыть")
                 Spacer()
                 Text("Выберите файл")
                     .font(.headline)
@@ -1052,9 +1357,12 @@ struct PlayerHostView: View {
                     } label: {
                         Image(systemName: "slider.horizontal.3")
                             .font(.title3.weight(.semibold))
+                            .frame(width: 44, height: 44)
                     }
+                    .glassButton(Circle())
+                    .accessibilityLabel("Другая раздача")
                 } else {
-                    Color.clear.frame(width: 24, height: 24)
+                    Color.clear.frame(width: 44, height: 44)
                 }
             }
             .padding()
@@ -1084,9 +1392,11 @@ struct PlayerHostView: View {
                 VLCVideoView(model: model)
                     .ignoresSafeArea()
                 if controlsLocked {
+                    // Touches do nothing while locked; a tap shows the lock that undoes it.
                     Color.clear
                         .contentShape(Rectangle())
                         .ignoresSafeArea()
+                        .onTapGesture { showLockHint() }
                 } else if playerGestures {
                     playerGestureLayer(size: proxy.size)
                 } else {
@@ -1127,27 +1437,9 @@ struct PlayerHostView: View {
                     controls
                         .transition(.opacity)
                 }
-                if controlsLocked {
-                    VStack {
-                        HStack {
-                            Spacer()
-                            Button {
-                                controlsLocked = false
-                                bumpControls()
-                            } label: {
-                                Label("Разблокировать", systemImage: "lock.open.fill")
-                                    .font(.subheadline.weight(.semibold))
-                                    .padding(.horizontal, 16)
-                                    .padding(.vertical, 11)
-                                    .glassSurface(Capsule(), interactive: true)
-                            }
-                            .buttonStyle(.plain)
-                        }
-                        Spacer()
-                    }
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 20)
-                    .padding(.vertical, 12)
+                if controlsLocked && lockHintVisible {
+                    lockOverlay
+                        .transition(.opacity)
                 }
                 if let release = switching {
                     VStack {
@@ -1444,8 +1736,8 @@ struct PlayerHostView: View {
                 } label: {
                     Image(systemName: "xmark")
                         .frame(width: 44, height: 44)
-                        .glassSurface(Circle(), interactive: true)
                 }
+                .glassButton(Circle())
                 .accessibilityLabel("Закрыть")
                 VStack(alignment: .leading, spacing: 2) {
                     Text(request.item?.title ?? request.title)
@@ -1462,14 +1754,15 @@ struct PlayerHostView: View {
                 Spacer(minLength: 8)
                 if let sleepStatusText = sleepStatusText {
                     Button {
+                        optionsPath = [.sleep]
                         showOptions = true
                     } label: {
                         Label(sleepStatusText, systemImage: "moon.zzz.fill")
                             .font(.caption.weight(.semibold))
                             .padding(.horizontal, 14)
                             .frame(height: 44)
-                            .glassSurface(Capsule(), interactive: true)
                     }
+                    .glassButton(Capsule())
                 }
                 // The actions of the player in one glass capsule, like a system toolbar.
                 HStack(spacing: 0) {
@@ -1481,10 +1774,11 @@ struct PlayerHostView: View {
                     topBarButton("slider.horizontal.3", label: "Настройки плеера") {
                         showOptions = true
                     }
+                    if model.pipSupported {
+                        pipButton
+                    }
                     topBarButton("lock.fill", label: "Заблокировать экран") {
-                        hideToken += 1
-                        controlsLocked = true
-                        withAnimation(.easeInOut(duration: 0.2)) { showControls = false }
+                        lockControls()
                     }
                     if OrientationHelper.isPhone {
                         topBarButton("rotate.right", label: "Повернуть экран") {
@@ -1522,8 +1816,8 @@ struct PlayerHostView: View {
                         Image(systemName: "gobackward.10")
                             .font(.system(size: 26, weight: .semibold))
                             .frame(width: 64, height: 64)
-                            .glassSurface(Circle(), interactive: true)
                     }
+                    .glassButton(Circle())
                     .accessibilityLabel("Назад на 10 секунд")
                 }
                 Button {
@@ -1534,8 +1828,8 @@ struct PlayerHostView: View {
                         .font(.system(size: 36, weight: .bold))
                         .contentTransition(.symbolEffect(.replace))
                         .frame(width: 88, height: 88)
-                        .glassSurface(Circle(), interactive: true)
                 }
+                .glassButton(Circle())
                 .accessibilityLabel(model.isPlaying ? "Пауза" : "Смотреть")
                 if !request.isLive {
                     Button {
@@ -1545,8 +1839,8 @@ struct PlayerHostView: View {
                         Image(systemName: "goforward.10")
                             .font(.system(size: 26, weight: .semibold))
                             .frame(width: 64, height: 64)
-                            .glassSurface(Circle(), interactive: true)
                     }
+                    .glassButton(Circle())
                     .accessibilityLabel("Вперёд на 10 секунд")
                 }
             }
@@ -1593,9 +1887,8 @@ struct PlayerHostView: View {
                             .font(.subheadline.weight(.semibold))
                             .padding(.horizontal, 14)
                             .padding(.vertical, 10)
-                            .glassSurface(Capsule(), interactive: true)
                     }
-                    .buttonStyle(.plain)
+                    .glassButton(Capsule())
                 }
             }
             if !request.isLive {
@@ -1659,89 +1952,45 @@ struct PlayerHostView: View {
     }
 
     private var optionsSheet: some View {
-        NavigationStack {
+        NavigationStack(path: $optionsPath) {
             List {
-                qualitySection
-
-                Section("Озвучка") {
-                    if model.audioTracks.isEmpty {
-                        Text("Дорожки появятся после начала воспроизведения")
-                            .foregroundStyle(Theme.secondary)
+                Section {
+                    if canSwitchRelease {
+                        menuRow("Раздача", icon: "square.stack.3d.up", value: currentReleaseText, page: .release)
                     }
-                    ForEach(model.audioTracks) { track in
-                        checkRow(track.name, selected: track.id == model.currentAudio) {
-                            selectAudio(track, remember: true)
-                        }
-                    }
+                    menuRow("Озвучка", icon: "waveform", value: currentAudioText, page: .audio)
+                    menuRow("Субтитры", icon: "captions.bubble", value: currentSubtitleText, page: .subtitles)
                 }
-
-                if !externalAudio.isEmpty {
-                    Section {
-                        ForEach(externalAudio) { file in
-                            checkRow(audioTitle(file), selected: addedAudio.contains(file.id)) {
-                                addExternalAudio(file)
+                Section {
+                    if !request.isLive {
+                        menuRow("Скорость", icon: "speedometer", value: currentRateText, page: .speed)
+                    }
+                    menuRow("Пропорции", icon: "aspectratio", value: model.aspect.title, page: .aspect)
+                    if !request.isLive {
+                        menuRow("Синхронизация", icon: "metronome", value: syncText, page: .sync)
+                    }
+                    menuRow("Таймер сна", icon: "moon.zzz", value: sleepText, page: .sleep)
+                }
+                Section {
+                    if model.pipSupported && phase == .playing {
+                        Button {
+                            showOptions = false
+                            Task { @MainActor in
+                                // The sheet closes first: the window starts from the visible video.
+                                try? await Task.sleep(nanoseconds: 450_000_000)
+                                togglePictureInPicture()
                             }
-                        }
-                    } header: {
-                        Text("Внешние озвучки")
-                    } footer: {
-                        Text("Отдельные звуковые дорожки из раздачи. После подключения выберите её в списке «Озвучка», если она не включилась сама.")
-                    }
-                }
-
-                if model.subtitleTracks.count > 1 {
-                    Section("Субтитры") {
-                        ForEach(model.subtitleTracks) { track in
-                            checkRow(track.name, selected: track.id == model.currentSubtitle) {
-                                selectSubtitle(track, remember: true)
-                            }
+                        } label: {
+                            optionLabel(model.pipActive ? "Вернуть в плеер" : "Картинка в картинке",
+                                        icon: model.pipActive ? "pip.exit" : "pip.enter", value: nil)
                         }
                     }
-                }
-
-                if !request.isLive {
-                    Section {
-                        delayRow("Звук", value: model.audioDelayMs, step: 100) { model.setAudioDelay(ms: $0) }
-                        if model.subtitleTracks.count > 1 {
-                            delayRow("Субтитры", value: model.subtitleDelayMs, step: 500) { model.setSubtitleDelay(ms: $0) }
-                        }
-                    } header: {
-                        Text("Синхронизация")
-                    } footer: {
-                        Text("Если голос не совпадает с губами (бывает у отдельных озвучек), сдвиньте звук: «+» — позже, «−» — раньше. Сдвиг сохраняется до закрытия плеера.")
+                    if canDownload {
+                        menuRow("Скачать", icon: "arrow.down.circle", value: downloadText, page: .download)
                     }
-                }
-
-                Section("Таймер сна") {
-                    ForEach(SleepChoice.allCases.filter { !request.isLive || $0 != .endOfVideo }) { choice in
-                        checkRow(choice.title, selected: sleepChoice == choice) {
-                            setSleepTimer(choice)
-                        }
+                    if hash != nil && !request.isLive && !playingLocal {
+                        menuRow("Торрент", icon: "antenna.radiowaves.left.and.right", value: nil, page: .torrent)
                     }
-                }
-
-                if !request.isLive {
-                    Section("Скорость") {
-                        ForEach(PlaybackRates.all) { option in
-                            checkRow(option.title, selected: abs(option.value - model.rate) < 0.01) {
-                                model.setRate(option.value)
-                                if savePlayerSettings { savedRate = Double(option.value) }
-                            }
-                        }
-                    }
-                }
-
-                Section("Пропорции") {
-                    ForEach(AspectMode.allCases) { mode in
-                        checkRow(mode.title, selected: mode == model.aspect) {
-                            model.setAspect(mode)
-                            if savePlayerSettings { savedAspect = mode.rawValue }
-                        }
-                    }
-                }
-
-                if let h = hash, !request.isLive {
-                    TorrentStatsSection(hash: h)
                 }
             }
             .navigationTitle("Настройки плеера")
@@ -1751,10 +2000,436 @@ struct PlayerHostView: View {
                     Button("Готово") { showOptions = false }
                 }
             }
+            .navigationDestination(for: OptionsPage.self) { page in
+                optionsPage(page)
+                    .navigationBarTitleDisplayMode(.inline)
+            }
             .onAppear { model.refreshTracks() }
         }
         .presentationDetents([.medium, .large])
         .preferredColorScheme(.dark)
+    }
+
+    private func optionLabel(_ title: String, icon: String, value: String?) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: icon)
+                .foregroundStyle(Theme.accent)
+                .frame(width: 26)
+            Text(title)
+                .foregroundStyle(.white)
+            Spacer(minLength: 8)
+            if let value, !value.isEmpty {
+                Text(value)
+                    .foregroundStyle(Theme.secondary)
+                    .lineLimit(1)
+            }
+        }
+        .contentShape(Rectangle())
+    }
+
+    private func menuRow(_ title: String, icon: String, value: String?, page: OptionsPage) -> some View {
+        NavigationLink(value: page) {
+            optionLabel(title, icon: icon, value: value)
+        }
+    }
+
+    /// Back to the menu after a choice.
+    private func popOptions() {
+        if !optionsPath.isEmpty { optionsPath.removeLast() }
+    }
+
+    private var currentReleaseText: String? {
+        guard let current = release(matching: link) else { return nil }
+        return current.qualityText.isEmpty ? nil : current.qualityText
+    }
+
+    private var currentAudioText: String? {
+        model.audioTracks.first { $0.id == model.currentAudio }?.name
+    }
+
+    private var currentSubtitleText: String {
+        if model.subtitleTracks.isEmpty { return "нет" }
+        return model.subtitleTracks.first { $0.id == model.currentSubtitle }?.name ?? "выключены"
+    }
+
+    private var currentRateText: String {
+        PlaybackRates.all.first { abs($0.value - model.rate) < 0.01 }?.title ?? String(format: "%.2g×", Double(model.rate))
+    }
+
+    private var syncText: String? {
+        var parts: [String] = []
+        if model.audioDelayMs != 0 { parts.append("звук " + PlayerHostView.delayText(model.audioDelayMs)) }
+        if model.subtitleDelayMs != 0 { parts.append("субт. " + PlayerHostView.delayText(model.subtitleDelayMs)) }
+        return parts.isEmpty ? nil : parts.joined(separator: ", ")
+    }
+
+    private var sleepText: String {
+        sleepChoice == .off ? "выключен" : (sleepStatusText ?? sleepChoice.title)
+    }
+
+    private var canDownload: Bool {
+        !request.isLive && hash != nil && !files.isEmpty && LinkInspector.kind(of: link) == .torrent
+    }
+
+    private var downloadText: String? {
+        guard let h = hash, let file = currentFile, let item = DownloadManager.shared.item(hash: h, fileId: file.id) else { return nil }
+        switch item.state {
+        case .completed: return "скачано"
+        case .failed: return "ошибка"
+        case .paused: return "пауза"
+        case .queued, .downloading: return "\(Int(item.progress * 100))%"
+        }
+    }
+
+    @ViewBuilder
+    private func optionsPage(_ page: OptionsPage) -> some View {
+        switch page {
+        case .release:
+            List { qualitySection }
+                .navigationTitle("Раздача")
+        case .audio:
+            audioPage
+        case .subtitles:
+            subtitlesPage
+        case .subtitleSearch:
+            SubtitleSearchList(query: { await subtitleQuery() },
+                               onPick: { url, candidate in addFoundSubtitles(url, candidate) })
+        case .speed:
+            List {
+                Section {
+                    ForEach(PlaybackRates.all) { option in
+                        checkRow(option.title, selected: abs(option.value - model.rate) < 0.01) {
+                            model.setRate(option.value)
+                            if savePlayerSettings { savedRate = Double(option.value) }
+                            popOptions()
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Скорость")
+        case .aspect:
+            List {
+                Section {
+                    ForEach(AspectMode.allCases) { mode in
+                        checkRow(mode.title, selected: mode == model.aspect) {
+                            model.setAspect(mode)
+                            if savePlayerSettings { savedAspect = mode.rawValue }
+                            popOptions()
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Пропорции")
+        case .sync:
+            List {
+                Section {
+                    delayRow("Звук", value: model.audioDelayMs, step: 100) { model.setAudioDelay(ms: $0) }
+                    if model.subtitleTracks.count > 1 {
+                        delayRow("Субтитры", value: model.subtitleDelayMs, step: 500) { model.setSubtitleDelay(ms: $0) }
+                    }
+                } footer: {
+                    Text("Голос не совпадает с губами — сдвиньте звук: «+» — позже, «−» — раньше. Сдвиг действует до закрытия плеера.")
+                }
+            }
+            .navigationTitle("Синхронизация")
+        case .sleep:
+            List {
+                Section {
+                    ForEach(SleepChoice.allCases.filter { !request.isLive || $0 != .endOfVideo }) { choice in
+                        checkRow(choice.title, selected: sleepChoice == choice) {
+                            setSleepTimer(choice)
+                            popOptions()
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Таймер сна")
+        case .download:
+            if let h = hash {
+                PlayerDownloadPage(hash: h, current: currentFile,
+                                   isSeries: request.item?.kind == .series || files.count > 1,
+                                   season: releaseSeason ?? wantedSeason,
+                                   seasonFiles: seasonFilesForDownload,
+                                   allVideos: files) { selection in
+                    enqueueDownload(selection)
+                }
+            }
+        case .torrent:
+            if let h = hash {
+                List { TorrentStatsSection(hash: h) }
+                    .navigationTitle("Торрент")
+            }
+        }
+    }
+
+    private var audioPage: some View {
+        List {
+            Section {
+                if model.audioTracks.isEmpty {
+                    Text("Дорожки появятся после начала воспроизведения")
+                        .foregroundStyle(Theme.secondary)
+                }
+                ForEach(model.audioTracks) { track in
+                    checkRow(track.name, selected: track.id == model.currentAudio) {
+                        selectAudio(track, remember: true)
+                        popOptions()
+                    }
+                }
+            }
+            if !externalAudio.isEmpty {
+                Section {
+                    ForEach(externalAudio) { file in
+                        checkRow(audioTitle(file), selected: addedAudio.contains(file.id)) {
+                            addExternalAudio(file)
+                        }
+                    }
+                } header: {
+                    Text("Внешние озвучки")
+                } footer: {
+                    Text("Отдельные дорожки из раздачи. После подключения выберите её выше, если она не включилась сама.")
+                }
+            }
+        }
+        .navigationTitle("Озвучка")
+    }
+
+    private var subtitlesPage: some View {
+        List {
+            Section {
+                if model.subtitleTracks.isEmpty {
+                    Text("В видео нет субтитров")
+                        .foregroundStyle(Theme.secondary)
+                }
+                ForEach(model.subtitleTracks) { track in
+                    checkRow(track.name, selected: track.id == model.currentSubtitle) {
+                        selectSubtitle(track, remember: true)
+                        popOptions()
+                    }
+                }
+            }
+            if !request.isLive {
+                Section {
+                    NavigationLink(value: OptionsPage.subtitleSearch) {
+                        optionLabel("Найти в интернете", icon: "magnifyingglass", value: nil)
+                    }
+                } footer: {
+                    Text("OpenSubtitles.com: субтитры под этот файл на языке из настроек.")
+                }
+            }
+            if model.subtitleTracks.count > 1 {
+                Section("Сдвиг") {
+                    delayRow("Субтитры", value: model.subtitleDelayMs, step: 500) { model.setSubtitleDelay(ms: $0) }
+                }
+            }
+        }
+        .navigationTitle("Субтитры")
+    }
+
+    private var seasonFilesForDownload: [TorrentFile] {
+        guard request.item?.kind == .series || files.count > 1,
+              let season = releaseSeason ?? wantedSeason else { return [] }
+        return DownloadSelection.files(allFiles, isSeries: true, season: season, episode: nil)
+    }
+
+    private func enqueueDownload(_ selection: [TorrentFile]) {
+        guard let h = hash, !selection.isEmpty else { return }
+        let count = DownloadManager.shared.enqueue(files: selection, all: allFiles, hash: h, link: link,
+                                                   title: request.item?.title ?? request.title,
+                                                   item: request.item, itemKey: request.itemKey,
+                                                   season: releaseSeason ?? wantedSeason)
+        showOptions = false
+        showNotice(count > 0 ? "Добавлено в загрузки: \(count)" : "Уже в загрузках")
+    }
+
+    // MARK: - Subtitles from the internet
+
+    private func subtitleQuery() async -> SubtitleService.Query {
+        let item = request.item
+        var query = SubtitleService.Query(title: item?.title ?? request.title, originalTitle: item?.originalTitle,
+                                          year: item?.year, imdbId: nil, isSeries: item?.kind == .series,
+                                          season: nil, episode: nil, movieHash: nil, releaseName: currentFile?.name)
+        if query.isSeries, let identity = episodeIdentity(currentFile) {
+            query.season = identity.season
+            query.episode = identity.episode
+        }
+        if let id = item?.id, id > 0 {
+            let lookup = Task { try await KPClient.shared.film(id).imdbId }
+            if case .success(let imdb)? = await TaskWait.result(of: lookup, within: 6) {
+                query.imdbId = imdb
+            }
+        }
+        if let url = streamURL, let file = currentFile {
+            query.movieHash = await SubtitleService.movieHash(of: url, size: file.length)
+        }
+        return query
+    }
+
+    private func addFoundSubtitles(_ url: URL, _ candidate: SubtitleCandidate) {
+        model.addSubtitleSlave(url, select: true)
+        showOptions = false
+        showNotice("Субтитры подключены: " + SubtitleService.languageTitle(candidate.language).lowercased())
+        AppDiagnostics.shared.log("subtitles", "Подключены найденные субтитры \(candidate.language)")
+    }
+
+    /// A foreign film without a Russian dub or subtitles gets subtitles from OpenSubtitles (a setting).
+    private func scheduleAutoSubtitles() {
+        guard subtitleAuto, !openSubtitlesKey.trimmed.isEmpty, !request.isLive, !streamKey.isEmpty,
+              !autoSubtitleTried.contains(streamKey) else { return }
+        let key = streamKey
+        Task { @MainActor in
+            // The tracks of the stream are known a few seconds after the start.
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            guard !closing, streamKey == key, model.started, !autoSubtitleTried.contains(key) else { return }
+            model.refreshTracks()
+            let audio = model.audioTracks.map(\.name)
+            let subtitles = model.subtitleTracks.filter { $0.id >= 0 }.map(\.name)
+            guard TrackLanguage.needsSubtitles(audio: audio, subtitles: subtitles) else { return }
+            autoSubtitleTried.insert(key)
+            do {
+                let query = await subtitleQuery()
+                let found = try await SubtitleService.shared.search(query)
+                guard let best = found.first(where: { !$0.machineTranslated }) ?? found.first,
+                      streamKey == key, !closing else { return }
+                let url = try await SubtitleService.shared.download(best)
+                guard streamKey == key, !closing else { return }
+                model.addSubtitleSlave(url, select: true)
+                showNotice("Включены субтитры: " + SubtitleService.languageTitle(best.language).lowercased())
+            } catch {
+                AppDiagnostics.shared.log("subtitles", "Автопоиск субтитров: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    // MARK: - Lock and Picture in Picture
+
+    private func lockControls() {
+        hideToken += 1
+        controlsLocked = true
+        withAnimation(.easeInOut(duration: 0.2)) { showControls = false }
+        OrientationLock.lockCurrent()
+        showLockHint()
+    }
+
+    private func unlockControls() {
+        controlsLocked = false
+        lockHintToken += 1
+        lockHintVisible = false
+        OrientationLock.unlock()
+        bumpControls()
+    }
+
+    private func showLockHint() {
+        lockHintToken += 1
+        let token = lockHintToken
+        withAnimation(.easeInOut(duration: 0.2)) { lockHintVisible = true }
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard token == lockHintToken else { return }
+            withAnimation(.easeInOut(duration: 0.3)) { lockHintVisible = false }
+        }
+    }
+
+    /// Shown for a moment after a tap on the locked screen: the lock in the middle unlocks.
+    private var lockOverlay: some View {
+        VStack(spacing: 14) {
+            Spacer()
+            Button {
+                unlockControls()
+            } label: {
+                Image(systemName: "lock.fill")
+                    .font(.system(size: 30, weight: .semibold))
+                    .frame(width: 80, height: 80)
+            }
+            .glassButton(Circle())
+            .accessibilityLabel("Разблокировать")
+            VStack(spacing: 4) {
+                Text("Экран заблокирован")
+                    .font(.headline)
+                Text("Нажмите на замок, чтобы разблокировать")
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(0.8))
+            }
+            .shadow(color: .black.opacity(0.6), radius: 4)
+            Spacer()
+            if !request.isLive, model.lengthMs > 0 {
+                Text("\(TimeFormat.string(ms: model.timeMs)) / \(TimeFormat.string(ms: model.lengthMs))")
+                    .font(.caption.monospacedDigit())
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .glassSurface(Capsule())
+                    .padding(.bottom, 18)
+            }
+        }
+        .foregroundStyle(.white)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var pipButton: some View {
+        Button {
+            togglePictureInPicture()
+        } label: {
+            ZStack {
+                if model.preparingPiP {
+                    ProgressView()
+                        .tint(.white)
+                } else {
+                    Image(systemName: model.pipActive ? "pip.exit" : "pip.enter")
+                }
+            }
+            .frame(width: 44, height: 44)
+            .contentShape(Rectangle())
+        }
+        .disabled(phase != .playing)
+        .accessibilityLabel("Картинка в картинке")
+    }
+
+    private func togglePictureInPicture() {
+        if model.pipActive {
+            model.exitPictureInPicture()
+        } else if !model.preparingPiP {
+            if model.renderMode == .native { showNotice("Готовим картинку в картинке…") }
+            model.enterPictureInPicture()
+        }
+        bumpControls()
+    }
+
+    /// The video went to the floating window: the app is usable meanwhile.
+    private func pictureInPictureStarted() {
+        // Started by iOS when the app was closed: the player stays as it is.
+        guard !model.pipStartedAutomatically else { return }
+        showOptions = false
+        showFiles = false
+        showQuality = false
+        if controlsLocked { unlockControls() }
+        OrientationLock.unlock()
+        coordinator.minimized = true
+        if OrientationHelper.isPhone { OrientationHelper.set(landscape: false) }
+    }
+
+    /// The button of the floating window that brings the video back to the player.
+    private func restoreFromPictureInPicture() {
+        let wasMinimized = coordinator.minimized
+        coordinator.minimized = false
+        if wasMinimized, OrientationHelper.isPhone { OrientationHelper.set(landscape: true) }
+        bumpControls()
+    }
+
+    /// The cross of the floating window.
+    private func pictureInPictureClosed() {
+        if coordinator.minimized {
+            close()
+        } else {
+            model.pause()
+        }
+    }
+
+    private func enteredBackgroundWithoutWindow() {
+        if backgroundAudio && phase == .playing {
+            // Keep the sound playing (lock screen, other apps); the picture is not needed.
+            model.setVideoEnabled(false)
+        } else {
+            model.pause()
+        }
     }
 
     private var qualitySheet: some View {

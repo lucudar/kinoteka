@@ -1,6 +1,6 @@
 import Foundation
 
-struct TorrentFile: Identifiable, Hashable {
+struct TorrentFile: Identifiable, Hashable, Codable {
     let id: Int
     let path: String
     let length: Int64
@@ -10,6 +10,8 @@ struct TorrentFile: Identifiable, Hashable {
     var ext: String { (path as NSString).pathExtension.lowercased() }
     var isVideo: Bool { TorrentFile.videoExtensions.contains(ext) }
     var sizeText: String { ByteCountFormatter.string(fromByteCount: length, countStyle: .file) }
+
+    private enum CodingKeys: String, CodingKey { case id, path, length }
 
     static let videoExtensions: Set<String> = [
         "mkv", "mp4", "m4v", "avi", "mov", "ts", "m2ts", "mts", "wmv", "flv", "webm",

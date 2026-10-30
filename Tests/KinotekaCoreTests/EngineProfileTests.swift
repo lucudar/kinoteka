@@ -25,11 +25,11 @@ final class EngineProfileTests: XCTestCase {
         XCTAssertEqual(profile.kind, .fast)
         XCTAssertEqual(profile.cacheBytes, 2 * gb)
         XCTAssertTrue(profile.useDisk)
-        XCTAssertEqual(profile.connections, 60)
+        XCTAssertEqual(profile.connections, 100)
         XCTAssertTrue(profile.utp)
         XCTAssertFalse(profile.forceEncrypt)
         XCTAssertEqual(profile.uploadLimit, 0)
-        XCTAssertEqual(profile.warmupHead, 8 << 20)
+        XCTAssertEqual(profile.warmupHead, 16 << 20)
         XCTAssertEqual(profile.warmupTail, 4 << 20)
     }
 
@@ -38,7 +38,7 @@ final class EngineProfileTests: XCTestCase {
         XCTAssertEqual(profile.kind, .mobile)
         XCTAssertEqual(profile.cacheBytes, 256 << 20)
         XCTAssertTrue(profile.useDisk)
-        XCTAssertEqual(profile.connections, 40)
+        XCTAssertEqual(profile.connections, 60)
         XCTAssertFalse(profile.utp)
         XCTAssertFalse(profile.forceEncrypt)
         XCTAssertEqual(profile.uploadLimit, 100)
@@ -57,6 +57,7 @@ final class EngineProfileTests: XCTestCase {
             XCTAssertEqual(settings["DisableUPNP"], .bool(true))
             XCTAssertEqual(settings["PeersListenPort"], .int(0))
             XCTAssertEqual(settings["ForceEncrypt"], .bool(false))
+            XCTAssertEqual(settings["DefaultTrackers"], .string(EngineProfile.trackers.joined(separator: "\n")))
         }
     }
 
@@ -75,7 +76,7 @@ final class EngineProfileTests: XCTestCase {
         XCTAssertEqual(profile.cacheBytes, 128 << 20)
         XCTAssertEqual(profile.warmupHead, 0)
         XCTAssertEqual(profile.warmupTail, 0)
-        XCTAssertEqual(profile.connections, 25)
+        XCTAssertEqual(profile.connections, 30)
     }
 
     func testLittleFreeSpaceKeepsTheCacheInMemory() {
@@ -110,8 +111,8 @@ final class EngineProfileTests: XCTestCase {
         let current = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
         let profile = EngineProfile.make(env(.wifi))
         XCTAssertEqual(profile.changes(from: current),
-                       ["CacheSize", "ConnectionsLimit", "DisableUPNP", "RemoveCacheOnDrop", "TorrentDisconnectTimeout",
-                        "TorrentsSavePath", "UseDisk"])
+                       ["CacheSize", "ConnectionsLimit", "DefaultTrackers", "DisableUPNP", "RemoveCacheOnDrop",
+                        "TorrentDisconnectTimeout", "TorrentsSavePath", "UseDisk"])
 
         // What the engine stores and returns after the change.
         let merged = profile.merged(into: current)

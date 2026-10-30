@@ -24,7 +24,7 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 60
     env:
-      TORRSERVER_TAG: MatriX.147.1
+      TORRSERVER_TAG: MatriX.147.2
       HOMEBREW_NO_AUTO_UPDATE: "1"
       HOMEBREW_NO_INSTALL_CLEANUP: "1"
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -57,17 +57,60 @@ jobs:
       - name: Install XcodeGen
         run: brew install xcodegen 2>&1 | tee -a steps.log
 
-      - name: Download TorrServerKit
+      # The engine is built from the TorrServer sources with the changes of Config/engine (faster
+      # connecting to peers, the torrent library of the desktop TorrServer); kept in the cache
+      # until the tag or these files change.
+      - name: Restore the engine
+        id: engine-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: Frameworks/TorrServerKit.xcframework
+          key: engine-${{ env.TORRSERVER_TAG }}-${{ hashFiles('Config/engine/**') }}
+
+      - uses: actions/setup-go@v5
+        if: steps.engine-cache.outputs.cache-hit != 'true'
+        with:
+          go-version: '1.26.x'
+          cache: false
+
+      - name: Build the engine
+        id: engine-build
+        if: steps.engine-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        timeout-minutes: 25
         run: |
-          {
-            curl -fsSL -o tsk.zip "https://github.com/YouROK/TorrServer/releases/download/${TORRSERVER_TAG}/TorrServer-ios-TorrServerKit.xcframework.zip"
-            mkdir -p Frameworks
-            unzip -q -o tsk.zip -d Frameworks
-            ls Frameworks
-          } 2>&1 | tee -a steps.log
+          set -o pipefail
+          bash Config/engine/build-engine.sh 2>&1 | tee -a steps.log | tail -60
+
+      - name: Save the engine
+        if: steps.engine-build.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: Frameworks/TorrServerKit.xcframework
+          key: ${{ steps.engine-cache.outputs.cache-primary-key }}
+
+      - name: Engine
+        run: |
+          if [ "${{ steps.engine-cache.outputs.cache-hit }}" = "true" ] || [ "${{ steps.engine-build.outcome }}" = "success" ]; then
+            echo "ENGINE_INFO=движок ${TORRSERVER_TAG} с правками Кинотеки" >> "$GITHUB_ENV"
+          else
+            # The build of the engine failed: the app gets the standard one of the release.
+            {
+              rm -rf Frameworks/TorrServerKit.xcframework
+              curl -fsSL -o tsk.zip "https://github.com/YouROK/TorrServer/releases/download/${TORRSERVER_TAG}/TorrServer-ios-TorrServerKit.xcframework.zip"
+              mkdir -p Frameworks
+              unzip -q -o tsk.zip -d Frameworks
+            } 2>&1 | tee -a steps.log
+            echo "ENGINE_INFO=стандартный движок ${TORRSERVER_TAG} (сборка с правками не удалась)" >> "$GITHUB_ENV"
+          fi
+          ls Frameworks Frameworks/TorrServerKit.xcframework 2>&1 | tee -a steps.log
 
       - name: App icon
-        run: base64 -D -i Config/AppIcon.png.b64 -o Sources/Assets.xcassets/AppIcon.appiconset/AppIcon.png 2>&1 | tee -a steps.log
+        # Stored as base64 text; the dark and tinted variants are used on iOS 18 and newer.
+        run: |
+          for name in AppIcon AppIcon-Dark AppIcon-Tinted; do
+            base64 -D -i "Config/$name.png.b64" -o "Sources/Assets.xcassets/AppIcon.appiconset/$name.png"
+          done 2>&1 | tee -a steps.log
 
       - name: Generate Xcode project
         run: xcodegen generate 2>&1 | tee -a steps.log
@@ -125,16 +168,16 @@ jobs:
             gh release create "$TAG" $FILES \
               --target "$GITHUB_SHA" \
               --title "Кинотека — сборка ${{ github.run_number }}" \
-              --notes "Коммит ${GITHUB_SHA::7}, ${XCODE_INFO}, движок ${TORRSERVER_TAG}. Файл Kinoteka.ipa ставится на iPhone через Sideloadly (см. README)." \
+              --notes "Коммит ${GITHUB_SHA::7}, ${XCODE_INFO}, ${ENGINE_INFO}. Файл Kinoteka.ipa ставится на iPhone через Sideloadly (см. README)." \
               --latest
           else
             gh release create "$TAG" $FILES \
               --target "$GITHUB_SHA" \
               --title "Кинотека — тестовая сборка ${{ github.run_number }} ($GITHUB_REF_NAME)" \
-              --notes "Тестовая сборка из ветки $GITHUB_REF_NAME, коммит ${GITHUB_SHA::7}, ${XCODE_INFO}, движок ${TORRSERVER_TAG}. Основные сборки — из main." \
+              --notes "Тестовая сборка из ветки $GITHUB_REF_NAME, коммит ${GITHUB_SHA::7}, ${XCODE_INFO}, ${ENGINE_INFO}. Основные сборки — из main." \
               --prerelease --latest=false
           fi
-          gh issue comment "$STATUS_ISSUE" --body "✅ Сборка №${{ github.run_number }} ($GITHUB_REF_NAME, ${XCODE_INFO}) готова: ${{ github.server_url }}/${{ github.repository }}/releases/tag/$TAG" || true
+          gh issue comment "$STATUS_ISSUE" --body "✅ Сборка №${{ github.run_number }} ($GITHUB_REF_NAME, ${XCODE_INFO}, ${ENGINE_INFO}) готова: ${{ github.server_url }}/${{ github.repository }}/releases/tag/$TAG" || true
 
       - uses: actions/upload-artifact@v4
         if: failure()
