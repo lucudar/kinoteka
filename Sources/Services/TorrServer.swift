@@ -72,10 +72,16 @@ enum TorrServerError: LocalizedError {
         case .server(let text):
             return text.isEmpty ? "Торрент-движок вернул ошибку." : "Торрент-движок: \(text)"
         case .timeout:
-            return "Не удалось получить данные торрента: нет пиров или ссылка неверна."
+            return "Не удалось получить данные торрента: найденные пиры их не отдают или пиров нет. Повторная попытка продолжит поиск с уже найденными пирами."
         case .noVideo:
             return "В торренте нет видеофайлов."
         }
+    }
+
+    /// No peer has sent the torrent data (the file list) in time.
+    var isTimeout: Bool {
+        if case .timeout = self { return true }
+        return false
     }
 
     /// The engine has no torrent client: it did not reconnect after its settings were saved.
@@ -224,6 +230,24 @@ final class TorrServer {
         start()
         Task.detached(priority: .utility) {
             try? await self.ensureRunning()
+            // For the diagnostics: the engine built with the changes of Kinoteka ends with "-kinoteka".
+            if let version = await self.version() {
+                AppDiagnostics.shared.log("torrent", "Движок \(version)")
+            }
+        }
+    }
+
+    /// The version the engine reports.
+    func version() async -> String? {
+        guard let url = URL(string: base + "/echo") else { return nil }
+        var request = URLRequest(url: url, timeoutInterval: 3)
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        do {
+            let (data, response) = try await session.data(for: request)
+            guard (response as? HTTPURLResponse)?.statusCode == 200 else { return nil }
+            return String(data: data, encoding: .utf8)?.trimmed.nonEmpty
+        } catch {
+            return nil
         }
     }
 

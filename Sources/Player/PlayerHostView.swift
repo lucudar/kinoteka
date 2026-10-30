@@ -103,6 +103,13 @@ struct PlayerHostView: View {
     @State private var resolveTask: Task<Void, Never>?
     @State private var attemptedLinks: Set<String> = []
     @State private var fallbackCount = 0
+    /// Other releases of the film searched for their torrent data (the file list) at the same time
+    /// as the one that opens, by hash: the first one whose peers send it plays.
+    @State private var racers: [String: TorrentRelease] = [:]
+    /// Racers being added now (the engine has not answered yet).
+    @State private var racersPending = 0
+    /// Changes when the racers are closed: a racer added after that is not needed.
+    @State private var racingGeneration = 0
     @State private var attemptStartedAt = Date()
     @State private var playbackBeganAt = Date.distantPast
     @State private var playbackSuccessRecorded = false
@@ -166,6 +173,8 @@ struct PlayerHostView: View {
 
     private static let audioExtensions: Set<String> = ["mka", "ac3", "eac3", "dts", "aac", "mp3", "flac", "ogg", "opus", "m4a", "wav"]
     private static let subtitleExtensions: Set<String> = ["srt", "ass", "ssa", "vtt", "sub", "smi"]
+    /// At most this many other releases are searched at the same time as the one that opens.
+    private static let maxRacers = 2
 
     var body: some View {
         systemObservers(playbackObservers(screen))
@@ -365,8 +374,15 @@ struct PlayerHostView: View {
                 return
             } catch {
                 if Task.isCancelled || closing { return }
-                PlaybackLearning.shared.recordFailure(release)
+                // The release that plays now: another one may have given its data first meanwhile.
+                PlaybackLearning.shared.recordFailure(self.release(matching: link) ?? release)
                 AppDiagnostics.shared.log("player", "Запуск не удался: \(error.localizedDescription)")
+                // Waiting for the torrent data has tried other releases at the same time already;
+                // they stay connected, so "Повторить" goes on with the peers found.
+                if (error as? TorrServerError)?.isTimeout == true, automaticFallback, canSwitchRelease {
+                    phase = .failed(error.localizedDescription)
+                    return
+                }
                 guard await selectAutomaticFallback(preferLowerQuality: false) else {
                     phase = .failed(error.localizedDescription)
                     return
@@ -416,15 +432,12 @@ struct PlayerHostView: View {
         engineAttached = true
         // Torrents that are not needed now (played before, prepared for another film) are freed.
         TorrentWarmup.shared.playbackStarted(hash: h)
-        let timeout: TimeInterval = automaticFallback && canSwitchRelease ? (fallbackCount == 0 ? 10 : 18) : 120
         let all: [TorrentFile]
         if !status.files.isEmpty {
             all = status.files
+            closeRacers(keeping: h)
         } else {
-            all = try await TorrServer.shared.waitForFiles(hash: h, timeout: timeout) { s in
-                statusText = "Подключение к пирам…"
-                detailText = s.peersText
-            }
+            all = try await waitForMetadata(of: h, link: torrent)
         }
         try Task.checkCancellation()
         allFiles = all
@@ -480,6 +493,165 @@ struct PlayerHostView: View {
             return match
         }
         return alternatives.first { canonicalLink($0.link) == key }
+    }
+
+    /// Waits for the torrent data (the file list) of `primary`, which only peers send for a magnet
+    /// link. Peers of Zona's apps never send it, and some releases have almost only them, so when
+    /// it does not come soon, other releases of the film are added at the same time and the first
+    /// one with the data plays. Nothing is dropped while waiting: every torrent keeps the peers it
+    /// has found, the way a second tap on "Повторить" did before.
+    private func waitForMetadata(of primary: String, link torrent: String) async throws -> [TorrentFile] {
+        let racing = automaticFallback && canSwitchRelease
+        // With other releases the wait ends sooner: they have been tried at the same time.
+        let budget: TimeInterval = racing ? 75 : 120
+        let started = Date()
+        let primaryKey = primary.lowercased()
+        var nextRacerAt: TimeInterval = racers.isEmpty ? 8 : 10
+        var crowdChecked = false
+        var readded = false
+        var tick = 0
+        while !Task.isCancelled && !closing {
+            let elapsed = Date().timeIntervalSince(started)
+            let status: TSStatus
+            do {
+                status = try await TorrServer.shared.get(hash: primary)
+            } catch {
+                if Task.isCancelled { throw CancellationError() }
+                guard !readded else { throw error }
+                // The engine has closed the torrent meanwhile (it waits for the data for minutes,
+                // or it was restarted): it is added again.
+                readded = true
+                AppDiagnostics.shared.log("torrent", "Раздача закрыта движком, добавляем снова: \(error.localizedDescription)")
+                status = try await TorrServer.shared.add(link: torrent, title: request.item?.title ?? request.title,
+                                                         poster: request.item?.posterURL)
+            }
+            try Task.checkCancellation()
+            if !status.files.isEmpty {
+                if elapsed > 5 {
+                    AppDiagnostics.shared.log("torrent", "Данные торрента получены за \(Int(elapsed)) с")
+                }
+                closeRacers(keeping: primary)
+                return status.files
+            }
+            var active = status.activePeers ?? 0
+            var total = status.totalPeers ?? 0
+            for (racerHash, racerRelease) in racers where racerHash != primaryKey {
+                do {
+                    let racer = try await TorrServer.shared.get(hash: racerHash)
+                    try Task.checkCancellation()
+                    if !racer.files.isEmpty {
+                        if let episode = wantedEpisode,
+                           EpisodeMatcher.find(in: videoFiles(racer.files), season: wantedSeason, episode: episode) == nil {
+                            // It has no such episode: the others go on.
+                            AppDiagnostics.shared.log("fallback", "В другой раздаче нет нужной серии: \(racerRelease.qualityText)")
+                            racers[racerHash] = nil
+                            Task { await TorrServer.shared.drop(hash: racerHash) }
+                            continue
+                        }
+                        adoptRacer(racerRelease, hash: racerHash, elapsed: elapsed)
+                        return racer.files
+                    }
+                    active += racer.activePeers ?? 0
+                    total += racer.totalPeers ?? 0
+                } catch {
+                    if Task.isCancelled { throw CancellationError() }
+                    // The engine has closed it: the others go on.
+                    racers[racerHash] = nil
+                }
+            }
+            let searched = 1 + racers.count
+            statusText = elapsed < 15 ? "Подключение к пирам…" : "Ищем пиров с данными торрента…"
+            detailText = "Пиры: \(active) из \(total)" + (searched > 1 ? " · раздач: \(searched)" : "")
+            if elapsed >= budget {
+                AppDiagnostics.shared.log("torrent", "Данные торрента не получены за \(Int(budget)) с: пиры \(active) из \(total), раздач \(searched)")
+                throw TorrServerError.timeout
+            }
+
+            // Many peers connected and still no data: most likely Zona's apps, another release
+            // is added at once instead of waiting.
+            let crowdedButSilent = !crowdChecked && elapsed >= 4 && (status.activePeers ?? 0) >= 6
+            if racing, alternativesLoaded, elapsed >= nextRacerAt || crowdedButSilent,
+               racers.count + racersPending < PlayerHostView.maxRacers {
+                if crowdedButSilent { crowdChecked = true }
+                addRacer(besides: primaryKey, reason: crowdedButSilent
+                         ? "пиров \(status.activePeers ?? 0), данных нет"
+                         : "нет данных \(Int(elapsed)) с")
+                nextRacerAt = elapsed + 10
+            }
+            tick += 1
+            try await Task.sleep(nanoseconds: tick < 20 ? 250_000_000 : 500_000_000)
+        }
+        throw CancellationError()
+    }
+
+    /// Adds the next best release of the film to the engine, to wait for its torrent data at the
+    /// same time. The engine is not waited for here: the torrents being searched are checked on.
+    private func addRacer(besides primary: String, reason: String) {
+        let taken = Set(racers.keys).union([primary])
+        let racing = Set(racers.values.map { canonicalLink($0.link) })
+        let candidates = PlaybackLearning.shared.candidates(alternatives,
+                                                             preferred: effectivePreferredQuality,
+                                                             season: releaseSeason,
+                                                             voice: desiredVoice)
+        guard let next = candidates.first(where: { candidate in
+            let key = canonicalLink(candidate.link)
+            if attemptedLinks.contains(key) || racing.contains(key) { return false }
+            if let other = candidate.hash?.lowercased(), taken.contains(other) { return false }
+            return true
+        }) else { return }
+        attemptedLinks.insert(canonicalLink(next.link))
+        racersPending += 1
+        let generation = racingGeneration
+        let raw = LinkInspector.stripMarker(next.link)
+        let title = request.item?.title ?? request.title
+        let poster = request.item?.posterURL
+        AppDiagnostics.shared.log("fallback", "Параллельно ищем другую раздачу (\(reason)): \(next.qualityText), сиды \(next.seeders)")
+        Task { @MainActor in
+            let status = try? await TorrServer.shared.add(link: raw, title: title, poster: poster, saveToDB: false)
+            if generation == racingGeneration { racersPending = max(0, racersPending - 1) }
+            guard let added = status?.hash?.lowercased(), !added.isEmpty else { return }
+            guard generation == racingGeneration, !closing else {
+                // The search has ended meanwhile: this torrent is not needed.
+                if added != hash?.lowercased() { await TorrServer.shared.drop(hash: added) }
+                return
+            }
+            if !taken.contains(added) { racers[added] = next }
+        }
+    }
+
+    /// Another release has got its torrent data first: it plays instead of the one that opened.
+    private func adoptRacer(_ winner: TorrentRelease, hash winnerHash: String, elapsed: TimeInterval) {
+        // A short wait is no fault of the release that opened.
+        if elapsed >= 10 { PlaybackLearning.shared.recordFailure(release(matching: link)) }
+        link = LinkInspector.markTorrent(winner.link)
+        attemptedLinks.insert(canonicalLink(link))
+        hash = winnerHash
+        wantedFileId = nil
+        fallbackCount += 1
+        racers[winnerHash] = nil
+        if let key = request.itemKey { library.addSource(SavedSource(release: winner), for: key) }
+        // The release that opened is disconnected, so this one gets all the bandwidth.
+        TorrentWarmup.shared.playbackStarted(hash: winnerHash)
+        closeRacers(keeping: winnerHash)
+        AppDiagnostics.shared.log("fallback", "Данные торрента первой дала другая раздача за \(Int(elapsed)) с: \(winner.qualityText), сиды \(winner.seeders)")
+        // Saved to the engine's database too, like the release that opens: next time it starts at once.
+        let raw = LinkInspector.stripMarker(winner.link)
+        let title = request.item?.title ?? request.title
+        let poster = request.item?.posterURL
+        Task { _ = try? await TorrServer.shared.add(link: raw, title: title, poster: poster) }
+    }
+
+    /// Disconnects the releases searched at the same time, except `keeping`.
+    private func closeRacers(keeping: String? = nil) {
+        racingGeneration += 1
+        racersPending = 0
+        guard !racers.isEmpty else { return }
+        let keep = keeping?.lowercased()
+        let unused = racers.keys.filter { $0 != keep && $0 != hash?.lowercased() }
+        racers = [:]
+        for old in unused {
+            Task { await TorrServer.shared.drop(hash: old) }
+        }
     }
 
     /// Picks the next learned, live release. After repeated stalls it first tries
@@ -616,6 +788,7 @@ struct PlayerHostView: View {
     private func start(url: URL, slaves: [(URL, VLCMediaPlaybackSlaveType)], startAt: Int32? = nil) {
         streamURL = url
         phase = .playing
+        closeRacers(keeping: hash)
         // Downloads wait while a stream plays (a setting), a saved file does not need the network.
         DownloadManager.shared.playerStreaming = !url.isFileURL
         recoveryText = nil
@@ -953,6 +1126,7 @@ struct PlayerHostView: View {
             DownloadManager.shared.playerStreaming = false
             OrientationLock.unlock()
         }
+        closeRacers()
         // Always: a second tap on the cross must close the player even if the first one stopped it.
         coordinator.close(request.id)
     }
@@ -960,6 +1134,7 @@ struct PlayerHostView: View {
     private func finish() {
         resolveTask?.cancel()
         switchTask?.cancel()
+        closeRacers()
         recoveryTask?.cancel()
         startupWatchdogTask?.cancel()
         preloadTask?.cancel()
