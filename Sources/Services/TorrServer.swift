@@ -638,27 +638,8 @@ final class TorrServer {
         return comps?.url
     }
 
-    /// Reads a tiny range of the next episode so TorrServer starts requesting
-    /// its pieces before the current episode ends. Best effort only.
-    func prefetch(hash: String, file: TorrentFile, bytes: Int = 256 * 1024) async {
-        await waitForProfileTask()
-        guard bytes > 0, let url = streamURL(hash: hash, file: file) else { return }
-        var request = URLRequest(url: url, timeoutInterval: 6)
-        request.setValue("bytes=0-\(bytes - 1)", forHTTPHeaderField: "Range")
-        request.cachePolicy = .reloadIgnoringLocalCacheData
-        do {
-            let (_, response) = try await session.data(for: request)
-            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-            AppDiagnostics.shared.log("torrent", "Подготовлена следующая серия, HTTP \(code)")
-        } catch {
-            if !Task.isCancelled {
-                AppDiagnostics.shared.log("torrent", "Подготовка серии не удалась: \(error.localizedDescription)")
-            }
-        }
-    }
-
     /// Reads a range of the file through the engine, so it downloads those pieces now: the start
-    /// and the end of the film the open page will play. Returns the bytes read.
+    /// and the end of the film the open page or the player will play. Returns the bytes read.
     func readAhead(hash: String, file: TorrentFile, offset: Int64, length: Int64, idleTimeout: TimeInterval = 20) async -> Int64 {
         await waitForProfileTask()
         guard !Task.isCancelled, length > 0, offset >= 0, offset < file.length,

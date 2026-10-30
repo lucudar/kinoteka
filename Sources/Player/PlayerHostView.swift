@@ -565,8 +565,13 @@ struct PlayerHostView: View {
             return
         }
         guard let url = local ?? TorrServer.shared.streamURL(hash: h, file: file) else { return }
-        preloadTask?.cancel()
+        // The next episode read in advance goes on reading when it is the one that starts now.
+        if nextPreparedID != file.id { preloadTask?.cancel() }
         preloadTask = nil
+        if local == nil {
+            // The end of the file is downloaded while the player reads its start.
+            TorrentWarmup.shared.playbackWillStart(hash: h, file: file)
+        }
         nextPreparedID = nil
         showNextEpisodePrompt = false
         autoNextCancelled = false
@@ -629,7 +634,13 @@ struct PlayerHostView: View {
         var options: [String: Any] = [:]
         if let agent = request.userAgent { options["http-user-agent"] = agent }
         if let referrer = request.referrer { options["http-referrer"] = referrer }
-        if request.isLive { options["network-caching"] = 1500 }
+        if request.isLive {
+            options["network-caching"] = 1500
+        } else if engineAttached, !url.isFileURL, TorrServer.shared.activeProfile?.kind == .fast {
+            // On Wi‑Fi the engine already keeps a big buffer ahead of the playback: a shorter one
+            // in the player (3 s by default) starts the film and every seek sooner.
+            options["network-caching"] = 2000
+        }
         let rate: Float = (savePlayerSettings && !request.isLive) ? Float(savedRate) : 1
         let aspect: AspectMode = savePlayerSettings ? (AspectMode(rawValue: savedAspect) ?? .fit) : .fit
         model.load(url: url, startAt: position, options: options, rate: rate, aspect: aspect, slaves: slaves)
@@ -806,7 +817,7 @@ struct PlayerHostView: View {
         preloadTask?.cancel()
         preloadTask = Task {
             AppDiagnostics.shared.log("series", "Подготовка \(fileLabel(next))")
-            await TorrServer.shared.prefetch(hash: h, file: next)
+            await TorrentWarmup.shared.prepareNext(hash: h, file: next)
         }
     }
 

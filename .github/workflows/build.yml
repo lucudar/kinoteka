@@ -24,7 +24,7 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 60
     env:
-      TORRSERVER_TAG: MatriX.147.1
+      TORRSERVER_TAG: MatriX.147.2
       HOMEBREW_NO_AUTO_UPDATE: "1"
       HOMEBREW_NO_INSTALL_CLEANUP: "1"
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -67,7 +67,11 @@ jobs:
           } 2>&1 | tee -a steps.log
 
       - name: App icon
-        run: base64 -D -i Config/AppIcon.png.b64 -o Sources/Assets.xcassets/AppIcon.appiconset/AppIcon.png 2>&1 | tee -a steps.log
+        # Stored as base64 text; the dark and tinted variants are used on iOS 18 and newer.
+        run: |
+          for name in AppIcon AppIcon-Dark AppIcon-Tinted; do
+            base64 -D -i "Config/$name.png.b64" -o "Sources/Assets.xcassets/AppIcon.appiconset/$name.png"
+          done 2>&1 | tee -a steps.log
 
       - name: Generate Xcode project
         run: xcodegen generate 2>&1 | tee -a steps.log
