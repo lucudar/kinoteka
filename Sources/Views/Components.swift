@@ -343,6 +343,28 @@ struct MediaGrid: View {
     }
 }
 
+/// The sort button of a list of films: a menu of the orders; the icon is filled while the list
+/// is sorted.
+struct TitleOrderMenu: View {
+    @Binding var order: TitleOrder
+    var options: [TitleOrder] = TitleOrder.allCases
+    /// The name of the list's own order.
+    let originalTitle: String
+
+    var body: some View {
+        Menu {
+            Picker("Сортировка", selection: $order) {
+                ForEach(options) { option in
+                    Text(option.title(original: originalTitle)).tag(option)
+                }
+            }
+        } label: {
+            Image(systemName: order == .original ? "arrow.up.arrow.down.circle" : "arrow.up.arrow.down.circle.fill")
+        }
+        .accessibilityLabel("Сортировка")
+    }
+}
+
 struct SectionHeader: View {
     let title: String
     var body: some View {

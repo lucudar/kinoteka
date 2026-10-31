@@ -9,6 +9,8 @@ struct PersonView: View {
     @State private var groups: [PersonWorkGroup] = []
     @State private var selected: Int?
     @State private var error: String?
+    /// The films of each kind of work come the best rated first (`.original`) or by year.
+    @AppStorage(SettingsKeys.personOrder) private var order: TitleOrder = .original
 
     private let columns = [GridItem(.adaptive(minimum: 104, maximum: 180), spacing: 12, alignment: .top)]
 
@@ -45,6 +47,13 @@ struct PersonView: View {
         .background(Theme.background)
         .navigationTitle(displayName)
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            if !groups.isEmpty {
+                ToolbarItem(placement: .topBarTrailing) {
+                    TitleOrderMenu(order: $order, options: [.original, .newest, .oldest], originalTitle: "По рейтингу")
+                }
+            }
+        }
         .task(id: token) { await load() }
     }
 
@@ -130,7 +139,7 @@ struct PersonView: View {
 
     private var grid: some View {
         LazyVGrid(columns: columns, alignment: .leading, spacing: 16) {
-            ForEach(currentGroup?.entries ?? []) { entry in
+            ForEach(order.sorted(currentGroup?.entries ?? [], year: { $0.item.year }, rating: { $0.item.ratingKP })) { entry in
                 NavigationLink(value: entry.item) {
                     PosterCard(item: entry.item, caption: entry.caption)
                 }

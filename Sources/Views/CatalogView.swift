@@ -80,6 +80,20 @@ struct CatalogView: View {
             .navigationTitle(filter.type == "FILM" ? "Фильмы" : "Сериалы")
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
+                    Menu {
+                        // The server sorts the whole catalog.
+                        Picker("Сортировка", selection: $filter.order) {
+                            Text("По популярности").tag("NUM_VOTE")
+                            Text("По рейтингу").tag("RATING")
+                            Text("Сначала новые").tag("YEAR")
+                        }
+                    } label: {
+                        Image(systemName: filter.order == "NUM_VOTE" ? "arrow.up.arrow.down.circle" : "arrow.up.arrow.down.circle.fill")
+                    }
+                    .accessibilityLabel("Сортировка")
+                    .disabled(!catalogAvailable)
+                }
+                ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         showFilters = true
                     } label: {
@@ -130,7 +144,7 @@ struct CatalogView: View {
         var parts: [String] = []
         switch filter.order {
         case "RATING": parts.append("по рейтингу")
-        case "YEAR": parts.append("по дате выхода")
+        case "YEAR": parts.append("сначала новые")
         default: break
         }
         if filter.genreId != nil || filter.genreName != nil { parts.append(filter.genreName?.lowercased() ?? "жанр") }
@@ -192,7 +206,7 @@ struct FiltersView: View {
                     Picker("Сортировка", selection: $draft.order) {
                         Text("По популярности").tag("NUM_VOTE")
                         Text("По рейтингу").tag("RATING")
-                        Text("По дате выхода").tag("YEAR")
+                        Text("Сначала новые").tag("YEAR")
                     }
                     .pickerStyle(.inline)
                     .labelsHidden()

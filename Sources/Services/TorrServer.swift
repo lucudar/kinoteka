@@ -648,8 +648,9 @@ final class TorrServer {
         return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
     }
 
-    /// TorrServer closes every torrent, saves the settings and reconnects its torrent client
-    /// (several seconds, up to half a minute when its peer port is still busy), then answers.
+    /// TorrServer closes every torrent, saves the settings and reconnects its torrent client, then
+    /// answers: in tens of milliseconds (its fixed pauses of 3.5 s are removed in the engine build,
+    /// Config/engine/patch-server.py), up to half a minute when its peer port is still busy.
     private func saveSettings(_ sets: [String: Any], reason: String) async -> Bool {
         await TorrentWarmup.shared.engineWillReset()
         let started = Date()

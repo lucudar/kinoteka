@@ -453,32 +453,56 @@ struct CollectionRow: View {
 
 struct CollectionGridView: View {
     let section: HomeSection
+    @AppStorage(SettingsKeys.collectionOrder) private var order: TitleOrder = .original
     @State private var items: [MediaItem] = []
     @State private var page = 0
     @State private var totalPages = 1
     @State private var loading = false
     @State private var error: String?
 
+    /// Sorted by year or rating, the collection is shown whole: its pages (up to
+    /// `TitleOrder.collectionPages`) are loaded first.
+    private var loadedForSorting: Bool { page > 0 && page >= min(totalPages, TitleOrder.collectionPages) }
+
+    private var shownItems: [MediaItem] { order.sorted(items) }
+
     var body: some View {
         ScrollView {
-            MediaGrid(items: items) { item in
-                if item.id == items.last?.id {
-                    Task { await loadMore() }
+            if order != .original && !loadedForSorting && error == nil {
+                ProgressView("Загружаю подборку целиком…")
+                    .frame(maxWidth: .infinity)
+                    .padding(.top, 60)
+            } else {
+                MediaGrid(items: shownItems) { item in
+                    if order == .original, item.id == items.last?.id {
+                        Task { await loadMore() }
+                    }
+                }
+                .padding(.top, 8)
+                if loading {
+                    ProgressView().padding()
                 }
             }
-            .padding(.top, 8)
-            if loading {
-                ProgressView().padding()
-            }
             if let error = error {
-                ErrorView(message: error) { Task { await loadMore() } }
+                ErrorView(message: error) { Task { await load() } }
             }
         }
         .background(Theme.background)
         .navigationTitle(section.title)
         .navigationBarTitleDisplayMode(.inline)
-        .task {
-            if items.isEmpty { await loadMore() }
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                TitleOrderMenu(order: $order, originalTitle: "Как в подборке")
+            }
+        }
+        .task(id: order) { await load() }
+    }
+
+    private func load() async {
+        if order == .original {
+            if items.isEmpty || error != nil { await loadMore() }
+        } else {
+            await loadAll()
         }
     }
 
@@ -487,14 +511,45 @@ struct CollectionGridView: View {
         loading = true
         defer { loading = false }
         do {
-            let result = try await KPClient.shared.collection(section.id, page: page + 1)
-            let known = Set(items.map { $0.id })
-            items += result.items.filter { !known.contains($0.id) }
-            totalPages = result.totalPages
-            page += 1
+            append(try await KPClient.shared.collection(section.id, page: page + 1))
             error = nil
         } catch {
             if !Task.isCancelled { self.error = error.localizedDescription }
         }
+    }
+
+    /// The rest of the collection, a few pages at a time.
+    private func loadAll() async {
+        // A page requested by scrolling is awaited.
+        while loading {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            if Task.isCancelled { return }
+        }
+        error = nil
+        if page == 0 {
+            await loadMore()
+            guard error == nil, !Task.isCancelled else { return }
+        }
+        let last = min(totalPages, TitleOrder.collectionPages)
+        guard page < last else { return }
+        loading = true
+        defer { loading = false }
+        let id = section.id
+        let answer = await PagedLoad.pages((page + 1)...last) { number in
+            try await KPClient.shared.collection(id, page: number)
+        }
+        for result in answer.pages {
+            append(result)
+        }
+        if let failure = answer.error, !Task.isCancelled, !(failure is CancellationError) {
+            error = failure.localizedDescription
+        }
+    }
+
+    private func append(_ result: KPPage) {
+        let known = Set(items.map { $0.id })
+        items += result.items.filter { !known.contains($0.id) }
+        totalPages = result.totalPages
+        page += 1
     }
 }

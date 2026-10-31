@@ -45,6 +45,11 @@ enum SettingsKeys {
     static let subtitleAuto = "subtitleSearchAutomatic"
     static let openSubtitlesKey = "openSubtitlesApiKey"
     static let openSubtitlesUser = "openSubtitlesUsername"
+    /// The order chosen for the lists: collections ("Все"), search results, a person's films, the library.
+    static let collectionOrder = "collectionOrder"
+    static let searchOrder = "searchOrder"
+    static let personOrder = "personWorksOrder"
+    static let librarySort = "librarySort"
 }
 
 /// The screen stays on while something needs it: the player, downloads (a setting).

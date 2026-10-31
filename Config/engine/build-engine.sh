@@ -1,6 +1,6 @@
 #!/bin/bash
 # Builds Frameworks/TorrServerKit.xcframework, the embedded torrent engine, from the sources of
-# TorrServer $TORRSERVER_TAG the way its build-ios.sh does, with two changes for faster starts:
+# TorrServer $TORRSERVER_TAG the way its build-ios.sh does, with these changes:
 #
 # 1. The torrent library of the desktop TorrServer of the same tag (tsynik/torrent v1.2.34). The iOS
 #    kit of the tag pins v1.2.31, where a DHT search that comes back empty (started before the DHT
@@ -12,6 +12,10 @@
 # 3. The web server can be opened again inside the running engine (kinoteka-web.go, kinoteka-kit.go,
 #    patch-server.py): iOS takes the sockets of a suspended app, and the app calls Relisten when the
 #    engine runs but does not answer; a web server that fails is opened again by the engine itself.
+# 4. New settings are applied in tens of milliseconds instead of 3.5 s (patch-server.py): TorrServer
+#    paused for a second before and after reconnecting its torrent client, and 1.5 s more stopping
+#    the rutor search, which is off in the app. The app saves settings for another network and to
+#    reconnect a torrent client that lost its sockets, while a film waits to start.
 #
 # Needs macOS with Xcode, Go (the version of the go.mod of the tag) and python3.
 set -euo pipefail

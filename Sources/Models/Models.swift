@@ -33,6 +33,13 @@ struct MediaItem: Codable, Identifiable, Hashable {
     }
 }
 
+extension TitleOrder {
+    /// Films and series of a list in this order (by the rating of Kinopoisk, else of IMDb).
+    func sorted(_ items: [MediaItem]) -> [MediaItem] {
+        sorted(items, year: { $0.year }, rating: { $0.ratingKP ?? $0.ratingIMDb })
+    }
+}
+
 // MARK: - Flexible decoding helpers (Kinopoisk API mixes types between endpoints)
 
 struct AnyKey: CodingKey {
@@ -340,13 +347,16 @@ struct CatalogFilter: Equatable, Codable {
 
     var query: [(String, String)] {
         let d = Decade.byId(decade)
+        // Newest first, the titles announced for the next years would open the list: none of
+        // them can be watched yet.
+        let yearTo = order == "YEAR" ? max(d.from, min(d.to, Calendar.current.component(.year, from: Date()))) : d.to
         var q: [(String, String)] = [
             ("type", type),
             ("order", order),
             ("ratingFrom", String(ratingFrom)),
             ("ratingTo", "10"),
             ("yearFrom", String(d.from)),
-            ("yearTo", String(d.to))
+            ("yearTo", String(yearTo))
         ]
         if let g = genreId { q.append(("genres", String(g))) }
         if let c = countryId { q.append(("countries", String(c))) }

@@ -13,6 +13,7 @@ struct SearchView: View {
     @State private var error: String?
     @State private var kindFilter: MediaKind?
     @State private var path = NavigationPath()
+    @AppStorage(SettingsKeys.searchOrder) private var order: TitleOrder = .original
 
     private var trimmedQuery: String { query.trimmed }
 
@@ -22,9 +23,10 @@ struct SearchView: View {
         LiquidGlassSupport.isAvailable ? .automatic : .navigationBarDrawer(displayMode: .always)
     }
 
+    /// Sorted by year or rating, the first `TitleOrder.searchPages` pages are sorted together.
     private var visibleResults: [MediaItem] {
-        guard let kind = kindFilter else { return results }
-        return results.filter { $0.kind == kind }
+        guard let kind = kindFilter else { return order.sorted(results) }
+        return order.sorted(results.filter { $0.kind == kind })
     }
 
     var body: some View {
@@ -57,6 +59,16 @@ struct SearchView: View {
                 if Task.isCancelled { return }
                 await search(q)
             }
+            .onChange(of: order) { _, newOrder in
+                if newOrder != .original { Task { await loadForSorting() } }
+            }
+            .toolbar {
+                if trimmedQuery.count >= 2 && !results.isEmpty {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        TitleOrderMenu(order: $order, originalTitle: "По релевантности")
+                    }
+                }
+            }
             .navigationDestination(for: MediaItem.self) { DetailsView(item: $0) }
             .navigationDestination(for: PersonRoute.self) { PersonView(route: $0) }
         }
@@ -83,7 +95,8 @@ struct SearchView: View {
                 kindPicker
             }
             MediaGrid(items: visibleResults) { item in
-                if item.id == visibleResults.last?.id {
+                // Sorted results do not grow while scrolling: new ones would land in the middle.
+                if order == .original, item.id == visibleResults.last?.id {
                     Task { await loadMore() }
                 }
             }
@@ -171,9 +184,24 @@ struct SearchView: View {
         do {
             let result = try await KPClient.shared.search(q, page: 1)
             guard q == trimmedQuery else { return }
-            results = result.items
+            var found = result.items
+            var loaded = 1
+            let last = min(result.totalPages, TitleOrder.searchPages)
+            if order != .original, last > 1 {
+                // Sorted: the next pages come first, so the list does not change under the finger.
+                let answer = await PagedLoad.pages(2...last) { number in
+                    try await KPClient.shared.search(q, page: number)
+                }
+                guard q == trimmedQuery else { return }
+                for extra in answer.pages {
+                    let known = Set(found.map { $0.id })
+                    found += extra.items.filter { !known.contains($0.id) }
+                    loaded += 1
+                }
+            }
+            results = found
             totalPages = result.totalPages
-            page = 1
+            page = loaded
             searchedQuery = q
             error = nil
         } catch {
@@ -182,6 +210,28 @@ struct SearchView: View {
             results = []
             searchedQuery = q
             self.error = error.localizedDescription
+        }
+    }
+
+    /// The order was changed for the results shown: the next pages (up to `TitleOrder.searchPages`)
+    /// are added, so the first results are sorted together.
+    private func loadForSorting() async {
+        while loading {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        let q = searchedQuery
+        let last = min(totalPages, TitleOrder.searchPages)
+        guard order != .original, !q.isEmpty, q == trimmedQuery, page >= 1, page < last else { return }
+        loading = true
+        defer { loading = false }
+        let answer = await PagedLoad.pages((page + 1)...last) { number in
+            try await KPClient.shared.search(q, page: number)
+        }
+        guard q == trimmedQuery, q == searchedQuery else { return }
+        for extra in answer.pages {
+            let known = Set(results.map { $0.id })
+            results += extra.items.filter { !known.contains($0.id) }
+            page += 1
         }
     }
 

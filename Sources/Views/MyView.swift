@@ -18,16 +18,23 @@ enum LibraryListKind: Hashable {
 
 private enum LibrarySort: String, CaseIterable, Identifiable {
     case added
+    case newest
+    case oldest
     case title
-    case year
     case rating
 
     var id: String { rawValue }
-    var title: String {
+
+    func title(for kind: LibraryListKind) -> String {
         switch self {
-        case .added: return "Сначала новые"
+        case .added:
+            switch kind {
+            case .watched, .history: return "Недавно просмотренные"
+            case .favorites, .watchLater: return "Недавно добавленные"
+            }
+        case .newest: return "Сначала новые"
+        case .oldest: return "Сначала старые"
         case .title: return "По названию"
-        case .year: return "По году"
         case .rating: return "По рейтингу"
         }
     }
@@ -138,7 +145,7 @@ struct ItemsGridScreen: View {
     let kind: LibraryListKind
     @State private var confirmClear = false
     @State private var searchText = ""
-    @State private var sort: LibrarySort = .added
+    @AppStorage(SettingsKeys.librarySort) private var sort: LibrarySort = .added
 
     private var sourceItems: [MediaItem] {
         switch kind {
@@ -158,15 +165,17 @@ struct ItemsGridScreen: View {
         }
         switch sort {
         case .added:
-            break
+            return result
+        case .newest:
+            return TitleOrder.newest.sorted(result)
+        case .oldest:
+            return TitleOrder.oldest.sorted(result)
         case .title:
             result.sort { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
-        case .year:
-            result.sort { ($0.year ?? 0) > ($1.year ?? 0) }
+            return result
         case .rating:
-            result.sort { ($0.ratingKP ?? $0.ratingIMDb ?? 0) > ($1.ratingKP ?? $1.ratingIMDb ?? 0) }
+            return TitleOrder.rating.sorted(result)
         }
-        return result
     }
 
     var body: some View {
@@ -193,12 +202,13 @@ struct ItemsGridScreen: View {
                     Menu {
                         Picker("Сортировка", selection: $sort) {
                             ForEach(LibrarySort.allCases) { option in
-                                Text(option.title).tag(option)
+                                Text(option.title(for: kind)).tag(option)
                             }
                         }
                     } label: {
-                        Image(systemName: "arrow.up.arrow.down")
+                        Image(systemName: sort == .added ? "arrow.up.arrow.down.circle" : "arrow.up.arrow.down.circle.fill")
                     }
+                    .accessibilityLabel("Сортировка")
                 }
                 if kind == .history && !sourceItems.isEmpty {
                     Button("Очистить") { confirmClear = true }

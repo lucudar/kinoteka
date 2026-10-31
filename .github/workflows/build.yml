@@ -59,8 +59,9 @@ jobs:
 
       # The engine is built from the TorrServer sources with the changes of Config/engine (faster
       # connecting to peers, the torrent library of the desktop TorrServer, the port opened again
-      # after iOS took it); kept in the cache until the tag or these files change. The app calls
-      # functions of these changes, so there is no fallback to the standard engine of the release.
+      # after iOS took it, new settings without fixed pauses); kept in the cache until the tag or
+      # these files change. The app calls functions of these changes, so there is no fallback to
+      # the standard engine of the release.
       - name: Restore the engine
         id: engine-cache
         uses: actions/cache/restore@v4
