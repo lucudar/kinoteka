@@ -112,7 +112,7 @@ struct RootView: View {
         .onChange(of: scenePhase) { _, phase in
             // The phases themselves are logged by AppDiagnostics.
             if phase == .active {
-                TorrServer.shared.start()
+                TorrServer.shared.appBecameActive()
             } else {
                 library.persist()
             }

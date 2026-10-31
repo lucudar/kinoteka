@@ -8,6 +8,10 @@
 #    in 5 minutes, so the torrent gets its peers from the trackers alone; v1.2.34 repeats it in 15 s.
 # 2. Faster connecting to peers (patch-torrent.py): 80 connection attempts at once per torrent
 #    instead of 25, up to 40 new ones a second instead of 10, dial timeouts of 2–10 s instead of 3–20 s.
+#    The loop accepting peer connections pauses after an error instead of spinning on a socket iOS took.
+# 3. The web server can be opened again inside the running engine (kinoteka-web.go, kinoteka-kit.go,
+#    patch-server.py): iOS takes the sockets of a suspended app, and the app calls Relisten when the
+#    engine runs but does not answer; a web server that fails is opened again by the engine itself.
 #
 # Needs macOS with Xcode, Go (the version of the go.mod of the tag) and python3.
 set -euo pipefail
@@ -30,6 +34,11 @@ tar -xzf "$WORK/src.tar.gz" -C "$WORK"
 SRC="$(find "$WORK" -mindepth 1 -maxdepth 1 -type d -name 'TorrServer-*' | head -1)"
 KIT="$SRC/server/mobile/torrserverkit"
 test -f "$KIT/go.mod"
+
+echo "=== The changes of Kinoteka in the engine"
+cp "$HERE/kinoteka-web.go" "$SRC/server/web/kinoteka.go"
+cp "$HERE/kinoteka-kit.go" "$KIT/kinoteka.go"
+python3 "$HERE/patch-server.py" "$SRC/server"
 
 echo "=== tsynik/torrent $TORRENT_VERSION with the changes of Kinoteka"
 mkdir -p "$WORK/mod"
@@ -72,4 +81,4 @@ gomobile bind \
   -o "$OUT" \
   .
 ls -R "$OUT" | head -20
-echo "=== Built: TorrServer $TAG, tsynik/torrent $TORRENT_VERSION with the changes of Kinoteka"
+echo "=== Built: TorrServer $TAG with the changes of Kinoteka, tsynik/torrent $TORRENT_VERSION"

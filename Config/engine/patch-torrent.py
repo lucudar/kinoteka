@@ -7,6 +7,10 @@ the peers of the releases of its index, never do (their extension handshake has 
 With 25 connection attempts at once, 10 new ones a second and 3–20 s timeouts, the engine went
 through a few hundred known peers so slowly that a start often took longer than the player waited.
 
+The loop accepting peer connections pauses after an error: a socket that iOS took while the app was
+suspended fails at once on every call (the uTP one after its reader stopped), and without a pause
+the loop took a whole processor core until the torrent client was closed.
+
 Usage: patch-torrent.py <directory of the library>. Fails when a line to change is not found, so a
 new version of the library is never built without the changes unnoticed.
 """
@@ -19,6 +23,23 @@ CHANGES = [
     ("config.go", "MinDialTimeout", "3 * time.Second", "2 * time.Second"),
     ("config.go", "HalfOpenConnsPerTorrent", "25", "80"),
     ("client.go", "dialRateLimiter", "rate.NewLimiter(10, 10)", "rate.NewLimiter(40, 40)"),
+]
+
+CODE_CHANGES = [
+    # file, what, code of the library, code of Kinoteka
+    ("client.go", "acceptConnections pauses for a second after an error",
+     """		if err != nil {
+			log.Fmsg("error accepting connection: %s", err).LogLevel(log.Debug, cl.logger)
+			continue
+		}
+""",
+     """		if err != nil {
+			log.Fmsg("error accepting connection: %s", err).LogLevel(log.Debug, cl.logger)
+			// Kinoteka: a socket that iOS took fails at once on every call.
+			time.Sleep(time.Second)
+			continue
+		}
+"""),
 ]
 
 
@@ -39,6 +60,17 @@ def main() -> int:
         with open(path, "w", encoding="utf-8") as f:
             f.write(new)
         print(f"patch-torrent: {name}: {setting} {old} -> {value}")
+    for name, what, old, value in CODE_CHANGES:
+        path = f"{root}/{name}"
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        count = text.count(old)
+        if count != 1:
+            print(f"patch-torrent: {name}: code found {count} times, expected once:\n{old}", file=sys.stderr)
+            return 1
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text.replace(old, value))
+        print(f"patch-torrent: {name}: {what}")
     return 0
 
 

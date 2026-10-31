@@ -91,6 +91,29 @@ enum TorrServerError: LocalizedError {
     }
 }
 
+/// A value written on the engine queue and read by the caller, also after its timeout.
+private final class LockedValue<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Value
+
+    init(_ value: Value) {
+        stored = value
+    }
+
+    var value: Value {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return stored
+        }
+        set {
+            lock.lock()
+            stored = newValue
+            lock.unlock()
+        }
+    }
+}
+
 /// Resumes a continuation once: by the work or by its timeout, whichever comes first.
 private final class ResumeOnce: @unchecked Sendable {
     private let lock = NSLock()
@@ -130,6 +153,11 @@ final class TorrServer {
     private let lock = NSLock()
     private var lastError: String?
     private var serverPort = TorrServer.ports[0]
+    /// Starting the engine or opening its port again; the callers of ensureRunning share it.
+    private var recoveryTask: Task<Void, Error>?
+    /// TorrserverkitRelistens() already handled: a larger one means the engine opened its port
+    /// again by itself.
+    private var knownRelistens = 0
     private let session: URLSession
 
     init() {
@@ -148,6 +176,9 @@ final class TorrServer {
     }
 
     var isRunning: Bool { TorrserverkitIsRunning() }
+
+    /// How many times the HTTP port of the engine was opened again in this run.
+    var relistens: Int { TorrserverkitRelistens() }
 
     static var dataDirectory: URL {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -221,6 +252,16 @@ final class TorrServer {
     func start() {
         queue.async {
             self.startOnQueue()
+        }
+    }
+
+    /// The app is active again. iOS takes the sockets of a suspended app (mostly while the iPhone
+    /// is locked), and then the engine answers nothing: it is checked at once and repaired in a few
+    /// seconds, before a film is opened.
+    func appBecameActive() {
+        start()
+        Task.detached(priority: .userInitiated) {
+            try? await self.ensureRunning()
         }
     }
 
@@ -309,14 +350,51 @@ final class TorrServer {
     }
 
     private func startIfNeeded() async throws {
-        if await waitForPing(seconds: 1.5) { return }
-        for attempt in 1...2 {
-            // Only starts when the engine is not running (its HTTP server stopped).
-            if !(await onQueue(timeout: 30, { self.startOnQueue() })) {
+        if await waitForPing(seconds: 1.5) {
+            await reconnectIfEngineRelistened()
+            return
+        }
+        // A cancelled caller gets no answer from any ping: the engine is not repaired for it.
+        try Task.checkCancellation()
+        lock.lock()
+        let task: Task<Void, Error>
+        if let running = recoveryTask {
+            task = running
+        } else {
+            task = Task { try await self.recover() }
+            recoveryTask = task
+        }
+        lock.unlock()
+        try await task.value
+        try Task.checkCancellation()
+    }
+
+    /// The engine does not answer: it is started, or its port is opened again when it runs.
+    private func recover() async throws {
+        defer {
+            lock.lock()
+            recoveryTask = nil
+            lock.unlock()
+        }
+        if isRunning, await reopenPort() { return }
+        for attempt in 1...3 {
+            // Only starts when the engine is not running; waits for a start in progress.
+            guard await onQueue(timeout: 30, { self.startOnQueue() }) else {
                 AppDiagnostics.shared.log("torrent", "Запуск движка не закончился за 30 с")
+                if await waitForPing(seconds: 15) { return }
+                break
             }
-            if await waitForPing(seconds: attempt == 1 ? 10 : 15) { return }
-            if Task.isCancelled { throw CancellationError() }
+            if isRunning {
+                // Started now (its server answers in a moment), or it runs without answering.
+                if await waitForPing(seconds: 10) { return }
+                if await reopenPort() { return }
+                break
+            }
+            // The start failed (startError): the next attempt comes in a moment instead of
+            // waiting for an answer from an engine that is not running.
+            if attempt < 3 {
+                try? await Task.sleep(nanoseconds: UInt64(attempt) * 2_000_000_000)
+            }
         }
         let reason: String
         if isRunning {
@@ -326,6 +404,77 @@ final class TorrServer {
         }
         AppDiagnostics.shared.log("torrent", "Движок недоступен: \(reason)")
         throw TorrServerError.notRunning(reason)
+    }
+
+    /// The engine runs but its HTTP server does not answer: iOS takes the sockets of a suspended
+    /// app, and a listening socket taken this way accepts nothing any more and reports no error.
+    /// The engine opens its port again without a restart (its torrents stay), then its torrent
+    /// client, which lost its sockets too, is connected again.
+    private func reopenPort() async -> Bool {
+        // A film is open: one more chance before its stream is cut.
+        if isPlayerActive, await waitForPing(seconds: 3) { return true }
+        let started = Date()
+        let result = LockedValue("не закончилось за 15 с")
+        let finished = await onQueue(timeout: 15) { result.value = self.relistenOnQueue() }
+        let message = result.value
+        if finished, message.isEmpty {
+            // The connections kept for the next requests were on the taken sockets.
+            await session.reset()
+        }
+        guard finished, message.isEmpty, await waitForPing(seconds: 5) else {
+            AppDiagnostics.shared.log("torrent", "Движок не отвечает, порт не открылся заново: \(message.isEmpty ? "нет ответа" : message)")
+            return false
+        }
+        let elapsed = Int(Date().timeIntervalSince(started) * 1000)
+        AppDiagnostics.shared.log("torrent", "Движок не отвечал (iOS закрыл сокеты приостановленного приложения): порт \(port) открыт заново за \(elapsed) мс")
+        let count = TorrserverkitRelistens()
+        lock.lock()
+        knownRelistens = count
+        lock.unlock()
+        await reconnectAfterReclaim()
+        return true
+    }
+
+    /// Must be called on `queue`. Opens the HTTP port of the running engine again: the same one,
+    /// or the next free one of `ports`. An empty string on success, or the error.
+    private func relistenOnQueue() -> String {
+        let current = port
+        var message = TorrserverkitRelisten(current)
+        guard TorrServer.isPortBusy(message) else { return message }
+        AppDiagnostics.shared.log("torrent", "Порт \(current) занят: \(message)")
+        for candidate in TorrServer.ports where candidate != current {
+            message = TorrserverkitRelisten(candidate)
+            if message.isEmpty {
+                lock.lock()
+                serverPort = candidate
+                lock.unlock()
+                break
+            }
+            guard TorrServer.isPortBusy(message) else { break }
+            AppDiagnostics.shared.log("torrent", "Порт \(candidate) занят: \(message)")
+        }
+        return message
+    }
+
+    /// The engine opened its port again by itself (its HTTP server failed on a socket iOS took):
+    /// its torrent client lost its sockets too.
+    private func reconnectIfEngineRelistened() async {
+        let count = TorrserverkitRelistens()
+        lock.lock()
+        let changed = count != knownRelistens
+        knownRelistens = count
+        lock.unlock()
+        guard changed else { return }
+        AppDiagnostics.shared.log("torrent", "Движок сам открыл порт заново (iOS закрыл сокеты приостановленного приложения)")
+        await reconnectAfterReclaim()
+    }
+
+    /// iOS took the sockets of the engine: its torrent client receives nothing any more (DHT, uTP,
+    /// incoming connections), so it is connected again with new ones. Its torrents are closed;
+    /// their streams broke with the sockets anyway, and the player and the downloads add them again.
+    private func reconnectAfterReclaim() async {
+        await waitForProfileTask()
+        await reconnectClient(force: true)
     }
 
     // MARK: Engine profile
@@ -519,12 +668,13 @@ final class TorrServer {
         return saved
     }
 
-    /// The torrent client is missing (a reconnect of the engine failed): saving the same settings
-    /// makes TorrServer connect it again. Shared by the callers, at most once in 20 seconds.
-    private func reconnectClient() async {
+    /// The torrent client is missing (a reconnect of the engine failed) or lost its sockets: saving
+    /// the same settings makes TorrServer connect it again. Shared by the callers, at most once in
+    /// 20 seconds unless `force`.
+    private func reconnectClient(force: Bool = false) async {
         lock.lock()
         var task = profileTask
-        if task == nil, lastReconnect.map({ Date().timeIntervalSince($0) > 20 }) ?? true {
+        if task == nil, force || lastReconnect.map({ Date().timeIntervalSince($0) > 20 }) ?? true {
             lastReconnect = Date()
             let created = Task { await self.resaveSettings() }
             profileTask = created
