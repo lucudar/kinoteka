@@ -8,8 +8,8 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    MARKETING_VERSION: "0.12.6"
-    CURRENT_PROJECT_VERSION: "22"
+    MARKETING_VERSION: "0.12.7"
+    CURRENT_PROJECT_VERSION: "23"
 packages:
   VLCKitSPM:
     url: https://github.com/tylerjonesio/vlckit-spm

@@ -184,7 +184,7 @@ struct SettingsView: View {
     }
 
     private var playlistSummary: String {
-        if playlistURL.isEmpty { return "не задан" }
+        if playlistURL.isEmpty { return "встроенные" }
         if playlistURL == ChannelsStore.localMarker { return "файл" }
         return URL(string: playlistURL)?.host ?? playlistURL
     }

@@ -10,6 +10,7 @@ struct PlayerHostView: View {
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var model = VLCPlayerModel()
     @ObservedObject private var network = NetworkMonitor.shared
+    @ObservedObject private var tvGuide = TVGuide.shared
 
     @AppStorage(SettingsKeys.autoNext) private var autoNext = true
     @AppStorage(SettingsKeys.savePlayerSettings) private var savePlayerSettings = true
@@ -392,6 +393,10 @@ struct PlayerHostView: View {
     }
 
     private func resolve(_ target: String) async throws {
+        if let tv = TVCatalog.channel(forLink: target) {
+            try await resolveChannel(tv, link: target)
+            return
+        }
         switch LinkInspector.kind(of: target) {
         case .direct:
             guard let url = URL(string: target) else { throw TorrServerError.server("Некорректная ссылка.") }
@@ -400,6 +405,21 @@ struct PlayerHostView: View {
         case .torrent:
             try await resolveTorrent(LinkInspector.stripMarker(target))
         }
+    }
+
+    /// A built-in channel: the stream is asked from the broadcaster on every start (its link has a token).
+    private func resolveChannel(_ tv: TVChannel, link target: String) async throws {
+        guard !closing else { throw CancellationError() }
+        phase = .resolving
+        statusText = "Подключение к каналу…"
+        detailText = ""
+        Task { await TVGuide.shared.load(tv) }
+        let url = try await TVResolver.shared.resolve(tv)
+        try Task.checkCancellation()
+        guard !closing else { throw CancellationError() }
+        AppDiagnostics.shared.log("player", "Канал «\(tv.name)»: \(url.host ?? "поток")")
+        streamKey = target
+        start(url: url, slaves: [])
     }
 
     private func resolveTorrent(_ torrent: String) async throws {
@@ -818,7 +838,7 @@ struct PlayerHostView: View {
         let aspect: AspectMode = savePlayerSettings ? (AspectMode(rawValue: savedAspect) ?? .fit) : .fit
         model.load(url: url, startAt: position, options: options, rate: rate, aspect: aspect, slaves: slaves)
         model.enableRemoteControls(title: request.item?.title ?? request.title,
-                                   subtitle: currentFile.flatMap { files.count > 1 ? fileLabel($0) : nil },
+                                   subtitle: liveProgramme ?? currentFile.flatMap { files.count > 1 ? fileLabel($0) : nil },
                                    isLive: request.isLive)
         lastResumeSave = Date()
         lastContinueSave = Date.distantPast
@@ -1160,6 +1180,10 @@ struct PlayerHostView: View {
     }
 
     private func loadArtwork() async {
+        if let tv = TVCatalog.channel(forLink: request.link), let logo = UIImage(named: tv.logoName) {
+            model.setNowPlayingArtwork(logo)
+            return
+        }
         guard let url = request.item?.poster else { return }
         if let image = await ImageCache.shared.load(url), !Task.isCancelled {
             model.setNowPlayingArtwork(image)
@@ -1308,7 +1332,7 @@ struct PlayerHostView: View {
             Image(systemName: "exclamationmark.triangle.fill")
                 .font(.largeTitle)
                 .foregroundStyle(.yellow)
-            Text("Не удалось открыть видео")
+            Text(request.isLive ? "Не удалось включить канал" : "Не удалось открыть видео")
                 .font(.headline)
             Text(message)
                 .font(.subheadline)
@@ -1728,6 +1752,12 @@ struct PlayerHostView: View {
         }
     }
 
+    /// The programme on the air of a built-in channel.
+    private var liveProgramme: String? {
+        guard request.isLive, let tv = TVCatalog.channel(forLink: request.link) else { return nil }
+        return tvGuide.now(for: tv.id)?.title
+    }
+
     private var topBar: some View {
         GlassGroup(spacing: 8) {
             HStack(spacing: 12) {
@@ -1745,6 +1775,11 @@ struct PlayerHostView: View {
                         .lineLimit(1)
                     if let file = currentFile, files.count > 1 {
                         Text(fileLabel(file))
+                            .font(.caption)
+                            .foregroundStyle(.white.opacity(0.75))
+                            .lineLimit(1)
+                    } else if let programme = liveProgramme {
+                        Text(programme)
                             .font(.caption)
                             .foregroundStyle(.white.opacity(0.75))
                             .lineLimit(1)

@@ -106,6 +106,25 @@ jobs:
             base64 -D -i "Config/$name.png.b64" -o "Sources/Assets.xcassets/AppIcon.appiconset/$name.png"
           done 2>&1 | tee -a steps.log
 
+      - name: Channel logos
+        # The logos of the built-in TV channels are kept as base64 text too
+        # (Config/channels/tv-<id>.<png|jpg>.b64); they become images of the asset catalog.
+        run: |
+          set -e
+          dir=Sources/Assets.xcassets/Channels
+          mkdir -p "$dir"
+          printf '%s' '{"info":{"author":"xcode","version":1}}' > "$dir/Contents.json"
+          count=0
+          for file in Config/channels/*.b64; do
+            name=$(basename "$file" .b64)
+            set_dir="$dir/${name%.*}.imageset"
+            mkdir -p "$set_dir"
+            base64 -D -i "$file" -o "$set_dir/$name"
+            printf '{"images":[{"filename":"%s","idiom":"universal"}],"info":{"author":"xcode","version":1}}' "$name" > "$set_dir/Contents.json"
+            count=$((count + 1))
+          done
+          echo "Channel logos: $count" | tee -a steps.log
+
       - name: Generate Xcode project
         run: xcodegen generate 2>&1 | tee -a steps.log
 
