@@ -16,6 +16,9 @@
 #    paused for a second before and after reconnecting its torrent client, and 1.5 s more stopping
 #    the rutor search, which is off in the app. The app saves settings for another network and to
 #    reconnect a torrent client that lost its sockets, while a film waits to start.
+# 5. The public IPv4 address is looked up for 1 s at most instead of 3 s (patch-server.py): the torrent
+#    client waits for the lookup on every connect, so where OpenDNS and icanhazip.com do not answer
+#    every start and every new network cost 3 s.
 #
 # Needs macOS with Xcode, Go (the version of the go.mod of the tag) and python3.
 set -euo pipefail

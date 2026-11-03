@@ -46,7 +46,6 @@ final class AppDiagnostics: NSObject, MXMetricManagerSubscriber, @unchecked Send
     private var previousEvents: [String] = []
     private var pingPending = false
     private var pingSentAt: TimeInterval = 0
-    private var sessionWritePending = false
     private var sampler: DispatchSourceTimer?
     private var samplerTicks = 0
 

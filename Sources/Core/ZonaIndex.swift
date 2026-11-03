@@ -672,6 +672,82 @@ enum ZonaReleases {
     }
 }
 
+// MARK: - Trailers
+
+/// A trailer of a title in the index: a video file on a Russian film site (kino-teatr.ru,
+/// kinomania.ru), kept in the torrent core with "trailer:true". The player opens it like any link,
+/// so trailers need neither the Kinopoisk key nor YouTube, which is slowed down in Russia.
+struct ZonaTrailer: Decodable, Equatable, Sendable {
+    var link: String
+    /// "1280x720".
+    var resolution: String?
+    var size: Int64 = 0
+    /// "ru".
+    var language: String?
+
+    init(link: String, resolution: String? = nil, size: Int64 = 0, language: String? = nil) {
+        self.link = link
+        self.resolution = resolution
+        self.size = size
+        self.language = language
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: JSONKey.self)
+        link = c.flexString("torrent_download_link") ?? ""
+        resolution = c.flexString("resolution")
+        size = max(0, c.flexInt64("size_bytes") ?? 0)
+        language = c.flexString("language")
+    }
+}
+
+enum ZonaTrailers {
+    static let fields = ["torrent_download_link", "resolution", "size_bytes", "language"]
+    /// The film sites are behind a protection (DDoS-Guard) that answers the player's own name (VLC,
+    /// CFNetwork) with its page (403) instead of the video: the check and the player introduce
+    /// themselves as Safari.
+    static let userAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 "
+        + "(KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"
+    /// Their trailers open: tried first.
+    static let reliableHosts: Set<String> = ["www.kino-teatr.ru", "kino-teatr.ru"]
+    /// Their trailers did not open (kinomania.ru answered "402 Payment Required"): tried last.
+    static let unreliableHosts: Set<String> = ["fs.kinomania.ru"]
+
+    static func url(kinopoiskId id: Int) -> URL? {
+        guard id > 0 else { return nil }
+        return ZonaIndex.select("torrent", query: "kinopoisk_id:\(id)", filters: ["trailer:true"], rows: 20, fields: fields)
+    }
+
+    /// The links the player can open, the most likely to play first: the sites that work, Russian
+    /// trailers, the sharper picture (up to 1080p). Links of video services ("24video:?id=") and
+    /// magnet links are not files.
+    static func links(_ trailers: [ZonaTrailer]) -> [URL] {
+        var seen = Set<String>()
+        var list: [(url: URL, rank: [Int], order: Int)] = []
+        for (order, trailer) in trailers.enumerated() {
+            guard let url = URL(string: trailer.link.trimmed),
+                  let scheme = url.scheme?.lowercased(), scheme == "https" || scheme == "http",
+                  let host = url.host?.lowercased(), !host.isEmpty,
+                  seen.insert(url.absoluteString).inserted else { continue }
+            let site = reliableHosts.contains(host) ? 0 : (unreliableHosts.contains(host) ? 2 : 1)
+            let language = (trailer.language ?? "").trimmed.lowercased()
+            let russian = language.isEmpty || language.hasPrefix("ru") ? 0 : 1
+            let height = min(ZonaReleases.equivalentHeight(trailer.resolution) ?? 0, 1080)
+            list.append((url: url, rank: [site, russian, -height], order: order))
+        }
+        return list.sorted { a, b in
+            a.rank != b.rank ? a.rank.lexicographicallyPrecedes(b.rank) : a.order < b.order
+        }.map { $0.url }
+    }
+
+    /// The start of a video file rather than a page (an error, a check of the protection).
+    static func looksLikeVideo(_ head: Data) -> Bool {
+        let blank: Set<UInt8> = [0x09, 0x0A, 0x0D, 0x20]
+        guard let first = head.first(where: { !blank.contains($0) }) else { return false }
+        return first != UInt8(ascii: "<") && first != UInt8(ascii: "{")
+    }
+}
+
 // MARK: - Merging sources
 
 enum ReleaseMerge {

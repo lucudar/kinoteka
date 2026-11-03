@@ -170,14 +170,6 @@ final class LibraryStore: ObservableObject {
         }
     }
 
-    func removeSources(at offsets: IndexSet, for key: String) {
-        mutate { d in
-            var list = d.sources[key] ?? []
-            list.remove(atOffsets: offsets)
-            d.sources[key] = list.isEmpty ? nil : list
-        }
-    }
-
     // Playback positions (not published: updated often while playing)
     func resumePosition(for streamKey: String) -> Int32 {
         data.resume[streamKey] ?? 0

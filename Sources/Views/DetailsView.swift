@@ -642,8 +642,20 @@ struct DetailsView: View {
     private func openTrailer() {
         guard !loadingTrailer else { return }
         loadingTrailer = true
+        let title = current.title
         Task {
             defer { loadingTrailer = false }
+            // Zona's trailers are files on Russian film sites: they play here, without a key or a VPN.
+            if let url = await ZonaCatalog.shared.trailer(item.id) {
+                coordinator.play(PlayRequest(title: "Трейлер · \(title)", link: url.absoluteString,
+                                             userAgent: ZonaTrailers.userAgent, startTime: 0))
+                return
+            }
+            // Kinopoisk's (its widget, YouTube) open in Safari and need the key of its API.
+            guard KPClient.shared.hasToken else {
+                alertText = "Трейлер не найден"
+                return
+            }
             do {
                 let videos = try await KPClient.shared.videos(item.id)
                 let usable = videos.filter { ($0.url ?? "").hasPrefix("http") }

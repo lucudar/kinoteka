@@ -30,8 +30,6 @@ struct TorrentSearchResult: Codable, Sendable {
     var server: String? = nil
     /// Where the releases came from, in order: "Zona", "jr.maxvol.pro".
     var sources: [String]? = nil
-
-    var hasZona: Bool { sources?.contains(ZonaReleases.source) ?? false }
 }
 
 extension TorrentSearchQuery {

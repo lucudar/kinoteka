@@ -240,26 +240,34 @@ struct EngineProfile: Hashable, Sendable {
     }
 
     /// Trackers added to every torrent (TorrServer reads them from trackers.txt), besides the
-    /// ones of the release and the engine's list. Russian retrackers first: the rutracker ones
-    /// know its releases even when the magnet link has no trackers, and they answer on
-    /// mobile networks where foreign trackers can be slowed down. No retracker.local: iOS
-    /// resolves .local names only by multicast in the local network, never through the provider.
+    /// ones of the release and the engine's list. Russian retrackers first: they know the releases
+    /// of Russian trackers even when the magnet link has no trackers at all (those of Kinozal and
+    /// NNM-Club never have), and they answer on mobile networks where foreign trackers can be slowed
+    /// down — rutracker's (t-ru.org) its own releases, corbina's most of the others, NNM-Club's its
+    /// own. The list was checked by asking every tracker about the 70 most seeded releases of each
+    /// source of the search: dead ones (exodus.desync.com, opentrackr over HTTP) and second names of
+    /// the same server are not in it. No retracker.local: iOS resolves .local names only by
+    /// multicast in the local network, never through the provider.
     static let trackers = [
         "http://bt.t-ru.org/ann?magnet",
         "http://bt2.t-ru.org/ann?magnet",
         "http://bt3.t-ru.org/ann?magnet",
         "http://bt4.t-ru.org/ann?magnet",
+        "udp://retracker01-msk-virt.corbina.net:80/announce",
         "http://retracker01-msk-virt.corbina.net:80/announce",
-        "http://tracker.opentrackr.org:1337/announce",
-        "udp://tracker.opentrackr.org:1337/announce",
+        "http://bt02.nnm-club.cc:2710/announce",
+        "http://bt02.nnm-club.info:2710/announce",
         "udp://open.stealth.si:80/announce",
         "udp://tracker.torrent.eu.org:451/announce",
         "udp://open.demonii.com:1337/announce",
-        "udp://explodie.org:6969/announce",
-        "udp://exodus.desync.com:6969/announce",
         "udp://tracker.qu.ax:6969/announce",
+        "udp://tracker-udp.gbitt.info:80/announce",
         "udp://tracker.dler.org:6969/announce",
+        "udp://tracker2.dler.org:80/announce",
+        "udp://open.tracker.cl:1337/announce",
+        "udp://explodie.org:6969/announce",
         "udp://opentor.net:6969/announce",
+        "udp://tracker.opentrackr.org:1337/announce",
         "http://tracker.renfei.net:8080/announce"
     ]
 }

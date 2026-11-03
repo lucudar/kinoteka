@@ -187,6 +187,44 @@ final class ZonaIndexTests: XCTestCase {
         XCTAssertEqual(ZonaIndex.totalPages(found: 0, list: ZonaIndex.collection("FAMILY")), 1)
     }
 
+    func testTrailersPreferSitesThatOpenAndSharperPictures() throws {
+        let url = try XCTUnwrap(ZonaTrailers.url(kinopoiskId: 1309570))
+        let text = try XCTUnwrap(url.absoluteString.removingPercentEncoding)
+        XCTAssertTrue(text.contains("/solr/torrent/select"), text)
+        XCTAssertTrue(text.contains("q=kinopoisk_id:1309570"), text)
+        XCTAssertTrue(text.contains("fq=trailer:true"), text)
+        XCTAssertNil(ZonaTrailers.url(kinopoiskId: 0))
+
+        let json = """
+        {"response":{"numFound":9,"docs":[
+          {"torrent_download_link":"https://fs.kinomania.ru/media/video/8/63/863db8.480.mp4","resolution":"852x480","size_bytes":27741344,"language":"ru"},
+          {"torrent_download_link":"24video:?id=3054378","resolution":"640x360","language":"ru"},
+          {"torrent_download_link":"https://www.kino-teatr.ru/video/16227/video_16227_6478.mp4","resolution":"1280x720","size_bytes":"8402024","language":"ru"},
+          {"torrent_download_link":"https://cdn-media.film.ru/trailer.mp4","resolution":"1920x1080","language":"en"},
+          {"torrent_download_link":"https://cdn-media.film.ru/trailer-ru.mp4","resolution":"1280x720","language":"ru"},
+          {"torrent_download_link":"https://www.kino-teatr.ru/video/9424/video_9424_fe3b.mp4","resolution":"1280x692","language":"ru"},
+          {"torrent_download_link":"https://www.kino-teatr.ru/video/9424/video_9424_fe3b.mp4","resolution":"1280x692"},
+          {"torrent_download_link":"magnet:?xt=urn:btih:1111111111111111111111111111111111111111","resolution":"1920x1080"},
+          {"resolution":"1920x1080"}
+        ]}}
+        """
+        let page = try JSONDecoder().decode(ZonaPage<ZonaTrailer>.self, from: Data(json.utf8))
+        XCTAssertEqual(page.docs.count, 9)
+        XCTAssertEqual(page.docs[2].size, 8402024)
+        XCTAssertEqual(ZonaTrailers.links(page.docs).map(\.absoluteString), [
+            "https://www.kino-teatr.ru/video/16227/video_16227_6478.mp4",
+            "https://www.kino-teatr.ru/video/9424/video_9424_fe3b.mp4",
+            "https://cdn-media.film.ru/trailer-ru.mp4",
+            "https://cdn-media.film.ru/trailer.mp4",
+            "https://fs.kinomania.ru/media/video/8/63/863db8.480.mp4"
+        ])
+
+        XCTAssertTrue(ZonaTrailers.looksLikeVideo(Data([0, 0, 0, 0x18]) + Data("ftypmp42".utf8)))
+        XCTAssertTrue(ZonaTrailers.looksLikeVideo(Data("FLV".utf8)))
+        XCTAssertFalse(ZonaTrailers.looksLikeVideo(Data("\n <!DOCTYPE html>".utf8)))
+        XCTAssertFalse(ZonaTrailers.looksLikeVideo(Data()))
+    }
+
     func testPosterFallbacks() throws {
         let kp = try XCTUnwrap(URL(string: "https://kinopoiskapiunofficial.tech/images/posters/kp_small/301.jpg"))
         XCTAssertEqual(ZonaIndex.posterFallbacks(for: kp).map(\.absoluteString), ["https://img2.zonapic.com/images/film_240/0/301.jpg"])

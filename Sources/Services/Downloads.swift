@@ -362,8 +362,6 @@ final class DownloadManager: ObservableObject {
 
     // MARK: Queries
 
-    var hasItems: Bool { !items.isEmpty }
-
     func item(hash: String, fileId: Int) -> DownloadItem? {
         let id = DownloadItem.identifier(hash: hash, fileId: fileId)
         return items.first { $0.id == id }
@@ -407,10 +405,6 @@ final class DownloadManager: ObservableObject {
             return found
         }
         return torrents.values.first { LinkInspector.stripMarker($0.link).trimmed == plain }
-    }
-
-    func hasCompleted(hash: String) -> Bool {
-        items.contains { $0.hash == hash.lowercased() && $0.state == .completed }
     }
 
     var usedBytes: Int64 {

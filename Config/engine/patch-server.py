@@ -10,7 +10,11 @@ kinoteka-kit.go copied next to the patched files by build-engine.sh:
   its sockets) are applied in tens of milliseconds instead of 3.5 s: SetSettings paused for a second
   before and after reconnecting the client (dropAllTorrent waits for the torrents to close, and
   reconnect retries a busy port by itself), and the stop of the rutor search waited 1.5 s even
-  though the search (off in the app) never ran.
+  though the search (off in the app) never ran;
+- the public IPv4 address is looked up for a second at most instead of 3 s: the torrent client waits
+  for it on every connect (the start, a new network, a lost socket), and where the lookup services
+  (OpenDNS, icanhazip.com) do not answer the engine started 3 s later. The address only makes the
+  DHT node id "secure" (BEP 42) and is sent to trackers, which see it anyway.
 
 Each change must apply exactly once, so a new TorrServer version that moved the code fails the build.
 """
@@ -44,6 +48,11 @@ CHANGES = [
      r"(\n\tutils2\.FreeOSMemGC\(\))\n\ttime\.Sleep\(time\.Millisecond \* 1500\)\n\}",
      "\\1\n\tif running { // Kinoteka: only a running loop needs the time to see the stop\n"
      "\t\ttime.Sleep(time.Millisecond * 1500)\n\t}\n}"),
+    ("torr/btserver.go",
+     r"// Create a context with a 3-second timeout for the IP lookup"
+     r"(\n\t\tctx, cancel := context\.WithTimeout\(context\.Background\(\), )3\*time\.Second"
+     r"(\)\n\t\tdefer cancel\(\)\n\t\tbt\.config\.PublicIp4, err = publicip\.Get4\(ctx\))",
+     "// Kinoteka: a second at most, the client waits for it on every connect\\1time.Second\\2"),
 ]
 
 for name, pattern, replacement in CHANGES:

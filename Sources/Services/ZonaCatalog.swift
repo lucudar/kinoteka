@@ -162,6 +162,51 @@ actor ZonaCatalog {
         return KPFilters(genres: genres, countries: countries)
     }
 
+    // MARK: Trailers
+
+    /// A trailer of the title that opens now; nil when the index has none or none of its sites answers.
+    func trailer(_ id: Int) async -> URL? {
+        guard ZonaCatalog.isEnabled, let url = ZonaTrailers.url(kinopoiskId: id) else { return nil }
+        let answer: ZonaPage<ZonaTrailer>
+        do {
+            answer = try await load(url, ttl: TTL.movie)
+        } catch {
+            return nil
+        }
+        let links = Array(ZonaTrailers.links(answer.docs).prefix(4))
+        guard !links.isEmpty else { return nil }
+        // Asked together; the best link that opens wins once every better one has failed.
+        let found = await withTaskGroup(of: (Int, Bool).self, returning: URL?.self) { group in
+            for (index, link) in links.enumerated() {
+                group.addTask { (index, await ZonaCatalog.opens(link)) }
+            }
+            var works: [Int: Bool] = [:]
+            for await (index, opened) in group {
+                works[index] = opened
+                for candidate in links.indices {
+                    guard let known = works[candidate] else { break }
+                    if known {
+                        group.cancelAll()
+                        return links[candidate]
+                    }
+                }
+            }
+            return nil
+        }
+        AppDiagnostics.shared.log("zona", "Трейлер: ссылок \(links.count), открылась \(found?.host ?? "ни одна")")
+        return found
+    }
+
+    /// The site gives the start of the video to the name the player sends as well.
+    private nonisolated static func opens(_ url: URL) async -> Bool {
+        var request = URLRequest(url: url)
+        request.setValue(ZonaTrailers.userAgent, forHTTPHeaderField: "User-Agent")
+        request.setValue("bytes=0-511", forHTTPHeaderField: "Range")
+        let result = await HTTPProbe.run(request, idle: 6, total: 8, limit: 512, keepBody: 512)
+        guard let status = result.status, status == 200 || status == 206 else { return false }
+        return ZonaTrailers.looksLikeVideo(result.body)
+    }
+
     // MARK: Network and cache
 
     /// Fresh saved answers at once, otherwise the index (and an older saved answer when it fails).

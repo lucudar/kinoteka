@@ -61,6 +61,17 @@ final class EngineProfileTests: XCTestCase {
         }
     }
 
+    func testTrackersKeepTheRussianRetrackersAndNoDeadOrLocalOnes() {
+        let list = EngineProfile.trackers
+        XCTAssertEqual(Set(list).count, list.count)
+        XCTAssertTrue(list.allSatisfy { $0.hasPrefix("udp://") || $0.hasPrefix("http://") })
+        XCTAssertTrue(list.contains("udp://retracker01-msk-virt.corbina.net:80/announce"))
+        XCTAssertTrue(list.contains("http://bt02.nnm-club.cc:2710/announce"))
+        XCTAssertTrue(list.contains("http://bt.t-ru.org/ann?magnet"))
+        XCTAssertFalse(list.contains { $0.contains(".local") || $0.contains("exodus.desync.com") })
+        XCTAssertFalse(list.contains("http://tracker.opentrackr.org:1337/announce"))
+    }
+
     func testOnlyTheKindOfNetworkChangesTheProfile() {
         // Wi‑Fi, a cable and a VPN interface need no retune of the engine between them.
         let wifi = EngineProfile.make(env(.wifi))
