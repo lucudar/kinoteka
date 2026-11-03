@@ -590,7 +590,7 @@ struct ReleaseRow: View {
     private var tags: [Tag] {
         var list: [Tag] = []
         if release.quality != .unknown {
-            list.append(Tag(text: release.quality.title, color: release.quality == .uhd ? .purple : Theme.accent))
+            list.append(Tag(text: release.quality.title, color: release.quality == .uhd ? .purple : Color.white.opacity(0.2)))
         }
         if release.isHDR { list.append(Tag(text: "HDR", color: .orange)) }
         if let seasons = release.seasonsText { list.append(Tag(text: seasons, color: Color(white: 0.35))) }

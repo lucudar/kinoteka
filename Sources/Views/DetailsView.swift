@@ -37,10 +37,6 @@ struct DetailsView: View {
     @State private var seasonPreselected = false
     /// The header has scrolled away: the title is shown in the navigation bar.
     @State private var titleInBar = false
-    @State private var stretch = HeaderStretch()
-
-    /// The picture of the header goes under the navigation bar (Liquid Glass buttons float over it).
-    private static let backdropHeight: CGFloat = 330
 
     private var current: MediaItem { film?.item ?? item }
     private var isSeries: Bool { film?.isSeries ?? (item.kind == .series) }
@@ -204,10 +200,9 @@ struct DetailsView: View {
 
     private var warmupKey: WarmupKey { WarmupKey(link: warmupLink, target: warmupTarget) }
 
+    /// The quality and the voice-over chosen are shown by their menus under the button.
     private var watchTitle: String {
-        let title = continueEntry != nil ? "Продолжить" : "Смотреть"
-        let choices = [chosenQuality?.title, chosenVoice?.title].compactMap { $0 }
-        return choices.isEmpty ? title : title + " · " + choices.joined(separator: " · ")
+        continueEntry != nil ? "Продолжить" : "Смотреть"
     }
 
     private var captionText: String? {
@@ -258,17 +253,11 @@ struct DetailsView: View {
             }
             .padding(.bottom, 32)
         }
-        .ignoresSafeArea(edges: .top)
-        .onScrollGeometryChange(for: CGFloat.self) { geometry in
-            geometry.contentOffset.y + geometry.contentInsets.top
-        } action: { _, offset in
-            // Only the picture of the header follows the pull, not the whole page.
-            let pull = max(0, -offset)
-            if stretch.pull != pull { stretch.pull = pull }
-            let scrolled = offset > 250
-            if scrolled != titleInBar {
-                withAnimation(.easeInOut(duration: 0.2)) { titleInBar = scrolled }
-            }
+        .onScrollGeometryChange(for: Bool.self) { geometry in
+            // The title under the poster has gone under the navigation bar.
+            geometry.contentOffset.y + geometry.contentInsets.top > 300
+        } action: { _, scrolled in
+            withAnimation(.easeInOut(duration: 0.2)) { titleInBar = scrolled }
         }
         .background(Theme.background)
         .navigationTitle(current.title)
@@ -284,6 +273,9 @@ struct DetailsView: View {
                 ShareLink(item: shareURL) {
                     Image(systemName: "square.and.arrow.up")
                 }
+            }
+            ToolbarItem(placement: .topBarTrailing) {
+                moreMenu
             }
         }
         .sheet(isPresented: $showSources) {
@@ -324,64 +316,145 @@ struct DetailsView: View {
 
     // MARK: Header
 
+    /// The poster in the middle over its own colour, the title and the ratings under it.
     private var header: some View {
-        ZStack(alignment: .bottomLeading) {
-            StretchyBackdrop(stretch: stretch, height: DetailsView.backdropHeight,
-                             cover: film?.coverUrl.flatMap { URL(string: $0) }, poster: current.poster)
-
-            HStack(alignment: .bottom, spacing: 14) {
-                Color.clear
-                    .frame(width: 112, height: 168)
-                    .overlay { PosterImage(url: URL(string: current.posterURL ?? "") ?? current.poster) }
-                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 14, style: .continuous)
-                            .stroke(Color.white.opacity(0.12), lineWidth: 0.75)
-                    }
-                    .shadow(color: .black.opacity(0.5), radius: 14, y: 6)
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(current.title)
-                        .font(.title2.weight(.bold))
-                        .lineLimit(3)
-                        .minimumScaleFactor(0.8)
-                    if let original = current.originalTitle {
-                        Text(original)
-                            .font(.subheadline)
-                            .foregroundStyle(Theme.secondary)
-                            .lineLimit(2)
-                    }
-                    HStack(spacing: 12) {
-                        if let kp = current.ratingKP, kp > 0 {
-                            ratingLabel("КП", kp)
-                        }
-                        if let imdb = current.ratingIMDb, imdb > 0 {
-                            ratingLabel("IMDb", imdb)
-                        }
-                    }
+        VStack(spacing: 0) {
+            Color.clear
+                .frame(width: 176, height: 264)
+                .overlay { PosterImage(url: current.poster) }
+                .overlay { PosterImage(url: largePoster, maxPixel: 1000, placeholder: false) }
+                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .stroke(Color.white.opacity(0.16), lineWidth: 0.5)
                 }
-                Spacer(minLength: 0)
+                .background {
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .fill(Color.black)
+                        .shadow(color: .black.opacity(0.55), radius: 28, y: 16)
+                }
+                .padding(.top, 6)
+            Text(current.title)
+                .font(.title2.weight(.bold))
+                .multilineTextAlignment(.center)
+                .lineLimit(3)
+                .minimumScaleFactor(0.8)
+                .padding(.top, 18)
+            if let original = current.originalTitle, !original.isEmpty, original != current.title {
+                Text(original)
+                    .font(.subheadline)
+                    .foregroundStyle(Theme.secondary)
+                    .multilineTextAlignment(.center)
+                    .lineLimit(2)
+                    .padding(.top, 3)
             }
-            .padding(.horizontal, 16)
-            .offset(y: 36)
+            if !metaLine.isEmpty {
+                Text(metaLine)
+                    .font(.footnote)
+                    .foregroundStyle(Theme.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.top, 6)
+            }
+            ratingPills
+                .padding(.top, 12)
         }
-        .padding(.bottom, 36)
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal, 16)
+        .background(alignment: .top) {
+            // Reaches up under the navigation bar and the status bar, fades out under the buttons.
+            AmbientGlow(url: current.poster, height: 1150)
+                .offset(y: -500)
+        }
     }
 
-    private func ratingLabel(_ title: String, _ value: Double) -> some View {
-        HStack(spacing: 4) {
+    /// The full-size poster, drawn over the preview of the lists (that one is usually loaded already).
+    private var largePoster: URL? {
+        guard let preview = current.posterPreviewURL, !preview.isEmpty,
+              let full = current.posterURL, full != preview else { return nil }
+        return URL(string: full)
+    }
+
+    /// "2024 · Фантастика, боевик · 2 ч 46 мин · 12+".
+    private var metaLine: String {
+        var parts: [String] = []
+        if let year = film?.yearText ?? current.year.map({ String($0) }), !year.isEmpty { parts.append(year) }
+        let genres = current.genres.prefix(2).joined(separator: ", ")
+        if !genres.isEmpty { parts.append(genres.capitalizedFirst) }
+        if let length = film?.lengthText, !length.isEmpty { parts.append(length) }
+        if let age = film?.ageText, !age.isEmpty { parts.append(age) }
+        return parts.joined(separator: " · ")
+    }
+
+    @ViewBuilder
+    private var ratingPills: some View {
+        let kp = current.ratingKP ?? 0
+        let imdb = current.ratingIMDb ?? 0
+        let watched = library.isWatched(item.id)
+        if kp > 0 || imdb > 0 || watched {
+            HStack(spacing: 8) {
+                if kp > 0 {
+                    ratingPill("Кинопоиск", kp)
+                }
+                if imdb > 0 {
+                    ratingPill("IMDb", imdb)
+                }
+                if watched {
+                    Label("Просмотрено", systemImage: "eye.fill")
+                        .font(.footnote.weight(.medium))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 12)
+                        .frame(height: 28)
+                        .glassSurface(Capsule())
+                }
+            }
+            .lineLimit(1)
+        }
+    }
+
+    private func ratingPill(_ title: String, _ value: Double) -> some View {
+        HStack(spacing: 5) {
             Text(title)
-                .font(.caption.weight(.semibold))
                 .foregroundStyle(Theme.secondary)
             Text(RatingStyle.text(value))
-                .font(.subheadline.weight(.bold))
-                .foregroundStyle(RatingStyle.color(value))
+                .fontWeight(.semibold)
+                .foregroundStyle(.white)
         }
+        .font(.footnote)
+        .padding(.horizontal, 12)
+        .frame(height: 28)
+        .glassSurface(Capsule())
+    }
+
+    /// "…" in the navigation bar: the mark "Просмотрено" and the page on Kinopoisk.
+    private var moreMenu: some View {
+        Menu {
+            Button {
+                library.toggleWatched(current)
+            } label: {
+                Label(library.isWatched(item.id) ? "Отметить непросмотренным" : "Отметить просмотренным",
+                      systemImage: library.isWatched(item.id) ? "eye.slash" : "eye")
+            }
+            Button {
+                pendingEpisode = nil
+                showSources = true
+            } label: {
+                Label("Все раздачи", systemImage: "list.bullet.rectangle")
+            }
+            Button {
+                openURL(shareURL)
+            } label: {
+                Label("Открыть на Кинопоиске", systemImage: "safari")
+            }
+        } label: {
+            Image(systemName: LiquidGlassSupport.isAvailable ? "ellipsis" : "ellipsis.circle")
+        }
+        .accessibilityLabel("Ещё")
     }
 
     // MARK: Actions
 
     private var actions: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: 10) {
             Button {
                 watchTapped()
             } label: {
@@ -389,7 +462,7 @@ struct DetailsView: View {
                     if searchingRelease {
                         HStack(spacing: 10) {
                             ProgressView()
-                                .tint(.white)
+                                .tint(Theme.onAccent)
                             Text("Ищем раздачу…")
                         }
                     } else {
@@ -397,16 +470,12 @@ struct DetailsView: View {
                     }
                 }
                 .font(.headline)
-                .foregroundStyle(.white)
                 .frame(maxWidth: .infinity)
-                .padding(.vertical, LiquidGlassSupport.isAvailable ? 5 : 14)
             }
             .primaryActionStyle()
-            .controlSize(.large)
             .disabled(searchingRelease)
 
-            qualityChips
-            voiceChips
+            choiceMenus
 
             if let text = captionText {
                 Text(text)
@@ -417,76 +486,115 @@ struct DetailsView: View {
                     .frame(maxWidth: .infinity)
             }
 
-            HStack(alignment: .top) {
-                CircleAction(title: "Трейлер", systemImage: loadingTrailer ? "hourglass" : "film") {
-                    openTrailer()
-                }
-                CircleAction(title: library.isFavorite(item) ? "В избранном" : "В избранное",
-                             systemImage: library.isFavorite(item) ? "heart.fill" : "heart",
-                             active: library.isFavorite(item)) {
-                    library.toggleFavorite(current)
-                }
-                CircleAction(title: library.isWatchLater(item) ? "Отложено" : "Позже",
-                             systemImage: library.isWatchLater(item) ? "bookmark.fill" : "bookmark",
-                             active: library.isWatchLater(item)) {
-                    library.toggleWatchLater(current)
-                }
-                CircleAction(title: "Просмотрено",
-                             systemImage: library.isWatched(item.id) ? "eye.fill" : "eye",
-                             active: library.isWatched(item.id)) {
-                    library.toggleWatched(current)
-                }
-                CircleAction(title: "Раздачи",
-                             systemImage: "list.bullet.rectangle",
-                             active: !sources.isEmpty) {
-                    pendingEpisode = nil
-                    showSources = true
-                }
-            }
-            .padding(.top, 2)
+            actionBar
+                .padding(.top, 4)
         }
         .padding(.horizontal, 16)
     }
 
-    /// "Авто" plays what was watched before or the best release of the preferred quality;
-    /// a quality plays the best release of that quality.
+    /// The trailer, favourites, "Смотреть позже" and the releases in one glass panel.
+    private var actionBar: some View {
+        HStack(spacing: 0) {
+            barButton(loadingTrailer ? "Ищем…" : "Трейлер",
+                      systemImage: loadingTrailer ? "hourglass" : "play.rectangle") {
+                openTrailer()
+            }
+            barButton(library.isFavorite(item) ? "В избранном" : "Избранное",
+                      systemImage: library.isFavorite(item) ? "heart.fill" : "heart") {
+                library.toggleFavorite(current)
+            }
+            barButton(library.isWatchLater(item) ? "Отложено" : "Позже",
+                      systemImage: library.isWatchLater(item) ? "bookmark.fill" : "bookmark") {
+                library.toggleWatchLater(current)
+            }
+            barButton("Раздачи",
+                      systemImage: sources.isEmpty ? "list.bullet.rectangle" : "list.bullet.rectangle.fill") {
+                pendingEpisode = nil
+                showSources = true
+            }
+        }
+        .padding(.horizontal, 6)
+        .frame(height: 64)
+        .glassSurface(Capsule())
+    }
+
+    private func barButton(_ title: String, systemImage: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(spacing: 4) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 19, weight: .regular))
+                    .contentTransition(.symbolEffect(.replace))
+                    .frame(height: 24)
+                Text(title)
+                    .font(.caption2.weight(.semibold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+            }
+            .foregroundStyle(Color.white.opacity(0.9))
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// Two menus under the button. Quality: "Авто" plays what was watched before or the best
+    /// release of the preferred quality, a quality plays the best release of that quality.
+    /// Voice-over filters the releases before the automatic quality and seeders ranking.
     @ViewBuilder
-    private var qualityChips: some View {
-        let options = qualityOptions
-        if autoPlayBest && options.count > 1 {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    Text("Качество")
-                        .font(.subheadline)
-                        .foregroundStyle(Theme.secondary)
-                        .padding(.trailing, 2)
-                    Chip(title: "Авто", selected: chosenQuality == nil) { chosenQuality = nil }
-                    ForEach(options) { quality in
-                        Chip(title: quality.title, selected: chosenQuality == quality) { chosenQuality = quality }
+    private var choiceMenus: some View {
+        let qualities = qualityOptions
+        let voices = voiceOptions
+        let showQuality = autoPlayBest && qualities.count > 1
+        let showVoice = autoPlayBest && !voices.isEmpty
+        if showQuality || showVoice {
+            HStack(spacing: 10) {
+                if showQuality {
+                    Menu {
+                        Picker("Качество", selection: $chosenQuality) {
+                            Text("Авто").tag(ReleaseQuality?.none)
+                            ForEach(qualities) { quality in
+                                Text(quality.title).tag(ReleaseQuality?.some(quality))
+                            }
+                        }
+                    } label: {
+                        choiceLabel("Качество", chosenQuality?.title ?? "Авто")
+                    }
+                }
+                if showVoice {
+                    Menu {
+                        Picker("Озвучка", selection: $chosenVoice) {
+                            Text("Авто").tag(ReleaseVoiceOption?.none)
+                            ForEach(voices) { voice in
+                                Text(voice.title).tag(ReleaseVoiceOption?.some(voice))
+                            }
+                        }
+                    } label: {
+                        choiceLabel("Озвучка", chosenVoice?.title ?? "Авто")
                     }
                 }
             }
         }
     }
 
-    /// Voice-over filters releases before the automatic quality/seeders ranking.
-    @ViewBuilder
-    private var voiceChips: some View {
-        let options = voiceOptions
-        if autoPlayBest && !options.isEmpty {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    Text("Озвучка")
-                        .font(.subheadline)
-                        .foregroundStyle(Theme.secondary)
-                        .padding(.trailing, 2)
-                    Chip(title: "Авто", selected: chosenVoice == nil) { chosenVoice = nil }
-                    ForEach(options) { voice in
-                        Chip(title: voice.title, selected: chosenVoice == voice) { chosenVoice = voice }
-                    }
-                }
-            }
+    private func choiceLabel(_ title: String, _ value: String) -> some View {
+        HStack(spacing: 6) {
+            Text(title)
+                .foregroundStyle(Theme.secondary)
+            Text(value)
+                .fontWeight(.semibold)
+                .foregroundStyle(.white)
+            Image(systemName: "chevron.down")
+                .font(.caption2.weight(.bold))
+                .foregroundStyle(Theme.secondary)
         }
+        .font(.subheadline)
+        .lineLimit(1)
+        .minimumScaleFactor(0.75)
+        .padding(.horizontal, 12)
+        .frame(maxWidth: .infinity)
+        .frame(height: 40)
+        .contentShape(Capsule())
+        .glassSurface(Capsule())
     }
 
     private func watchTapped() {
@@ -701,31 +809,47 @@ struct DetailsView: View {
         .padding(.horizontal, 16)
     }
 
+    /// "О фильме": the country, genres and authors in a glass table (the year, length and age
+    /// are under the title).
+    @ViewBuilder
     private var infoBlock: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            infoLine("Год", film?.yearText ?? current.year.map { String($0) } ?? "")
-            infoLine("Страна", current.countries.joined(separator: ", "))
-            infoLine("Жанр", current.genres.joined(separator: ", ").capitalizedFirst)
-            infoLine("Режиссёр", names(for: "DIRECTOR", limit: 3))
-            infoLine("Сценарий", names(for: "WRITER", limit: 3))
-            infoLine("Время", film?.lengthText ?? "")
-            infoLine("Возраст", film?.ageText ?? "")
+        let rows = infoRows
+        if !rows.isEmpty {
+            VStack(alignment: .leading, spacing: 10) {
+                SectionHeader(title: isSeries ? "О сериале" : "О фильме")
+                VStack(spacing: 0) {
+                    ForEach(Array(rows.enumerated()), id: \.offset) { index, row in
+                        if index > 0 {
+                            Divider()
+                        }
+                        HStack(alignment: .firstTextBaseline, spacing: 14) {
+                            Text(row.title)
+                                .foregroundStyle(Theme.secondary)
+                                .layoutPriority(1)
+                            Spacer(minLength: 0)
+                            Text(row.value)
+                                .multilineTextAlignment(.trailing)
+                        }
+                        .font(.subheadline)
+                        .padding(.vertical, 12)
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 2)
+                .glassSurface(RoundedRectangle(cornerRadius: 22, style: .continuous))
+                .padding(.horizontal, 16)
+            }
         }
-        .padding(.horizontal, 16)
     }
 
-    @ViewBuilder
-    private func infoLine(_ title: String, _ value: String) -> some View {
-        if !value.isEmpty {
-            HStack(alignment: .firstTextBaseline, spacing: 12) {
-                Text(title)
-                    .foregroundStyle(Theme.secondary)
-                    .frame(width: 88, alignment: .leading)
-                Text(value)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .font(.subheadline)
-        }
+    private var infoRows: [(title: String, value: String)] {
+        let rows: [(title: String, value: String)] = [
+            ("Страна", current.countries.joined(separator: ", ")),
+            ("Жанр", current.genres.joined(separator: ", ").capitalizedFirst),
+            ("Режиссёр", names(for: "DIRECTOR", limit: 3)),
+            ("Сценарий", names(for: "WRITER", limit: 3))
+        ]
+        return rows.filter { !$0.value.isEmpty }
     }
 
     private func names(for profession: String, limit: Int) -> String {
@@ -996,7 +1120,7 @@ struct EpisodeRow: View {
                 .font(.subheadline.weight(.bold))
                 .foregroundStyle(watched ? Theme.secondary : .white)
                 .frame(width: 36, height: 36)
-                .background(Circle().fill(Theme.card))
+                .background(Circle().fill(Color.white.opacity(0.08)))
             VStack(alignment: .leading, spacing: 3) {
                 Text(episode.title)
                     .font(.subheadline)
@@ -1045,42 +1169,5 @@ struct SimilarBlock: View {
                 loaded = true
             }
         }
-    }
-}
-
-/// How far the page is pulled down past its top.
-@Observable
-final class HeaderStretch {
-    var pull: CGFloat = 0
-}
-
-/// The picture at the top of a film page. It goes under the navigation bar and grows when the
-/// page is pulled down, instead of leaving an empty gap above it.
-private struct StretchyBackdrop: View {
-    let stretch: HeaderStretch
-    let height: CGFloat
-    let cover: URL?
-    let poster: URL?
-
-    var body: some View {
-        Color.clear
-            .frame(height: height)
-            .frame(maxWidth: .infinity)
-            .overlay {
-                if let cover = cover {
-                    PosterImage(url: cover, maxPixel: 1300)
-                } else {
-                    PosterImage(url: poster)
-                        .blur(radius: 24)
-                        .opacity(0.55)
-                }
-            }
-            .overlay {
-                LinearGradient(colors: [Theme.background.opacity(0.35), Theme.background.opacity(0.05),
-                                        Theme.background.opacity(0.6), Theme.background],
-                               startPoint: .top, endPoint: .bottom)
-            }
-            .clipped()
-            .scaleEffect(1 + max(0, stretch.pull) / max(height, 1), anchor: .bottom)
     }
 }

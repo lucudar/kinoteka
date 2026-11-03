@@ -153,12 +153,15 @@ struct PosterImage: View {
     let url: URL?
     var mode: ContentMode = .fill
     var maxPixel: Int = ImageCache.defaultMaxPixel
+    /// The grey card with a film icon while the picture loads (off for a picture over another one).
+    var placeholder = true
     @State private var image: UIImage?
 
-    init(url: URL?, mode: ContentMode = .fill, maxPixel: Int = ImageCache.defaultMaxPixel) {
+    init(url: URL?, mode: ContentMode = .fill, maxPixel: Int = ImageCache.defaultMaxPixel, placeholder: Bool = true) {
         self.url = url
         self.mode = mode
         self.maxPixel = maxPixel
+        self.placeholder = placeholder
         _image = State(initialValue: url.flatMap { ImageCache.shared.cached($0, maxPixel: maxPixel) })
     }
 
@@ -168,7 +171,7 @@ struct PosterImage: View {
                 Image(uiImage: image)
                     .resizable()
                     .aspectRatio(contentMode: mode)
-            } else if mode == .fill {
+            } else if mode == .fill && placeholder {
                 Theme.card
                 Image(systemName: "film")
                     .font(.title2)
@@ -195,93 +198,118 @@ struct PosterImage: View {
 
 // MARK: - Cards
 
-struct RatingBadge: View {
-    let value: Double
+extension MediaItem {
+    /// "7,9 · 2021" under a poster: the rating and the year (the genre when one of them is missing).
+    var cardMeta: String {
+        var parts: [String] = []
+        if let rating = ratingKP ?? ratingIMDb, rating > 0 { parts.append(RatingStyle.text(rating)) }
+        if let year = year { parts.append(String(year)) }
+        if parts.count < 2, let genre = genres.first, !genre.isEmpty { parts.append(genre.capitalizedFirst) }
+        return parts.joined(separator: " · ")
+    }
+
+    /// "Боевик · 2026 · 7,9" under a big poster.
+    var shortMeta: String {
+        var parts: [String] = []
+        if let genre = genres.first, !genre.isEmpty { parts.append(genre.capitalizedFirst) }
+        if let year = year { parts.append(String(year)) }
+        if let rating = ratingKP ?? ratingIMDb, rating > 0 { parts.append(RatingStyle.text(rating)) }
+        return parts.joined(separator: " · ")
+    }
+}
+
+/// "Смотреть позже", "В избранное" and "Просмотрено" in the context menu of a film card.
+struct LibraryMenuItems: View {
+    let library: LibraryStore
+    let item: MediaItem
 
     var body: some View {
-        Text(RatingStyle.text(value))
+        Button {
+            library.toggleWatchLater(item)
+        } label: {
+            Label(library.isWatchLater(item) ? "Убрать из «Смотреть позже»" : "Смотреть позже",
+                  systemImage: library.isWatchLater(item) ? "bookmark.slash" : "bookmark")
+        }
+        Button {
+            library.toggleFavorite(item)
+        } label: {
+            Label(library.isFavorite(item) ? "Убрать из избранного" : "В избранное",
+                  systemImage: library.isFavorite(item) ? "heart.slash" : "heart")
+        }
+        Button {
+            library.toggleWatched(item)
+        } label: {
+            Label(library.isWatched(item.id) ? "Отметить непросмотренным" : "Отметить просмотренным",
+                  systemImage: library.isWatched(item.id) ? "eye.slash" : "eye")
+        }
+    }
+}
+
+/// The marks of a poster: watched, in "Смотреть позже".
+struct PosterMarks: View {
+    @EnvironmentObject private var library: LibraryStore
+    let item: MediaItem
+
+    var body: some View {
+        VStack(spacing: 5) {
+            if library.isWatched(item.id) {
+                mark("eye.fill")
+            }
+            if library.isWatchLater(item) {
+                mark("bookmark.fill")
+            }
+        }
+        .padding(6)
+    }
+
+    private func mark(_ systemImage: String) -> some View {
+        Image(systemName: systemImage)
             .font(.caption2.weight(.bold))
             .foregroundStyle(.white)
-            .padding(.horizontal, 5)
-            .padding(.vertical, 2)
-            .background(RatingStyle.color(value), in: RoundedRectangle(cornerRadius: 4, style: .continuous))
+            .frame(width: 22, height: 22)
+            .background(Circle().fill(Color.black.opacity(0.6)))
     }
 }
 
 struct PosterCard: View {
+    static let cornerRadius: CGFloat = 14
+
     @EnvironmentObject private var library: LibraryStore
     let item: MediaItem
     var width: CGFloat? = nil
-    /// Replaces the year and country line (the role of an actor, for example).
+    /// Replaces the rating and year line (the role of an actor, for example).
     var caption: String? = nil
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 0) {
             Color.clear
                 .aspectRatio(2.0 / 3.0, contentMode: .fit)
                 .overlay { PosterImage(url: item.poster) }
-                .overlay(alignment: .topLeading) {
-                    if let rating = item.ratingKP ?? item.ratingIMDb, rating > 0 {
-                        RatingBadge(value: rating).padding(6)
-                    }
-                }
-                .overlay(alignment: .topTrailing) {
-                    VStack(spacing: 5) {
-                        if library.isWatched(item.id) {
-                            Image(systemName: "eye.fill")
-                                .font(.caption2.weight(.bold))
-                                .foregroundStyle(.white)
-                                .padding(5)
-                                .background(Circle().fill(Theme.accent))
-                        }
-                        if library.isWatchLater(item) {
-                            Image(systemName: "bookmark.fill")
-                                .font(.caption2.weight(.bold))
-                                .foregroundStyle(.white)
-                                .padding(5)
-                                .background(Circle().fill(Color.black.opacity(0.7)))
-                        }
-                    }
-                    .padding(6)
-                }
-                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .overlay(alignment: .topTrailing) { PosterMarks(item: item) }
+                .clipShape(RoundedRectangle(cornerRadius: PosterCard.cornerRadius, style: .continuous))
                 .overlay {
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .stroke(Color.white.opacity(0.08), lineWidth: 0.75)
+                    RoundedRectangle(cornerRadius: PosterCard.cornerRadius, style: .continuous)
+                        .stroke(Color.white.opacity(0.1), lineWidth: 0.5)
                 }
             Text(item.title)
                 .font(.footnote.weight(.semibold))
                 .foregroundStyle(.white)
-                .lineLimit(2, reservesSpace: true)
+                .lineLimit(2)
                 .multilineTextAlignment(.leading)
-            Text(caption ?? item.subtitleLine)
-                .font(.caption2)
-                .foregroundStyle(Theme.secondary)
-                .lineLimit(1)
+                .padding(.top, 8)
+            let meta = caption ?? item.cardMeta
+            if !meta.isEmpty {
+                Text(meta)
+                    .font(.caption)
+                    .foregroundStyle(Theme.secondary)
+                    .lineLimit(1)
+                    .padding(.top, 2)
+            }
         }
         .frame(width: width)
         .frame(maxWidth: width == nil ? .infinity : nil, alignment: .leading)
         .contentShape(Rectangle())
-        .contextMenu {
-            Button {
-                library.toggleWatchLater(item)
-            } label: {
-                Label(library.isWatchLater(item) ? "Убрать из «Смотреть позже»" : "Смотреть позже",
-                      systemImage: library.isWatchLater(item) ? "bookmark.slash" : "bookmark")
-            }
-            Button {
-                library.toggleFavorite(item)
-            } label: {
-                Label(library.isFavorite(item) ? "Убрать из избранного" : "В избранное",
-                      systemImage: library.isFavorite(item) ? "heart.slash" : "heart")
-            }
-            Button {
-                library.toggleWatched(item)
-            } label: {
-                Label(library.isWatched(item.id) ? "Отметить непросмотренным" : "Отметить просмотренным",
-                      systemImage: library.isWatched(item.id) ? "eye.slash" : "eye")
-            }
-        }
+        .contextMenu { LibraryMenuItems(library: library, item: item) }
     }
 }
 
@@ -311,7 +339,7 @@ struct PlaceholderRow: View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 12) {
                 ForEach(0..<6, id: \.self) { _ in
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    RoundedRectangle(cornerRadius: PosterCard.cornerRadius, style: .continuous)
                         .fill(Theme.card)
                         .frame(width: cardWidth, height: cardWidth * 1.5)
                 }
@@ -375,31 +403,22 @@ struct SectionHeader: View {
     }
 }
 
-struct CircleAction: View {
+/// The title of a row that opens the whole list: "Популярные фильмы ›".
+struct SectionLinkLabel: View {
     let title: String
-    let systemImage: String
-    var active: Bool = false
-    let action: () -> Void
 
     var body: some View {
-        Button(action: action) {
-            VStack(spacing: 6) {
-                Image(systemName: systemImage)
-                    .font(.system(size: 18, weight: .semibold))
-                    .foregroundStyle(active ? Theme.accent : Color.white)
-                    .contentTransition(.symbolEffect(.replace))
-                    .frame(width: 48, height: 48)
-                    .glassSurface(Circle(), tint: active ? Theme.accent.opacity(0.28) : nil)
-                Text(title)
-                    .font(.caption2)
-                    .foregroundStyle(Theme.secondary)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.8)
-            }
-            .frame(maxWidth: .infinity)
-            .contentShape(Rectangle())
+        HStack(alignment: .firstTextBaseline, spacing: 5) {
+            Text(title)
+                .font(.title3.weight(.bold))
+                .foregroundStyle(.white)
+            Image(systemName: "chevron.right")
+                .font(.subheadline.weight(.bold))
+                .foregroundStyle(Theme.secondary.opacity(0.7))
+            Spacer(minLength: 0)
         }
-        .buttonStyle(.plain)
+        .padding(.horizontal, 16)
+        .contentShape(Rectangle())
     }
 }
 
@@ -453,7 +472,7 @@ struct TokenBanner: View {
                     .foregroundStyle(Theme.secondary)
             }
             .padding(14)
-            .background(Theme.card, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .glassSurface(RoundedRectangle(cornerRadius: 20, style: .continuous))
         }
         .buttonStyle(.plain)
         .padding(.horizontal, 16)
@@ -470,11 +489,10 @@ struct Chip: View {
             Text(title)
                 .font(.subheadline.weight(selected ? .semibold : .medium))
                 .lineLimit(1)
-                .foregroundStyle(.white)
                 .padding(.horizontal, 14)
                 .padding(.vertical, 8)
         }
-        .glassButton(Capsule(), tint: selected ? Theme.accent : nil)
+        .buttonStyle(ChipButtonStyle(selected: selected))
         .animation(.smooth(duration: 0.25), value: selected)
     }
 }

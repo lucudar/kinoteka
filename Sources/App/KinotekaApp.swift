@@ -73,6 +73,7 @@ struct KinotekaApp: App {
                 .environmentObject(channels)
                 .preferredColorScheme(.dark)
                 .tint(Theme.accent)
+                .toggleStyle(AppSwitchStyle())
         }
     }
 }
@@ -122,6 +123,7 @@ struct RootView: View {
             CrashReportSheet(lines: notice.lines)
                 .preferredColorScheme(.dark)
                 .tint(Theme.accent)
+                .toggleStyle(AppSwitchStyle())
         }
     }
 

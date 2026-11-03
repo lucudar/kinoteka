@@ -76,7 +76,7 @@ struct SubtitleSearchList: View {
                 .font(.caption.weight(.bold))
                 .foregroundStyle(.white)
                 .frame(width: 34, height: 24)
-                .background(Theme.accent.opacity(0.35), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                .background(Color.white.opacity(0.18), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
             VStack(alignment: .leading, spacing: 3) {
                 Text(candidate.release.isEmpty ? candidate.fileName : candidate.release)
                     .font(.subheadline)

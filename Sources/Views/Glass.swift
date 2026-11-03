@@ -53,35 +53,15 @@ extension View {
         #endif
     }
 
-    /// The main action of a screen: tinted Liquid Glass on iOS 26, a filled accent shape before.
-    @ViewBuilder
+    /// The main action of a screen: a white capsule with black text, the one bright control
+    /// among the glass.
     func primaryActionStyle() -> some View {
-        #if compiler(>=6.2)
-        if #available(iOS 26.0, *) {
-            self.buttonStyle(.glassProminent)
-                .tint(Theme.accent)
-        } else {
-            self.buttonStyle(FilledActionButtonStyle())
-        }
-        #else
-        self.buttonStyle(FilledActionButtonStyle())
-        #endif
+        buttonStyle(PrimaryButtonStyle())
     }
 
-    /// A compact accent button (a dialog, a prompt): tinted Liquid Glass on iOS 26,
-    /// a filled system button before.
-    @ViewBuilder
+    /// A compact main button (a dialog, a prompt): the same white capsule, smaller.
     func prominentButtonStyle() -> some View {
-        #if compiler(>=6.2)
-        if #available(iOS 26.0, *) {
-            self.buttonStyle(.glassProminent)
-                .tint(Theme.accent)
-        } else {
-            self.buttonStyle(.borderedProminent)
-        }
-        #else
-        self.buttonStyle(.borderedProminent)
-        #endif
+        buttonStyle(PrimaryButtonStyle(compact: true))
     }
 
     /// A secondary action next to the main one: Liquid Glass on iOS 26, a bordered button before.
@@ -165,15 +145,53 @@ private struct MaterialGlass<S: Shape>: ViewModifier {
     }
 }
 
-/// The main action before iOS 26: the accent colour in a rounded rectangle.
-struct FilledActionButtonStyle: ButtonStyle {
+/// The white capsule of the main action. It is drawn the same on every iOS: tinted glass of a
+/// light colour would make the text hard to read.
+struct PrimaryButtonStyle: ButtonStyle {
+    var compact = false
+    @Environment(\.isEnabled) private var isEnabled
+
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .foregroundStyle(.white)
-            .background(Theme.accent, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .opacity(configuration.isPressed ? 0.75 : 1)
-            .scaleEffect(configuration.isPressed ? 0.98 : 1)
+            .font(compact ? Font.subheadline.weight(.semibold) : Font.headline)
+            .foregroundStyle(Theme.onAccent)
+            .padding(.horizontal, compact ? 18 : 20)
+            .padding(.vertical, compact ? 8 : 15)
+            .background(Color.white.opacity(isEnabled ? 0.95 : 0.55), in: Capsule())
+            .contentShape(Capsule())
+            .shadow(color: .black.opacity(compact ? 0 : 0.25), radius: 14, y: 8)
+            .scaleEffect(configuration.isPressed ? 0.97 : 1)
+            .opacity(configuration.isPressed ? 0.8 : 1)
             .animation(.easeOut(duration: 0.15), value: configuration.isPressed)
+    }
+}
+
+/// A choice in a row of chips: the selected one is white with black text, the others are glass.
+struct ChipButtonStyle: ButtonStyle {
+    let selected: Bool
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .foregroundStyle(selected ? Theme.onAccent : Color.white)
+            .background {
+                Capsule()
+                    .fill(Color.white)
+                    .opacity(selected ? 1 : 0)
+            }
+            .contentShape(Capsule())
+            .glassSurface(Capsule())
+            .scaleEffect(configuration.isPressed ? 0.95 : 1)
+            .opacity(configuration.isPressed ? 0.8 : 1)
+            .animation(.spring(duration: 0.22), value: configuration.isPressed)
+    }
+}
+
+/// Switches keep the green of the system: with the white tint of the app the knob would vanish.
+struct AppSwitchStyle: ToggleStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        Toggle(configuration)
+            .toggleStyle(.switch)
+            .tint(Theme.toggleOn)
     }
 }
 

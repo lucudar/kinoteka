@@ -1,11 +1,17 @@
 import SwiftUI
 import UIKit
 
+/// Monochrome: white controls and marks, Liquid Glass and a dark background that takes the colour
+/// of the poster on screen (`AmbientGlow`).
 enum Theme {
-    static let accent = Color(red: 0.0, green: 0.58, blue: 0.965)
-    static let background = Color(red: 0.063, green: 0.071, blue: 0.086)
-    static let card = Color(red: 0.125, green: 0.137, blue: 0.161)
-    static let secondary = Color(red: 0.733, green: 0.761, blue: 0.78)
+    static let accent = Color.white
+    /// Text and glyphs on the accent (the white "Смотреть" button, a selected chip).
+    static let onAccent = Color.black
+    /// Switches stay green, as in the system: on a white track the knob would vanish.
+    static let toggleOn = Color(red: 0.2, green: 0.78, blue: 0.35)
+    static let background = Color(red: 0.043, green: 0.047, blue: 0.063)
+    static let card = Color(red: 0.11, green: 0.114, blue: 0.13)
+    static let secondary = Color(white: 0.64)
 }
 
 enum SettingsKeys {
@@ -116,14 +122,9 @@ enum TimeFormat {
 }
 
 enum RatingStyle {
-    static func color(_ value: Double) -> Color {
-        if value >= 7 { return Color(red: 0.2, green: 0.65, blue: 0.3) }
-        if value >= 5 { return Color(red: 0.45, green: 0.47, blue: 0.5) }
-        return Color(red: 0.8, green: 0.25, blue: 0.25)
-    }
-
+    /// "7,9": one decimal with a Russian comma.
     static func text(_ value: Double) -> String {
-        String(format: "%.1f", value)
+        String(format: "%.1f", value).replacingOccurrences(of: ".", with: ",")
     }
 }
 

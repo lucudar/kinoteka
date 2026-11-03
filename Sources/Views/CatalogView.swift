@@ -106,6 +106,7 @@ struct CatalogView: View {
                 FiltersView(filter: filter) { newFilter in
                     filter = newFilter
                 }
+                .toggleStyle(AppSwitchStyle())
             }
             .onChange(of: filter) { _, newFilter in
                 newFilter.save()

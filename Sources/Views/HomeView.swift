@@ -78,13 +78,19 @@ struct HomeView: View {
     }
 }
 
-/// What is popular now as big cards paged sideways: the poster over its own blurred copy,
-/// with Liquid Glass buttons.
+/// What is popular now as a cover flow: the poster in the middle is big, its neighbours are
+/// smaller and dimmed, and the top of the screen takes the colour of the poster in the middle.
 struct FeaturedCarousel: View {
     let section: HomeSection
     let token: String
     @State private var items: [MediaItem] = []
     @State private var failed = false
+    /// The poster in the middle.
+    @State private var currentID: Int?
+
+    private var current: MediaItem? {
+        items.first { $0.id == currentID } ?? items.first
+    }
 
     var body: some View {
         Group {
@@ -92,55 +98,98 @@ struct FeaturedCarousel: View {
                 // The ordinary row of this collection tells what went wrong.
                 CollectionRow(section: section, token: token)
             } else {
-                cards
+                content
             }
         }
         .task(id: token) { await load() }
     }
 
-    private var cards: some View {
-        VStack(alignment: .leading, spacing: 10) {
+    private var content: some View {
+        VStack(spacing: 0) {
             NavigationLink(value: section) {
-                HStack(alignment: .firstTextBaseline) {
-                    Text(section.title)
-                        .font(.title3.weight(.bold))
-                        .foregroundStyle(.white)
-                    Spacer()
-                    Text("Все")
-                        .font(.subheadline)
-                        .foregroundStyle(Theme.accent)
-                }
-                .padding(.horizontal, 16)
+                SectionLinkLabel(title: section.title)
             }
             .buttonStyle(.plain)
+            .padding(.bottom, 14)
 
+            coverflow
+
+            caption
+                .frame(height: 52)
+                .animation(.easeInOut(duration: 0.25), value: current?.id)
+                .padding(.top, 16)
+        }
+        .background(alignment: .top) {
+            // Reaches up under the large title and the status bar, fades out under the caption.
+            AmbientGlow(url: current?.poster, height: 1250)
+                .offset(y: -600)
+        }
+    }
+
+    private var coverflow: some View {
+        GeometryReader { proxy in
+            let width = proxy.size.width
+            let margin = max(16, (width - CoverCard.width) / 2)
             ScrollView(.horizontal, showsIndicators: false) {
-                LazyHStack(spacing: 12) {
+                LazyHStack(spacing: 0) {
                     if items.isEmpty {
-                        ForEach(0..<2, id: \.self) { _ in
-                            RoundedRectangle(cornerRadius: FeaturedCard.cornerRadius, style: .continuous)
+                        ForEach([-1, -2, -3], id: \.self) { _ in
+                            RoundedRectangle(cornerRadius: CoverCard.cornerRadius, style: .continuous)
                                 .fill(Theme.card)
-                                .frame(height: FeaturedCard.height)
-                                .containerRelativeFrame(.horizontal) { length, _ in length * 0.9 }
+                                .frame(width: CoverCard.width, height: CoverCard.height)
+                                .modifier(CoverflowEffect(width: width))
                         }
                     } else {
                         ForEach(items) { item in
-                            FeaturedCard(item: item)
-                                .containerRelativeFrame(.horizontal) { length, _ in length * 0.9 }
-                                .scrollTransition(.interactive, axis: .horizontal) { content, phase in
-                                    content
-                                        .scaleEffect(phase.isIdentity ? 1 : 0.94)
-                                        .opacity(phase.isIdentity ? 1 : 0.7)
-                                }
+                            CoverCard(item: item)
+                                .modifier(CoverflowEffect(width: width))
                         }
                     }
                 }
                 .scrollTargetLayout()
             }
-            .contentMargins(.horizontal, 16, for: .scrollContent)
+            .contentMargins(.horizontal, margin, for: .scrollContent)
             .scrollTargetBehavior(.viewAligned)
+            .scrollPosition(id: $currentID, anchor: .center)
+            .scrollClipDisabled()
             .scrollDisabled(items.isEmpty)
             .modifier(PulseWhenEmpty(empty: items.isEmpty))
+        }
+        .frame(height: CoverCard.height)
+    }
+
+    @ViewBuilder
+    private var caption: some View {
+        if let item = current {
+            NavigationLink(value: item) {
+                VStack(spacing: 4) {
+                    Text(item.title)
+                        .font(.title3.weight(.bold))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
+                    Text(item.shortMeta)
+                        .font(.subheadline)
+                        .foregroundStyle(Theme.secondary)
+                        .lineLimit(1)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, 24)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .id(item.id)
+            .transition(.opacity)
+        } else {
+            VStack(spacing: 8) {
+                Capsule()
+                    .fill(Theme.card)
+                    .frame(width: 190, height: 18)
+                Capsule()
+                    .fill(Theme.card)
+                    .frame(width: 120, height: 12)
+            }
+            .modifier(LoadingPulse())
         }
     }
 
@@ -152,6 +201,24 @@ struct FeaturedCarousel: View {
         } catch {
             if Task.isCancelled { return }
             if items.isEmpty { failed = true }
+        }
+    }
+}
+
+/// The posters of the cover flow shrink and dim as they move away from the middle.
+private struct CoverflowEffect: ViewModifier {
+    /// The width of the cover flow.
+    let width: CGFloat
+
+    func body(content: Content) -> some View {
+        let center = width / 2
+        let step = CoverCard.width
+        return content.visualEffect { effect, geometry in
+            let frame = geometry.frame(in: .scrollView(axis: .horizontal))
+            let distance = min(abs(frame.midX - center) / step, 1)
+            return effect
+                .scaleEffect(1 - distance * 0.2)
+                .opacity(1 - distance * 0.5)
         }
     }
 }
@@ -169,95 +236,44 @@ private struct PulseWhenEmpty: ViewModifier {
     }
 }
 
-struct FeaturedCard: View {
-    static let height: CGFloat = 236
-    static let cornerRadius: CGFloat = 24
+/// A big poster of the cover flow on the home screen.
+struct CoverCard: View {
+    static let width: CGFloat = 214
+    static let height: CGFloat = 321
+    static let cornerRadius: CGFloat = 20
 
     @EnvironmentObject private var library: LibraryStore
     let item: MediaItem
 
-    /// The full-size poster: the card is bigger than a grid cell.
+    /// The full-size poster, drawn over the preview of the lists (that one is usually loaded already).
     private var largePoster: URL? {
-        URL(string: item.posterURL ?? "") ?? item.poster
+        guard let preview = item.posterPreviewURL, !preview.isEmpty,
+              let full = item.posterURL, full != preview else { return nil }
+        return URL(string: full)
     }
 
     var body: some View {
         NavigationLink(value: item) {
-            ZStack(alignment: .bottomLeading) {
-                Color.clear
-                    .overlay {
-                        PosterImage(url: item.poster, maxPixel: 300)
-                            .scaleEffect(1.3)
-                            .blur(radius: 26)
-                    }
-                    .overlay {
-                        LinearGradient(colors: [Color.black.opacity(0.05), Color.black.opacity(0.7)],
-                                       startPoint: .top, endPoint: .bottom)
-                    }
-                    .clipped()
-
-                HStack(alignment: .bottom, spacing: 14) {
-                    Color.clear
-                        .frame(width: 124, height: 186)
-                        .overlay { PosterImage(url: largePoster, maxPixel: 600) }
-                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                        .overlay {
-                            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                .stroke(Color.white.opacity(0.12), lineWidth: 0.75)
-                        }
-                        .shadow(color: .black.opacity(0.45), radius: 14, y: 8)
-
-                    VStack(alignment: .leading, spacing: 6) {
-                        Spacer(minLength: 0)
-                        if !item.subtitleLine.isEmpty {
-                            Text(item.subtitleLine)
-                                .font(.caption)
-                                .foregroundStyle(.white.opacity(0.75))
-                                .lineLimit(2)
-                        }
-                        Text(item.title)
-                            .font(.title3.weight(.bold))
-                            .foregroundStyle(.white)
-                            .lineLimit(3)
-                            .minimumScaleFactor(0.8)
-                        if let rating = item.ratingKP ?? item.ratingIMDb, rating > 0 {
-                            RatingBadge(value: rating)
-                        }
-                        Label(item.kind == .series ? "К сериалу" : "К фильму", systemImage: "play.fill")
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 9)
-                            .glassSurface(Capsule(), style: .clear, tint: Theme.accent.opacity(0.55))
-                            .padding(.top, 4)
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: 186, alignment: .bottomLeading)
+            Color.clear
+                .frame(width: CoverCard.width, height: CoverCard.height)
+                .overlay { PosterImage(url: item.poster) }
+                .overlay { PosterImage(url: largePoster, maxPixel: 1000, placeholder: false) }
+                .overlay(alignment: .topTrailing) { PosterMarks(item: item) }
+                .clipShape(RoundedRectangle(cornerRadius: CoverCard.cornerRadius, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: CoverCard.cornerRadius, style: .continuous)
+                        .stroke(Color.white.opacity(0.14), lineWidth: 0.5)
                 }
-                .padding(16)
-            }
-            .frame(height: FeaturedCard.height)
-            .clipShape(RoundedRectangle(cornerRadius: FeaturedCard.cornerRadius, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: FeaturedCard.cornerRadius, style: .continuous)
-                    .stroke(Color.white.opacity(0.08), lineWidth: 1)
-            }
-            .contentShape(RoundedRectangle(cornerRadius: FeaturedCard.cornerRadius, style: .continuous))
+                .background {
+                    // The shadow of a plain shape is cheaper than one of the picture.
+                    RoundedRectangle(cornerRadius: CoverCard.cornerRadius, style: .continuous)
+                        .fill(Color.black)
+                        .shadow(color: .black.opacity(0.5), radius: 22, y: 14)
+                }
+                .contentShape(RoundedRectangle(cornerRadius: CoverCard.cornerRadius, style: .continuous))
         }
         .buttonStyle(.plain)
-        .overlay(alignment: .topTrailing) {
-            Button {
-                library.toggleWatchLater(item)
-            } label: {
-                Image(systemName: library.isWatchLater(item) ? "bookmark.fill" : "bookmark")
-                    .font(.system(size: 16, weight: .semibold))
-                    .foregroundStyle(.white)
-                    .contentTransition(.symbolEffect(.replace))
-                    .frame(width: 40, height: 40)
-            }
-            .glassButton(Circle(), style: .clear)
-            .padding(12)
-            .accessibilityLabel(library.isWatchLater(item) ? "Убрать из «Смотреть позже»" : "Смотреть позже")
-        }
+        .contextMenu { LibraryMenuItems(library: library, item: item) }
     }
 }
 
@@ -348,58 +364,63 @@ struct ContinueWatchingRow: View {
 struct ContinueCard: View {
     let entry: ContinueEntry
 
-    /// "Осталось 34 мин": the length is known from the saved position and its share.
-    private var remainingText: String? {
+    /// "34 мин": the length is known from the saved position and its share.
+    private var remaining: String? {
         guard let time = entry.time, time > 0, entry.position > 0.02, entry.position < 0.98 else { return nil }
         let total = Double(time) / entry.position
         let minutes = Int(((total - Double(time)) / 60_000).rounded(.up))
         guard minutes > 0, minutes < 1_000 else { return nil }
-        if minutes < 60 { return "Осталось \(minutes) мин" }
+        if minutes < 60 { return "\(minutes) мин" }
         let rest = minutes % 60
-        return rest == 0 ? "Осталось \(minutes / 60) ч" : "Осталось \(minutes / 60) ч \(rest) мин"
+        return rest == 0 ? "\(minutes / 60) ч" : "\(minutes / 60) ч \(rest) мин"
+    }
+
+    /// "2 сезон, 3 серия · ещё 34 мин", or "Осталось 34 мин" for a film.
+    private var details: String? {
+        let subtitle = entry.subtitle?.trimmed ?? ""
+        switch (subtitle.isEmpty, remaining) {
+        case (true, nil): return nil
+        case (true, let left?): return "Осталось " + left
+        case (false, nil): return subtitle
+        case (false, let left?): return subtitle + " · ещё " + left
+        }
     }
 
     var body: some View {
         HStack(spacing: 12) {
             Color.clear
-                .frame(width: 60, height: 90)
+                .frame(width: 52, height: 78)
                 .overlay { PosterImage(url: entry.item?.poster) }
-                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                 .overlay {
                     Image(systemName: "play.fill")
-                        .font(.system(size: 14, weight: .bold))
+                        .font(.system(size: 11, weight: .bold))
                         .foregroundStyle(.white)
-                        .frame(width: 34, height: 34)
+                        .frame(width: 28, height: 28)
                         .glassSurface(Circle(), style: .clear)
                 }
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: 3) {
                 Text(entry.item?.title ?? entry.title)
                     .font(.subheadline.weight(.semibold))
-                    .lineLimit(2)
-                if let subtitle = entry.subtitle, !subtitle.isEmpty {
-                    Text(subtitle)
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                if let details = details {
+                    Text(details)
                         .font(.caption)
                         .foregroundStyle(Theme.secondary)
                         .lineLimit(2)
                 }
-                Spacer(minLength: 0)
-                if let remaining = remainingText {
-                    Text(remaining)
-                        .font(.caption2)
-                        .foregroundStyle(Theme.secondary)
-                }
                 ProgressView(value: min(max(entry.position, 0), 1))
-                    .tint(Theme.accent)
+                    .tint(.white)
+                    .padding(.top, 6)
             }
-            .padding(.vertical, 4)
+            Spacer(minLength: 0)
         }
-        .padding(10)
-        .frame(width: 270, height: 110)
-        .background(Theme.card, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(Color.white.opacity(0.06), lineWidth: 0.75)
-        }
+        .padding(.leading, 10)
+        .padding(.trailing, 14)
+        .frame(width: 290, height: 98)
+        .contentShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .glassSurface(RoundedRectangle(cornerRadius: 22, style: .continuous))
     }
 }
 
@@ -412,16 +433,7 @@ struct CollectionRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             NavigationLink(value: section) {
-                HStack(alignment: .firstTextBaseline) {
-                    Text(section.title)
-                        .font(.title3.weight(.bold))
-                        .foregroundStyle(.white)
-                    Spacer()
-                    Text("Все")
-                        .font(.subheadline)
-                        .foregroundStyle(Theme.accent)
-                }
-                .padding(.horizontal, 16)
+                SectionLinkLabel(title: section.title)
             }
             .buttonStyle(.plain)
 
