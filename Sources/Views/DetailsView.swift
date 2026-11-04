@@ -2,6 +2,8 @@ import SwiftUI
 
 struct DetailsView: View {
     let item: MediaItem
+    /// Starts the film once the page has loaded ("Смотреть" on the home screen).
+    let autoplay: Bool
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var coordinator: PlayerCoordinator
     @Environment(\.openURL) private var openURL
@@ -37,6 +39,18 @@ struct DetailsView: View {
     @State private var seasonPreselected = false
     /// The header has scrolled away: the title is shown in the navigation bar.
     @State private var titleInBar = false
+    /// The page takes the colour of the poster.
+    @State private var tint: Color?
+    /// A landscape frame of the film for the trailer card.
+    @State private var backdrop: URL?
+    /// The automatic start ("Смотреть" on the home screen) has happened.
+    @State private var autoplayDone = false
+
+    init(item: MediaItem, autoplay: Bool = false) {
+        self.item = item
+        self.autoplay = autoplay
+        _tint = State(initialValue: PosterTint.cached(item.poster))
+    }
 
     private var current: MediaItem { film?.item ?? item }
     private var isSeries: Bool { film?.isSeries ?? (item.kind == .series) }
@@ -221,7 +235,7 @@ struct DetailsView: View {
             if releases == nil {
                 return releasesFailed ? "Поиск раздач не ответил — «Смотреть» попробует ещё раз" : "Ищем раздачи…"
             }
-            return "Раздачи не найдены автоматически — откройте «Раздачи»"
+            return "Раздачи не найдены автоматически — откройте «…» → «Все раздачи»"
         }
     }
 
@@ -232,34 +246,40 @@ struct DetailsView: View {
     }
 
     var body: some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 22) {
-                header
-                actions
-                if let text = descriptionText {
-                    descriptionBlock(text)
+        GeometryReader { proxy in
+            let heroHeight = DetailsView.heroHeight(for: proxy.size.width)
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 24) {
+                    header(heroHeight: heroHeight)
+                    actions
+                    if let text = descriptionText {
+                        descriptionBlock(text)
+                    }
+                    if isSeries && !seasons.isEmpty {
+                        seasonsBlock
+                    }
+                    trailerCard
+                    if !cast.isEmpty {
+                        peopleBlock
+                    }
+                    detailsBlock
+                    if let error = error {
+                        ErrorView(message: error) { Task { await load() } }
+                    }
+                    SimilarBlock(itemId: item.id)
                 }
-                infoBlock
-                if isSeries && !seasons.isEmpty {
-                    seasonsBlock
-                }
-                if !people.isEmpty {
-                    peopleBlock
-                }
-                if let error = error {
-                    ErrorView(message: error) { Task { await load() } }
-                }
-                SimilarBlock(itemId: item.id)
+                .padding(.bottom, 32)
             }
-            .padding(.bottom, 32)
+            // The poster reaches under the status bar and the buttons of the navigation bar.
+            .ignoresSafeArea(edges: .top)
+            .onScrollGeometryChange(for: Bool.self) { geometry in
+                // The title on the picture has gone under the navigation bar.
+                geometry.contentOffset.y + geometry.contentInsets.top > heroHeight - 170
+            } action: { _, scrolled in
+                withAnimation(.easeInOut(duration: 0.2)) { titleInBar = scrolled }
+            }
         }
-        .onScrollGeometryChange(for: Bool.self) { geometry in
-            // The title under the poster has gone under the navigation bar.
-            geometry.contentOffset.y + geometry.contentInsets.top > 300
-        } action: { _, scrolled in
-            withAnimation(.easeInOut(duration: 0.2)) { titleInBar = scrolled }
-        }
-        .background(Theme.background)
+        .background(pageColor)
         .navigationTitle(current.title)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
@@ -287,6 +307,8 @@ struct DetailsView: View {
         }
         .task(id: token) { await load() }
         .task(id: searchQuery) { await prefetchReleases() }
+        .task(id: current.poster) { await loadTint() }
+        .task(id: filmResolved) { await loadBackdrop() }
         .onReceive(NotificationCenter.default.publisher(for: TorrentSearchService.updated)) { note in
             // The slower source (Zona's index or Jacred) answered: its releases join the plan.
             guard let query = searchQuery, let key = note.object as? String,
@@ -314,57 +336,78 @@ struct DetailsView: View {
         .onAppear { library.addHistory(current) }
     }
 
+    /// The poster takes about half of the screen.
+    static func heroHeight(for width: CGFloat) -> CGFloat {
+        min(max(width * 1.12, 360), 560)
+    }
+
+    /// The page takes the colour of the poster (a dark one: the text stays white).
+    private var pageColor: Color { tint ?? Theme.background }
+
+    private func loadTint() async {
+        guard let url = current.poster else { return }
+        if let color = await PosterTint.load(url), !Task.isCancelled, color != tint {
+            withAnimation(.easeInOut(duration: 0.45)) { tint = color }
+        }
+    }
+
+    /// A frame of the film for the trailer: Kinopoisk's cover, otherwise Zona's backdrop.
+    private func loadBackdrop() async {
+        guard filmResolved, backdrop == nil else { return }
+        if let cover = film?.coverUrl?.nonEmpty, let url = URL(string: cover) {
+            backdrop = url
+            return
+        }
+        backdrop = await Backdrops.load(item.id)
+    }
+
+    /// "Смотреть" on the home screen opened the page: it starts as the button here does, once.
+    private func autoplayIfNeeded() {
+        guard autoplay, !autoplayDone, !Task.isCancelled else { return }
+        autoplayDone = true
+        watchTapped()
+    }
+
     // MARK: Header
 
-    /// The poster in the middle over its own colour, the title and the ratings under it.
-    private var header: some View {
+    /// The poster over the whole width, the title, the year, genres and ratings on its faded bottom.
+    private func header(heroHeight: CGFloat) -> some View {
         VStack(spacing: 0) {
-            Color.clear
-                .frame(width: 176, height: 264)
-                .overlay { PosterImage(url: current.poster) }
-                .overlay { PosterImage(url: largePoster, maxPixel: 1000, placeholder: false) }
-                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .stroke(Color.white.opacity(0.16), lineWidth: 0.5)
-                }
-                .background {
-                    RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .fill(Color.black)
-                        .shadow(color: .black.opacity(0.55), radius: 28, y: 16)
-                }
-                .padding(.top, 6)
+            HeroPicture(item: current, height: heroHeight, fade: pageColor)
+            titleBlock
+                .padding(.top, -96)
+        }
+    }
+
+    private var titleBlock: some View {
+        VStack(spacing: 0) {
             Text(current.title)
-                .font(.title2.weight(.bold))
+                .font(.largeTitle.weight(.bold))
+                .foregroundStyle(.white)
                 .multilineTextAlignment(.center)
                 .lineLimit(3)
-                .minimumScaleFactor(0.8)
-                .padding(.top, 18)
+                .minimumScaleFactor(0.7)
+                .shadow(color: .black.opacity(0.35), radius: 12, y: 2)
             if let original = current.originalTitle, !original.isEmpty, original != current.title {
                 Text(original)
                     .font(.subheadline)
-                    .foregroundStyle(Theme.secondary)
+                    .foregroundStyle(Color.white.opacity(0.6))
                     .multilineTextAlignment(.center)
                     .lineLimit(2)
-                    .padding(.top, 3)
+                    .padding(.top, 4)
             }
             if !metaLine.isEmpty {
                 Text(metaLine)
-                    .font(.footnote)
-                    .foregroundStyle(Theme.secondary)
+                    .font(.subheadline)
+                    .foregroundStyle(Color.white.opacity(0.72))
                     .multilineTextAlignment(.center)
-                    .padding(.top, 6)
+                    .padding(.top, 8)
             }
-            ratingPills
-                .padding(.top, 12)
+            ratingsLine
+                .padding(.top, 4)
         }
         .frame(maxWidth: .infinity)
-        .padding(.horizontal, 16)
-        .background(alignment: .top) {
-            // Reaches up under the navigation bar and the status bar, fades out under the buttons.
-            AmbientGlow(url: current.poster, height: 1150)
-                .offset(y: -500)
-        }
+        .padding(.horizontal, 24)
     }
 
     /// The full-size poster, drawn over the preview of the lists (that one is usually loaded already).
@@ -385,47 +428,53 @@ struct DetailsView: View {
         return parts.joined(separator: " · ")
     }
 
+    /// "Кинопоиск 8,2 · IMDb 8,4", and the mark of a watched film.
     @ViewBuilder
-    private var ratingPills: some View {
+    private var ratingsLine: some View {
         let kp = current.ratingKP ?? 0
         let imdb = current.ratingIMDb ?? 0
         let watched = library.isWatched(item.id)
         if kp > 0 || imdb > 0 || watched {
-            HStack(spacing: 8) {
+            HStack(spacing: 6) {
                 if kp > 0 {
-                    ratingPill("Кинопоиск", kp)
+                    rating("Кинопоиск", kp)
+                }
+                if kp > 0 && imdb > 0 {
+                    separatorDot
                 }
                 if imdb > 0 {
-                    ratingPill("IMDb", imdb)
+                    rating("IMDb", imdb)
                 }
                 if watched {
+                    if kp > 0 || imdb > 0 {
+                        separatorDot
+                    }
                     Label("Просмотрено", systemImage: "eye.fill")
-                        .font(.footnote.weight(.medium))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 12)
-                        .frame(height: 28)
-                        .glassSurface(Capsule())
+                        .foregroundStyle(Color.white.opacity(0.85))
                 }
             }
+            .font(.subheadline)
             .lineLimit(1)
+            .minimumScaleFactor(0.8)
         }
     }
 
-    private func ratingPill(_ title: String, _ value: Double) -> some View {
-        HStack(spacing: 5) {
+    private func rating(_ title: String, _ value: Double) -> some View {
+        HStack(spacing: 4) {
             Text(title)
-                .foregroundStyle(Theme.secondary)
+                .foregroundStyle(Color.white.opacity(0.72))
             Text(RatingStyle.text(value))
-                .fontWeight(.semibold)
+                .fontWeight(.bold)
                 .foregroundStyle(.white)
         }
-        .font(.footnote)
-        .padding(.horizontal, 12)
-        .frame(height: 28)
-        .glassSurface(Capsule())
     }
 
-    /// "…" in the navigation bar: the mark "Просмотрено" and the page on Kinopoisk.
+    private var separatorDot: some View {
+        Text("·")
+            .foregroundStyle(Color.white.opacity(0.5))
+    }
+
+    /// "…" in the navigation bar: the mark "Просмотрено", all the releases and the page on Kinopoisk.
     private var moreMenu: some View {
         Menu {
             Button {
@@ -453,29 +502,43 @@ struct DetailsView: View {
 
     // MARK: Actions
 
+    /// One main button with "Позже" and "Избранное" beside it, the quality and the voice-over
+    /// in one small menu under it.
     private var actions: some View {
         VStack(spacing: 10) {
-            Button {
-                watchTapped()
-            } label: {
-                Group {
-                    if searchingRelease {
-                        HStack(spacing: 10) {
-                            ProgressView()
-                                .tint(Theme.onAccent)
-                            Text("Ищем раздачу…")
+            HStack(spacing: 10) {
+                Button {
+                    watchTapped()
+                } label: {
+                    Group {
+                        if searchingRelease {
+                            HStack(spacing: 10) {
+                                ProgressView()
+                                    .tint(Theme.onAccent)
+                                Text("Ищем раздачу…")
+                            }
+                        } else {
+                            Label(watchTitle, systemImage: "play.fill")
                         }
-                    } else {
-                        Label(watchTitle, systemImage: "play.fill")
                     }
+                    .font(.headline)
+                    .lineLimit(1)
+                    .frame(maxWidth: .infinity)
                 }
-                .font(.headline)
-                .frame(maxWidth: .infinity)
-            }
-            .primaryActionStyle()
-            .disabled(searchingRelease)
+                .primaryActionStyle()
+                .disabled(searchingRelease)
 
-            choiceMenus
+                circleButton(library.isWatchLater(item) ? "bookmark.fill" : "bookmark",
+                             label: library.isWatchLater(item) ? "Убрать из «Смотреть позже»" : "Смотреть позже") {
+                    library.toggleWatchLater(current)
+                }
+                circleButton(library.isFavorite(item) ? "heart.fill" : "heart",
+                             label: library.isFavorite(item) ? "Убрать из избранного" : "В избранное") {
+                    library.toggleFavorite(current)
+                }
+            }
+
+            choiceMenu
 
             if let text = captionText {
                 Text(text)
@@ -485,116 +548,151 @@ struct DetailsView: View {
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: .infinity)
             }
-
-            actionBar
-                .padding(.top, 4)
         }
         .padding(.horizontal, 16)
     }
 
-    /// The trailer, favourites, "Смотреть позже" and the releases in one glass panel.
-    private var actionBar: some View {
-        HStack(spacing: 0) {
-            barButton(loadingTrailer ? "Ищем…" : "Трейлер",
-                      systemImage: loadingTrailer ? "hourglass" : "play.rectangle") {
-                openTrailer()
-            }
-            barButton(library.isFavorite(item) ? "В избранном" : "Избранное",
-                      systemImage: library.isFavorite(item) ? "heart.fill" : "heart") {
-                library.toggleFavorite(current)
-            }
-            barButton(library.isWatchLater(item) ? "Отложено" : "Позже",
-                      systemImage: library.isWatchLater(item) ? "bookmark.fill" : "bookmark") {
-                library.toggleWatchLater(current)
-            }
-            barButton("Раздачи",
-                      systemImage: sources.isEmpty ? "list.bullet.rectangle" : "list.bullet.rectangle.fill") {
-                pendingEpisode = nil
-                showSources = true
-            }
-        }
-        .padding(.horizontal, 6)
-        .frame(height: 64)
-        .glassSurface(Capsule())
-    }
-
-    private func barButton(_ title: String, systemImage: String, action: @escaping () -> Void) -> some View {
+    private func circleButton(_ systemImage: String, label: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            VStack(spacing: 4) {
-                Image(systemName: systemImage)
-                    .font(.system(size: 19, weight: .regular))
-                    .contentTransition(.symbolEffect(.replace))
-                    .frame(height: 24)
-                Text(title)
-                    .font(.caption2.weight(.semibold))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.8)
-            }
-            .foregroundStyle(Color.white.opacity(0.9))
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .contentShape(Rectangle())
+            Image(systemName: systemImage)
+                .font(.system(size: 19, weight: .semibold))
+                .foregroundStyle(.white)
+                .contentTransition(.symbolEffect(.replace))
+                .frame(width: 52, height: 52)
         }
-        .buttonStyle(.plain)
+        .glassButton(Circle())
+        .accessibilityLabel(label)
     }
 
-    /// Two menus under the button. Quality: "Авто" plays what was watched before or the best
-    /// release of the preferred quality, a quality plays the best release of that quality.
+    /// "1080p · Дубляж ⌄": what "Смотреть" plays. Quality: "Авто" plays what was watched before or
+    /// the best release of the preferred quality, a quality plays the best release of that quality.
     /// Voice-over filters the releases before the automatic quality and seeders ranking.
     @ViewBuilder
-    private var choiceMenus: some View {
+    private var choiceMenu: some View {
         let qualities = qualityOptions
         let voices = voiceOptions
         let showQuality = autoPlayBest && qualities.count > 1
         let showVoice = autoPlayBest && !voices.isEmpty
         if showQuality || showVoice {
-            HStack(spacing: 10) {
+            Menu {
                 if showQuality {
-                    Menu {
-                        Picker("Качество", selection: $chosenQuality) {
-                            Text("Авто").tag(ReleaseQuality?.none)
-                            ForEach(qualities) { quality in
-                                Text(quality.title).tag(ReleaseQuality?.some(quality))
-                            }
+                    Picker(selection: $chosenQuality) {
+                        Text("Авто").tag(ReleaseQuality?.none)
+                        ForEach(qualities) { quality in
+                            Text(quality.title).tag(ReleaseQuality?.some(quality))
                         }
                     } label: {
-                        choiceLabel("Качество", chosenQuality?.title ?? "Авто")
+                        Label("Качество", systemImage: "tv")
                     }
+                    .pickerStyle(.menu)
                 }
                 if showVoice {
-                    Menu {
-                        Picker("Озвучка", selection: $chosenVoice) {
-                            Text("Авто").tag(ReleaseVoiceOption?.none)
-                            ForEach(voices) { voice in
-                                Text(voice.title).tag(ReleaseVoiceOption?.some(voice))
-                            }
+                    Picker(selection: $chosenVoice) {
+                        Text("Авто").tag(ReleaseVoiceOption?.none)
+                        ForEach(voices) { voice in
+                            Text(voice.title).tag(ReleaseVoiceOption?.some(voice))
                         }
                     } label: {
-                        choiceLabel("Озвучка", chosenVoice?.title ?? "Авто")
+                        Label("Озвучка", systemImage: "waveform")
                     }
+                    .pickerStyle(.menu)
                 }
+            } label: {
+                HStack(spacing: 5) {
+                    Text(choiceSummary)
+                    Image(systemName: "chevron.down")
+                        .font(.caption2.weight(.bold))
+                }
+                .font(.subheadline)
+                .foregroundStyle(Color.white.opacity(0.7))
+                .lineLimit(1)
+                .padding(.horizontal, 14)
+                .frame(height: 32)
+                .contentShape(Capsule())
             }
+            .frame(maxWidth: .infinity)
         }
     }
 
-    private func choiceLabel(_ title: String, _ value: String) -> some View {
-        HStack(spacing: 6) {
-            Text(title)
-                .foregroundStyle(Theme.secondary)
-            Text(value)
-                .fontWeight(.semibold)
-                .foregroundStyle(.white)
-            Image(systemName: "chevron.down")
-                .font(.caption2.weight(.bold))
-                .foregroundStyle(Theme.secondary)
+    /// The chosen quality and voice-over, or those of the release "Смотреть" plays.
+    private var choiceSummary: String {
+        let release = planRelease
+        let quality = chosenQuality?.title
+            ?? release.flatMap { $0.quality == .unknown ? nil : $0.quality.title }
+            ?? "Авто"
+        var parts = [quality]
+        if let voice = chosenVoice?.title ?? release.flatMap({ mainVoice(of: $0) }) {
+            parts.append(voice)
         }
-        .font(.subheadline)
-        .lineLimit(1)
-        .minimumScaleFactor(0.75)
-        .padding(.horizontal, 12)
-        .frame(maxWidth: .infinity)
-        .frame(height: 40)
-        .contentShape(Capsule())
-        .glassSurface(Capsule())
+        return parts.joined(separator: " · ")
+    }
+
+    /// The found release the main button plays.
+    private var planRelease: TorrentRelease? {
+        switch plan {
+        case .release(let release): return release
+        case .resume(let entry): return foundRelease(for: entry.link)
+        case .source(let source): return foundRelease(for: source.link)
+        case nil: return nil
+        }
+    }
+
+    private func mainVoice(of release: TorrentRelease) -> String? {
+        if let kind = release.voiceKinds.filter({ $0 != .subtitles }).min() { return kind.title }
+        return release.studios.first?.nonEmpty
+    }
+
+    // MARK: Trailer
+
+    /// The trailer as a frame of the film with a play button on it.
+    private var trailerCard: some View {
+        Button {
+            openTrailer()
+        } label: {
+            let shape = RoundedRectangle(cornerRadius: 22, style: .continuous)
+            Color.clear
+                .aspectRatio(16.0 / 9.0, contentMode: .fit)
+                .frame(maxWidth: .infinity)
+                .overlay { PosterImage(url: backdrop ?? largePoster ?? current.poster, maxPixel: 1200) }
+                .overlay {
+                    LinearGradient(colors: [Color.black.opacity(0), Color.black.opacity(0.6)],
+                                   startPoint: .center, endPoint: .bottom)
+                }
+                .overlay {
+                    Group {
+                        if loadingTrailer {
+                            ProgressView()
+                                .tint(.white)
+                        } else {
+                            Image(systemName: "play.fill")
+                                .font(.system(size: 22, weight: .bold))
+                                .foregroundStyle(.white)
+                                .offset(x: 2)
+                        }
+                    }
+                    .frame(width: 64, height: 64)
+                    .glassSurface(Circle(), style: .clear)
+                }
+                .overlay(alignment: .bottomLeading) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Трейлер")
+                            .font(.headline)
+                            .foregroundStyle(.white)
+                        Text(current.title)
+                            .font(.caption)
+                            .foregroundStyle(Color.white.opacity(0.75))
+                            .lineLimit(1)
+                    }
+                    .padding(14)
+                }
+                .clipShape(shape)
+                .overlay { shape.stroke(Color.white.opacity(0.1), lineWidth: 0.5) }
+                .contentShape(shape)
+        }
+        .buttonStyle(.plain)
+        .disabled(loadingTrailer)
+        .accessibilityLabel("Трейлер")
+        .padding(.horizontal, 16)
     }
 
     private func watchTapped() {
@@ -809,34 +907,32 @@ struct DetailsView: View {
         .padding(.horizontal, 16)
     }
 
-    /// "О фильме": the country, genres and authors in a glass table (the year, length and age
+    /// "Подробности": the country, genres and authors in two columns (the year, length and age
     /// are under the title).
     @ViewBuilder
-    private var infoBlock: some View {
+    private var detailsBlock: some View {
         let rows = infoRows
         if !rows.isEmpty {
-            VStack(alignment: .leading, spacing: 10) {
-                SectionHeader(title: isSeries ? "О сериале" : "О фильме")
-                VStack(spacing: 0) {
-                    ForEach(Array(rows.enumerated()), id: \.offset) { index, row in
-                        if index > 0 {
-                            Divider()
-                        }
-                        HStack(alignment: .firstTextBaseline, spacing: 14) {
-                            Text(row.title)
+            VStack(alignment: .leading, spacing: 14) {
+                SectionHeader(title: "Подробности")
+                LazyVGrid(columns: [GridItem(.flexible(), spacing: 16, alignment: .topLeading),
+                                    GridItem(.flexible(), spacing: 16, alignment: .topLeading)],
+                          alignment: .leading, spacing: 18) {
+                    ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(row.title.uppercased())
+                                .font(.caption2.weight(.semibold))
+                                .tracking(0.8)
                                 .foregroundStyle(Theme.secondary)
-                                .layoutPriority(1)
-                            Spacer(minLength: 0)
                             Text(row.value)
-                                .multilineTextAlignment(.trailing)
+                                .font(.subheadline)
+                                .foregroundStyle(.white)
+                                .lineLimit(4)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
-                        .font(.subheadline)
-                        .padding(.vertical, 12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 2)
-                .glassSurface(RoundedRectangle(cornerRadius: 22, style: .continuous))
                 .padding(.horizontal, 16)
             }
         }
@@ -860,11 +956,11 @@ struct DetailsView: View {
             .joined(separator: ", ")
     }
 
-    /// Directors first, then the cast: every person opens their films.
-    private var people: [KPStaff] {
-        let directors = staff.filter { $0.professionKey == "DIRECTOR" && !$0.name.isEmpty }.prefix(2)
-        let actors = staff.filter { $0.professionKey == "ACTOR" && !$0.name.isEmpty }.prefix(20)
-        return Array(directors) + Array(actors)
+    /// The actors ("В ролях"); without them the directors. Everyone of the film opens from the title.
+    private var cast: [KPStaff] {
+        let actors = staff.filter { $0.professionKey == "ACTOR" && !$0.name.isEmpty }
+        if !actors.isEmpty { return Array(actors.prefix(20)) }
+        return Array(staff.filter { $0.professionKey == "DIRECTOR" && !$0.name.isEmpty }.prefix(3))
     }
 
     // MARK: Seasons
@@ -992,10 +1088,15 @@ struct DetailsView: View {
 
     private var peopleBlock: some View {
         VStack(alignment: .leading, spacing: 12) {
-            SectionHeader(title: "Режиссёр и актёры")
+            NavigationLink {
+                CastListView(staff: staff)
+            } label: {
+                SectionLinkLabel(title: cast.first?.professionKey == "ACTOR" ? "В ролях" : "Создатели")
+            }
+            .buttonStyle(.plain)
             ScrollView(.horizontal, showsIndicators: false) {
-                LazyHStack(alignment: .top, spacing: 14) {
-                    ForEach(Array(people.enumerated()), id: \.offset) { _, person in
+                LazyHStack(alignment: .top, spacing: 12) {
+                    ForEach(Array(cast.enumerated()), id: \.offset) { _, person in
                         if let id = person.staffId {
                             NavigationLink(value: PersonRoute(id: id, name: person.name, professionKey: person.professionKey)) {
                                 personCard(person)
@@ -1012,29 +1113,33 @@ struct DetailsView: View {
     }
 
     private func personCard(_ person: KPStaff) -> some View {
-        VStack(spacing: 6) {
+        VStack(alignment: .leading, spacing: 6) {
             Color.clear
-                .frame(width: 72, height: 72)
-                .overlay { PosterImage(url: URL(string: person.posterUrl ?? "")) }
-                .clipShape(Circle())
+                .frame(width: 96, height: 128)
+                .overlay { PosterImage(url: URL(string: person.posterUrl ?? ""), maxPixel: 400) }
+                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .stroke(Color.white.opacity(0.1), lineWidth: 0.5)
+                }
             Text(person.name)
-                .font(.caption)
+                .font(.caption.weight(.medium))
                 .foregroundStyle(.white)
                 .lineLimit(2, reservesSpace: true)
-                .multilineTextAlignment(.center)
+                .multilineTextAlignment(.leading)
             if person.professionKey == "DIRECTOR" {
                 Text("Режиссёр")
                     .font(.caption2)
-                    .foregroundStyle(Theme.accent)
+                    .foregroundStyle(Theme.secondary)
                     .lineLimit(1)
-            } else if let role = person.description, !role.isEmpty {
+            } else if let role = person.description?.nonEmpty {
                 Text(role)
                     .font(.caption2)
                     .foregroundStyle(Theme.secondary)
                     .lineLimit(1)
             }
         }
-        .frame(width: 84)
+        .frame(width: 96, alignment: .leading)
         .contentShape(Rectangle())
     }
 
@@ -1081,6 +1186,7 @@ struct DetailsView: View {
                 self.error = error.localizedDescription
             }
         }
+        autoplayIfNeeded()
         if let people = await staffTask.value {
             staff = people
         }
@@ -1157,8 +1263,13 @@ struct SimilarBlock: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             if !items.isEmpty {
-                SectionHeader(title: "Похожие")
-                MediaRow(items: items)
+                NavigationLink {
+                    MediaListView(title: "Похожие", items: items)
+                } label: {
+                    SectionLinkLabel(title: "Похожие")
+                }
+                .buttonStyle(.plain)
+                MediaRow(items: items, cardWidth: 120)
             }
         }
         .frame(minHeight: 1)
@@ -1169,5 +1280,123 @@ struct SimilarBlock: View {
                 loaded = true
             }
         }
+    }
+}
+
+/// A whole row of films on its own screen ("Похожие").
+struct MediaListView: View {
+    let title: String
+    let items: [MediaItem]
+
+    var body: some View {
+        ScrollView {
+            MediaGrid(items: items)
+                .padding(.vertical, 12)
+        }
+        .background(Theme.background)
+        .navigationTitle(title)
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+/// Everyone of a film by their work: directors, actors, writers…
+struct CastListView: View {
+    let staff: [KPStaff]
+
+    private struct CrewSection: Identifiable {
+        let order: Int
+        let title: String
+        var people: [KPStaff]
+        var id: String { title }
+    }
+
+    private var sections: [CrewSection] {
+        var byTitle: [String: CrewSection] = [:]
+        for person in staff where !person.name.isEmpty {
+            let group = CastListView.group(person.professionKey ?? "")
+            byTitle[group.title, default: CrewSection(order: group.order, title: group.title, people: [])]
+                .people.append(person)
+        }
+        return byTitle.values.sorted { $0.order < $1.order }
+    }
+
+    static func group(_ key: String) -> (order: Int, title: String) {
+        switch key {
+        case "DIRECTOR": return (0, "Режиссёры")
+        case "ACTOR": return (1, "Актёры")
+        case "WRITER": return (2, "Сценаристы")
+        case "PRODUCER", "PRODUCER_USSR": return (3, "Продюсеры")
+        case "OPERATOR": return (4, "Операторы")
+        case "COMPOSER": return (5, "Композиторы")
+        case "DESIGN": return (6, "Художники")
+        case "EDITOR": return (7, "Монтажёры")
+        case "VOICE_DIRECTOR": return (8, "Режиссёры дубляжа")
+        case "TRANSLATOR": return (9, "Переводчики")
+        default: return (10, "Другие")
+        }
+    }
+
+    var body: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 0) {
+                ForEach(sections) { section in
+                    Section {
+                        ForEach(Array(section.people.enumerated()), id: \.offset) { _, person in
+                            row(person)
+                        }
+                    } header: {
+                        SectionHeader(title: section.title)
+                            .padding(.top, 22)
+                            .padding(.bottom, 6)
+                    }
+                }
+            }
+            .padding(.bottom, 24)
+        }
+        .background(Theme.background)
+        .navigationTitle("Актёры и создатели")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    @ViewBuilder
+    private func row(_ person: KPStaff) -> some View {
+        if let id = person.staffId {
+            NavigationLink(value: PersonRoute(id: id, name: person.name, professionKey: person.professionKey)) {
+                rowLabel(person, opens: true)
+            }
+            .buttonStyle(.plain)
+        } else {
+            rowLabel(person, opens: false)
+        }
+    }
+
+    private func rowLabel(_ person: KPStaff, opens: Bool) -> some View {
+        HStack(spacing: 12) {
+            Color.clear
+                .frame(width: 48, height: 64)
+                .overlay { PosterImage(url: URL(string: person.posterUrl ?? ""), maxPixel: 200) }
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(person.name)
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(.white)
+                    .lineLimit(2)
+                if let role = person.description?.nonEmpty {
+                    Text(role)
+                        .font(.caption)
+                        .foregroundStyle(Theme.secondary)
+                        .lineLimit(2)
+                }
+            }
+            Spacer(minLength: 8)
+            if opens {
+                Image(systemName: "chevron.right")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(Theme.secondary.opacity(0.7))
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 6)
+        .contentShape(Rectangle())
     }
 }

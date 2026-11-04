@@ -1,8 +1,8 @@
 import SwiftUI
 import UIKit
 
-/// Monochrome: white controls and marks, Liquid Glass and a dark background that takes the colour
-/// of the poster on screen (`AmbientGlow`).
+/// Monochrome: white controls and marks, Liquid Glass and a dark background; a film page takes
+/// the colour of its poster (`PosterTint`).
 enum Theme {
     static let accent = Color.white
     /// Text and glyphs on the accent (the white "Смотреть" button, a selected chip).

@@ -23,8 +23,14 @@ struct HomeSection: Identifiable, Hashable {
     static var rows: [HomeSection] { Array(all.dropFirst()) }
 }
 
+/// "Смотреть" over the big poster of the home screen: the page of the film opens and starts the best release.
+struct AutoplayRoute: Hashable {
+    let item: MediaItem
+}
+
 struct HomeView: View {
     @EnvironmentObject private var library: LibraryStore
+    @EnvironmentObject private var coordinator: PlayerCoordinator
     @AppStorage(SettingsKeys.kpToken) private var token = ""
     @AppStorage(SettingsKeys.zonaIndex) private var zonaIndex = true
     @State private var path = NavigationPath()
@@ -37,59 +43,95 @@ struct HomeView: View {
 
     var body: some View {
         NavigationStack(path: $path) {
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 26) {
-                    if catalogAvailable {
-                        FeaturedCarousel(section: HomeSection.featured, token: sourceKey)
-                    } else {
-                        TokenBanner()
-                    }
-                    if !library.data.continueWatching.isEmpty {
-                        ContinueWatchingRow(entries: library.data.continueWatching) { item in
-                            path.append(item)
-                        }
-                    }
-                    if !library.data.watchLater.isEmpty {
-                        VStack(alignment: .leading, spacing: 10) {
-                            SectionHeader(title: "Смотреть позже")
-                            MediaRow(items: Array(library.data.watchLater.prefix(12)))
-                        }
-                    }
-                    if catalogAvailable {
-                        if RecommendationService.hasProfile(library.data) {
-                            PersonalizedRow(data: library.data, token: sourceKey)
-                        }
-                        ForEach(HomeSection.rows) { section in
-                            CollectionRow(section: section, token: sourceKey)
-                        }
-                        if token.trimmed.isEmpty {
+            GeometryReader { proxy in
+                let topInset = proxy.safeAreaInsets.top
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 26) {
+                        if catalogAvailable {
+                            FeaturedHero(section: HomeSection.featured, token: sourceKey,
+                                         height: FeaturedHero.height(for: proxy.size, topInset: topInset),
+                                         topInset: topInset, watch: watch)
+                        } else {
                             TokenBanner()
+                                .padding(.top, topInset + 12)
+                        }
+                        if !library.data.continueWatching.isEmpty {
+                            ContinueWatchingRow(entries: library.data.continueWatching) { item in
+                                path.append(item)
+                            }
+                        }
+                        if !library.data.watchLater.isEmpty {
+                            VStack(alignment: .leading, spacing: 10) {
+                                SectionHeader(title: "Смотреть позже")
+                                MediaRow(items: Array(library.data.watchLater.prefix(12)))
+                            }
+                        }
+                        if catalogAvailable {
+                            if RecommendationService.hasProfile(library.data) {
+                                PersonalizedRow(data: library.data, token: sourceKey)
+                            }
+                            ForEach(HomeSection.rows) { section in
+                                CollectionRow(section: section, token: sourceKey)
+                            }
+                            if token.trimmed.isEmpty {
+                                TokenBanner()
+                            }
                         }
                     }
+                    .padding(.bottom, 12)
                 }
-                .padding(.vertical, 12)
+                .overlay(alignment: .top) {
+                    // The clock and the battery stay readable over the pictures.
+                    LinearGradient(colors: [Color.black.opacity(0.35), Color.black.opacity(0)],
+                                   startPoint: .top, endPoint: .bottom)
+                        .frame(height: topInset + 18)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
+                }
+                // The poster at the top reaches under the status bar.
+                .ignoresSafeArea(edges: .top)
             }
             .background(Theme.background)
             .navigationTitle("Кинотека")
+            .toolbar(.hidden, for: .navigationBar)
             .navigationDestination(for: MediaItem.self) { DetailsView(item: $0) }
+            .navigationDestination(for: AutoplayRoute.self) { DetailsView(item: $0.item, autoplay: true) }
             .navigationDestination(for: HomeSection.self) { CollectionGridView(section: $0) }
             .navigationDestination(for: PersonRoute.self) { PersonView(route: $0) }
         }
     }
+
+    /// Continues what was watched of the film, otherwise opens its page, which starts the best release.
+    private func watch(_ item: MediaItem) {
+        if let entry = library.continueEntry(for: item.key) {
+            coordinator.play(PlayRequest(continuing: entry))
+        } else {
+            path.append(AutoplayRoute(item: item))
+        }
+    }
 }
 
-/// What is popular now as a cover flow: the poster in the middle is big, its neighbours are
-/// smaller and dimmed, and the top of the screen takes the colour of the poster in the middle.
-struct FeaturedCarousel: View {
+/// What is popular now, a poster over the whole screen from its very top: the title, the genres
+/// and the buttons are on the picture, the dots under them show the page.
+struct FeaturedHero: View {
     let section: HomeSection
     let token: String
+    let height: CGFloat
+    /// The status bar over the picture.
+    let topInset: CGFloat
+    let watch: (MediaItem) -> Void
     @State private var items: [MediaItem] = []
     @State private var failed = false
-    /// The poster in the middle.
+    /// The poster on screen.
     @State private var currentID: Int?
 
-    private var current: MediaItem? {
-        items.first { $0.id == currentID } ?? items.first
+    /// Most of the screen: the dots and the title of the next row stay in sight.
+    static func height(for size: CGSize, topInset: CGFloat) -> CGFloat {
+        max(400, min(size.width * 1.45, (size.height + topInset) * 0.76))
+    }
+
+    private var currentIndex: Int {
+        items.firstIndex { $0.id == currentID } ?? 0
     }
 
     var body: some View {
@@ -97,99 +139,40 @@ struct FeaturedCarousel: View {
             if failed && items.isEmpty {
                 // The ordinary row of this collection tells what went wrong.
                 CollectionRow(section: section, token: token)
+                    .padding(.top, topInset + 12)
             } else {
-                content
+                pager
             }
         }
         .task(id: token) { await load() }
     }
 
-    private var content: some View {
-        VStack(spacing: 0) {
-            NavigationLink(value: section) {
-                SectionLinkLabel(title: section.title)
-            }
-            .buttonStyle(.plain)
-            .padding(.bottom, 14)
-
-            coverflow
-
-            caption
-                .frame(height: 52)
-                .animation(.easeInOut(duration: 0.25), value: current?.id)
-                .padding(.top, 16)
-        }
-        .background(alignment: .top) {
-            // Reaches up under the large title and the status bar, fades out under the caption.
-            AmbientGlow(url: current?.poster, height: 1250)
-                .offset(y: -600)
-        }
-    }
-
-    private var coverflow: some View {
-        GeometryReader { proxy in
-            let width = proxy.size.width
-            let margin = max(16, (width - CoverCard.width) / 2)
-            ScrollView(.horizontal, showsIndicators: false) {
-                LazyHStack(spacing: 0) {
-                    if items.isEmpty {
-                        ForEach([-1, -2, -3], id: \.self) { _ in
-                            RoundedRectangle(cornerRadius: CoverCard.cornerRadius, style: .continuous)
-                                .fill(Theme.card)
-                                .frame(width: CoverCard.width, height: CoverCard.height)
-                                .modifier(CoverflowEffect(width: width))
-                        }
-                    } else {
-                        ForEach(items) { item in
-                            CoverCard(item: item)
-                                .modifier(CoverflowEffect(width: width))
-                        }
+    private var pager: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            LazyHStack(spacing: 0) {
+                if items.isEmpty {
+                    HeroPlaceholder(height: height)
+                        .containerRelativeFrame(.horizontal)
+                } else {
+                    ForEach(items) { item in
+                        HeroPage(item: item, section: section, height: height, watch: watch)
+                            .containerRelativeFrame(.horizontal)
                     }
                 }
-                .scrollTargetLayout()
             }
-            .contentMargins(.horizontal, margin, for: .scrollContent)
-            .scrollTargetBehavior(.viewAligned)
-            .scrollPosition(id: $currentID, anchor: .center)
-            .scrollClipDisabled()
-            .scrollDisabled(items.isEmpty)
-            .modifier(PulseWhenEmpty(empty: items.isEmpty))
+            .scrollTargetLayout()
         }
-        .frame(height: CoverCard.height)
-    }
-
-    @ViewBuilder
-    private var caption: some View {
-        if let item = current {
-            NavigationLink(value: item) {
-                VStack(spacing: 4) {
-                    Text(item.title)
-                        .font(.title3.weight(.bold))
-                        .foregroundStyle(.white)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.7)
-                    Text(item.shortMeta)
-                        .font(.subheadline)
-                        .foregroundStyle(Theme.secondary)
-                        .lineLimit(1)
-                }
-                .frame(maxWidth: .infinity)
-                .padding(.horizontal, 24)
-                .contentShape(Rectangle())
+        .scrollTargetBehavior(.paging)
+        .scrollPosition(id: $currentID)
+        // The poster pulled down grows above the row.
+        .scrollClipDisabled()
+        .scrollDisabled(items.isEmpty)
+        .frame(height: height)
+        .overlay(alignment: .bottom) {
+            if items.count > 1 {
+                PageDots(count: items.count, current: currentIndex)
+                    .padding(.bottom, 14)
             }
-            .buttonStyle(.plain)
-            .id(item.id)
-            .transition(.opacity)
-        } else {
-            VStack(spacing: 8) {
-                Capsule()
-                    .fill(Theme.card)
-                    .frame(width: 190, height: 18)
-                Capsule()
-                    .fill(Theme.card)
-                    .frame(width: 120, height: 12)
-            }
-            .modifier(LoadingPulse())
         }
     }
 
@@ -205,75 +188,141 @@ struct FeaturedCarousel: View {
     }
 }
 
-/// The posters of the cover flow shrink and dim as they move away from the middle.
-private struct CoverflowEffect: ViewModifier {
-    /// The width of the cover flow.
-    let width: CGFloat
-
-    func body(content: Content) -> some View {
-        let center = width / 2
-        let step = CoverCard.width
-        return content.visualEffect { effect, geometry in
-            let frame = geometry.frame(in: .scrollView(axis: .horizontal))
-            let distance = min(abs(frame.midX - center) / step, 1)
-            return effect
-                .scaleEffect(1 - distance * 0.2)
-                .opacity(1 - distance * 0.5)
-        }
-    }
-}
-
-private struct PulseWhenEmpty: ViewModifier {
-    let empty: Bool
-
-    @ViewBuilder
-    func body(content: Content) -> some View {
-        if empty {
-            content.modifier(LoadingPulse())
-        } else {
-            content
-        }
-    }
-}
-
-/// A big poster of the cover flow on the home screen.
-struct CoverCard: View {
-    static let width: CGFloat = 214
-    static let height: CGFloat = 321
-    static let cornerRadius: CGFloat = 20
-
+/// One poster at the top of the home screen: the picture and the title open the page,
+/// "Смотреть" starts the film, "Позже" puts it in "Смотреть позже".
+private struct HeroPage: View {
     @EnvironmentObject private var library: LibraryStore
     let item: MediaItem
+    let section: HomeSection
+    let height: CGFloat
+    let watch: (MediaItem) -> Void
 
-    /// The full-size poster, drawn over the preview of the lists (that one is usually loaded already).
-    private var largePoster: URL? {
-        guard let preview = item.posterPreviewURL, !preview.isEmpty,
-              let full = item.posterURL, full != preview else { return nil }
-        return URL(string: full)
+    /// "Фэнтези · Боевик · Приключения · 2026".
+    private var meta: String {
+        var parts = item.genres.prefix(3).map { $0.capitalizedFirst }
+        if let year = item.year { parts.append(String(year)) }
+        return parts.joined(separator: " · ")
     }
 
     var body: some View {
-        NavigationLink(value: item) {
-            Color.clear
-                .frame(width: CoverCard.width, height: CoverCard.height)
-                .overlay { PosterImage(url: item.poster) }
-                .overlay { PosterImage(url: largePoster, maxPixel: 1000, placeholder: false) }
-                .overlay(alignment: .topTrailing) { PosterMarks(item: item) }
-                .clipShape(RoundedRectangle(cornerRadius: CoverCard.cornerRadius, style: .continuous))
-                .overlay {
-                    RoundedRectangle(cornerRadius: CoverCard.cornerRadius, style: .continuous)
-                        .stroke(Color.white.opacity(0.14), lineWidth: 0.5)
+        let later = library.isWatchLater(item)
+        ZStack(alignment: .bottom) {
+            NavigationLink(value: item) {
+                HeroPicture(item: item, height: height)
+            }
+            .buttonStyle(.plain)
+
+            VStack(spacing: 0) {
+                NavigationLink(value: section) {
+                    HStack(spacing: 4) {
+                        Text(section.title.uppercased())
+                            .tracking(1.5)
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 9, weight: .heavy))
+                    }
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Color.white.opacity(0.72))
+                    .padding(.vertical, 4)
+                    .contentShape(Rectangle())
                 }
-                .background {
-                    // The shadow of a plain shape is cheaper than one of the picture.
-                    RoundedRectangle(cornerRadius: CoverCard.cornerRadius, style: .continuous)
-                        .fill(Color.black)
-                        .shadow(color: .black.opacity(0.5), radius: 22, y: 14)
+                .buttonStyle(.plain)
+
+                NavigationLink(value: item) {
+                    VStack(spacing: 6) {
+                        Text(item.title)
+                            .font(.system(size: 38, weight: .bold))
+                            .foregroundStyle(.white)
+                            .multilineTextAlignment(.center)
+                            .lineLimit(2)
+                            .minimumScaleFactor(0.55)
+                        if !meta.isEmpty {
+                            Text(meta)
+                                .font(.subheadline)
+                                .foregroundStyle(Color.white.opacity(0.75))
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.8)
+                        }
+                    }
+                    .shadow(color: .black.opacity(0.45), radius: 12, y: 2)
+                    .frame(maxWidth: .infinity)
+                    .contentShape(Rectangle())
                 }
-                .contentShape(RoundedRectangle(cornerRadius: CoverCard.cornerRadius, style: .continuous))
+                .buttonStyle(.plain)
+                .padding(.top, 6)
+
+                HStack(spacing: 10) {
+                    Button {
+                        watch(item)
+                    } label: {
+                        Label("Смотреть", systemImage: "play.fill")
+                            .lineLimit(1)
+                    }
+                    .primaryActionStyle()
+
+                    Button {
+                        library.toggleWatchLater(item)
+                    } label: {
+                        Label("Позже", systemImage: later ? "checkmark" : "plus")
+                            .font(.headline)
+                            .foregroundStyle(.white)
+                            .lineLimit(1)
+                            .contentTransition(.symbolEffect(.replace))
+                            .padding(.horizontal, 20)
+                            .padding(.vertical, 15)
+                    }
+                    .glassButton(Capsule())
+                    .accessibilityLabel(later ? "Убрать из «Смотреть позже»" : "Смотреть позже")
+                }
+                .padding(.top, 18)
+            }
+            .padding(.horizontal, 24)
+            .padding(.bottom, 40)
         }
-        .buttonStyle(.plain)
-        .contextMenu { LibraryMenuItems(library: library, item: item) }
+        .frame(height: height)
+    }
+}
+
+/// The top of the home screen while the posters load.
+private struct HeroPlaceholder: View {
+    let height: CGFloat
+
+    var body: some View {
+        ZStack(alignment: .bottom) {
+            LinearGradient(colors: [Theme.card, Theme.background], startPoint: .top, endPoint: .bottom)
+            VStack(spacing: 12) {
+                Capsule()
+                    .fill(Theme.card)
+                    .frame(width: 120, height: 10)
+                Capsule()
+                    .fill(Theme.card)
+                    .frame(width: 220, height: 30)
+                Capsule()
+                    .fill(Theme.card)
+                    .frame(width: 170, height: 12)
+            }
+            .padding(.bottom, 112)
+            .modifier(LoadingPulse())
+        }
+        .frame(height: height)
+    }
+}
+
+/// The page of the posters at the top: a short line for the one on screen, dots for the others.
+private struct PageDots: View {
+    let count: Int
+    let current: Int
+
+    var body: some View {
+        HStack(spacing: 6) {
+            ForEach(0..<count, id: \.self) { index in
+                Capsule()
+                    .fill(Color.white.opacity(index == current ? 0.95 : 0.35))
+                    .frame(width: index == current ? 18 : 6, height: 6)
+            }
+        }
+        .animation(.easeInOut(duration: 0.25), value: current)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
     }
 }
 
@@ -327,7 +376,7 @@ struct ContinueWatchingRow: View {
     var openItem: ((MediaItem) -> Void)? = nil
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 12) {
             SectionHeader(title: "Продолжить просмотр")
             ScrollView(.horizontal, showsIndicators: false) {
                 LazyHStack(spacing: 12) {
@@ -361,8 +410,21 @@ struct ContinueWatchingRow: View {
     }
 }
 
+/// A big frame of the film with its title, the episode and the time left written on it, and
+/// the line of the progress along the bottom edge.
 struct ContinueCard: View {
+    static let width: CGFloat = 264
+    static let height: CGFloat = 148
+    static let cornerRadius: CGFloat = 18
+
     let entry: ContinueEntry
+    /// A landscape frame of the film (Zona's backdrop); the middle of the poster until it comes.
+    @State private var backdrop: URL?
+
+    init(entry: ContinueEntry) {
+        self.entry = entry
+        _backdrop = State(initialValue: Backdrops.cached(entry.item?.id))
+    }
 
     /// "34 мин": the length is known from the saved position and its share.
     private var remaining: String? {
@@ -375,52 +437,91 @@ struct ContinueCard: View {
         return rest == 0 ? "\(minutes / 60) ч" : "\(minutes / 60) ч \(rest) мин"
     }
 
-    /// "2 сезон, 3 серия · ещё 34 мин", or "Осталось 34 мин" for a film.
+    /// "С1 Э3": the episode being watched.
+    private var episodeText: String? {
+        guard let episode = entry.episode else { return nil }
+        if let season = entry.season { return "С\(season) Э\(episode)" }
+        return "Серия \(episode)"
+    }
+
+    /// "С1 Э3 · ещё 34 мин", "Далее: С1 Э4", or "Осталось 34 мин" for a film.
     private var details: String? {
         let subtitle = entry.subtitle?.trimmed ?? ""
-        switch (subtitle.isEmpty, remaining) {
-        case (true, nil): return nil
-        case (true, let left?): return "Осталось " + left
-        case (false, nil): return subtitle
-        case (false, let left?): return subtitle + " · ещё " + left
+        if subtitle.hasPrefix("Далее") {
+            return episodeText.map { "Далее: " + $0 } ?? subtitle
+        }
+        // "Просмотрено 45%" of a film: the time left says more.
+        let label = episodeText ?? (subtitle.hasPrefix("Просмотрено") ? nil : subtitle.nonEmpty)
+        switch (label, remaining) {
+        case (nil, nil): return subtitle.nonEmpty
+        case (nil, let left?): return "Осталось " + left
+        case (let label?, nil): return label
+        case (let label?, let left?): return label + " · ещё " + left
         }
     }
 
+    private var progress: CGFloat { CGFloat(min(max(entry.position, 0), 1)) }
+
     var body: some View {
-        HStack(spacing: 12) {
-            Color.clear
-                .frame(width: 52, height: 78)
-                .overlay { PosterImage(url: entry.item?.poster) }
-                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                .overlay {
-                    Image(systemName: "play.fill")
-                        .font(.system(size: 11, weight: .bold))
-                        .foregroundStyle(.white)
-                        .frame(width: 28, height: 28)
-                        .glassSurface(Circle(), style: .clear)
+        let shape = RoundedRectangle(cornerRadius: ContinueCard.cornerRadius, style: .continuous)
+        Color.clear
+            .frame(width: ContinueCard.width, height: ContinueCard.height)
+            .overlay { PosterImage(url: entry.item?.poster) }
+            .overlay {
+                if let backdrop = backdrop {
+                    PosterImage(url: backdrop, maxPixel: 900, placeholder: false)
+                        .transition(.opacity)
                 }
-            VStack(alignment: .leading, spacing: 3) {
-                Text(entry.item?.title ?? entry.title)
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(.white)
-                    .lineLimit(1)
-                if let details = details {
-                    Text(details)
-                        .font(.caption)
-                        .foregroundStyle(Theme.secondary)
-                        .lineLimit(2)
-                }
-                ProgressView(value: min(max(entry.position, 0), 1))
-                    .tint(.white)
-                    .padding(.top, 6)
             }
-            Spacer(minLength: 0)
-        }
-        .padding(.leading, 10)
-        .padding(.trailing, 14)
-        .frame(width: 290, height: 98)
-        .contentShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
-        .glassSurface(RoundedRectangle(cornerRadius: 22, style: .continuous))
+            .overlay {
+                LinearGradient(stops: [
+                    .init(color: Color.black.opacity(0), location: 0.3),
+                    .init(color: Color.black.opacity(0.8), location: 1)
+                ], startPoint: .top, endPoint: .bottom)
+            }
+            .overlay(alignment: .bottomLeading) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(entry.item?.title ?? entry.title)
+                        .font(.subheadline.weight(.bold))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                    if let details = details {
+                        Text(details)
+                            .font(.caption)
+                            .foregroundStyle(Color.white.opacity(0.75))
+                            .lineLimit(1)
+                    }
+                }
+                .padding(.horizontal, 14)
+                .padding(.bottom, 15)
+            }
+            .overlay(alignment: .topTrailing) {
+                Image(systemName: "play.fill")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundStyle(.white)
+                    .frame(width: 32, height: 32)
+                    .glassSurface(Circle(), style: .clear)
+                    .padding(10)
+            }
+            .overlay(alignment: .bottomLeading) {
+                ZStack(alignment: .leading) {
+                    Rectangle()
+                        .fill(Color.white.opacity(0.25))
+                    Rectangle()
+                        .fill(Color.white)
+                        .frame(width: ContinueCard.width * progress)
+                }
+                .frame(height: 3)
+            }
+            .clipShape(shape)
+            .overlay { shape.stroke(Color.white.opacity(0.1), lineWidth: 0.5) }
+            .contentShape(shape)
+            .task(id: entry.item?.id) {
+                guard backdrop == nil, let id = entry.item?.id else { return }
+                if let url = await Backdrops.load(id), !Task.isCancelled {
+                    withAnimation(.easeInOut(duration: 0.3)) { backdrop = url }
+                }
+            }
     }
 }
 
