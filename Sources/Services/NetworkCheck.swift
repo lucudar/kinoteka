@@ -387,17 +387,20 @@ enum NetworkProbes {
             + "&tr=https%3A%2F%2Ftorrent.ubuntu.com%2Fannounce&tr=https%3A%2F%2Fipv6.torrent.ubuntu.com%2Fannounce"
     }
 
+    /// The Russian retrackers of the engine's list: they give the peers of most releases of the search.
     static let httpTrackers = [
         Tracker(id: "tracker-rutracker", title: "Ретрекер rutracker (bt.t-ru.org)", url: "http://bt.t-ru.org/ann?magnet"),
         Tracker(id: "tracker-corbina", title: "Ретрекер corbina.net", url: "http://retracker01-msk-virt.corbina.net:80/announce"),
-        Tracker(id: "tracker-opentrackr", title: "opentrackr.org (HTTP)", url: "http://tracker.opentrackr.org:1337/announce")
+        Tracker(id: "tracker-nnmclub", title: "Ретрекер NNM-Club", url: "http://bt02.nnm-club.cc:2710/announce")
     ]
 
+    /// Trackers of the engine's list that answer steadily (opentrackr.org and exodus.desync.com did
+    /// not for days, so a cross there said nothing about the network).
     static let udpTrackers: [(host: String, port: UInt16)] = [
-        ("tracker.opentrackr.org", 1337),
+        ("retracker01-msk-virt.corbina.net", 80),
         ("open.stealth.si", 80),
         ("tracker.torrent.eu.org", 451),
-        ("exodus.desync.com", 6969)
+        ("open.demonii.com", 1337)
     ]
 
     static let dhtRouters: [(host: String, port: UInt16)] = [

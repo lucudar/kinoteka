@@ -2,6 +2,7 @@ import SwiftUI
 import UIKit
 import AVFoundation
 import MediaPlayer
+import AVKit
 import VLCKitSPM
 
 enum AspectMode: String, CaseIterable, Identifiable {
@@ -78,7 +79,16 @@ final class SystemVolumeController {
 /// UIView used as VLC drawable; reports size changes so the aspect mode can be re-applied.
 final class VideoSurfaceView: UIView {
     var onResize: ((CGSize) -> Void)?
+    /// The sample buffer view stays above a view VLC may still add for its own output.
+    weak var frontView: UIView?
     private var lastSize: CGSize = .zero
+
+    override func didAddSubview(_ subview: UIView) {
+        super.didAddSubview(subview)
+        if let front = frontView, subview !== front {
+            bringSubviewToFront(front)
+        }
+    }
 
     override func layoutSubviews() {
         super.layoutSubviews()
@@ -151,6 +161,19 @@ final class VLCPlayerModel: ObservableObject {
     /// this queue: while the video output is being created it waits for the main thread.
     private static let controlQueue = DispatchQueue(label: "kinoteka.vlc.control", qos: .userInitiated)
 
+    /// VLC draws into its own view, or hands the frames to a sample buffer layer, which
+    /// Picture in Picture can show.
+    enum RenderMode {
+        case native
+        case sampleBuffer
+    }
+
+    private struct TrackRestore {
+        let audio: MediaTrack?
+        let subtitle: MediaTrack?
+        let deadline: Date
+    }
+
     private let slot = VLCPlayerSlot()
     let videoView = VideoSurfaceView()
 
@@ -170,6 +193,24 @@ final class VLCPlayerModel: ObservableObject {
     /// Shift of the sound and of the subtitles against the picture (ms, "+" = later).
     @Published private(set) var audioDelayMs = 0
     @Published private(set) var subtitleDelayMs = 0
+    @Published private(set) var renderMode: RenderMode = .native
+    @Published private(set) var pipActive = false
+    @Published private(set) var pipPossible = false
+    @Published private(set) var preparingPiP = false
+    /// Counters the player screen reacts to: Picture in Picture started, asked to bring the
+    /// player back (its button), or was closed (its cross).
+    @Published private(set) var pipStarts = 0
+    @Published private(set) var pipRestoreRequests = 0
+    @Published private(set) var pipClosedRequests = 0
+    @Published private(set) var pipMessage: String?
+    /// Picture in Picture was started by iOS when the app went to the background.
+    private(set) var pipStartedAutomatically = false
+    /// Open the streams with frames for Picture in Picture from the start (a setting).
+    var prefersSampleBuffer = false
+    /// iOS starts Picture in Picture itself when the app is closed during playback.
+    var automaticPictureInPicture = false {
+        didSet { pipController?.canStartPictureInPictureAutomaticallyFromInline = automaticPictureInPicture }
+    }
 
     private var timer: Timer?
     private var aspectTask: Task<Void, Never>?
@@ -185,6 +226,20 @@ final class VLCPlayerModel: ObservableObject {
     private var nowPlayingSubtitle: String?
     private var nowPlayingArtwork: MPMediaItemArtwork?
     private var isLiveStream = false
+    private var sink: SampleBufferSink?
+    private var sampleView: SampleBufferVideoView?
+    private var pipController: AVPictureInPictureController?
+    private var pipBridge: PictureInPictureBridge?
+    private var pipPossibleObservation: NSKeyValueObservation?
+    private var pipStartTask: Task<Void, Never>?
+    private var frameCheckTask: Task<Void, Never>?
+    private var pipRestoring = false
+    private var lastURL: URL?
+    private var lastOptions: [String: Any] = [:]
+    private var loadedSlaves: [(URL, VLCMediaPlaybackSlaveType)] = []
+    /// Dubs and subtitles connected later: a reopened stream gets them again.
+    private var extraSlaves: [(URL, VLCMediaPlaybackSlaveType)] = []
+    private var trackRestore: TrackRestore?
 
     init() {
         videoView.backgroundColor = .black
@@ -217,8 +272,23 @@ final class VLCPlayerModel: ObservableObject {
 
     var isSeekable: Bool { player?.isSeekable ?? false }
 
+    var pipSupported: Bool { PictureInPictureSupport.isAvailable }
+
     func load(url: URL, startAt: Int32, options: [String: Any], rate: Float, aspect: AspectMode, slaves: [(URL, VLCMediaPlaybackSlaveType)] = []) {
+        if prefersSampleBuffer, renderMode == .native, PictureInPictureSupport.isAvailable {
+            _ = installSampleBufferPlayer(hint: .zero, pixelAspect: nil)
+        }
+        trackRestore = nil
+        extraSlaves = []
+        loadMedia(url: url, startAt: startAt, options: options, rate: rate, aspect: aspect, slaves: slaves)
+    }
+
+    private func loadMedia(url: URL, startAt: Int32, options: [String: Any], rate: Float, aspect: AspectMode,
+                           slaves: [(URL, VLCMediaPlaybackSlaveType)]) {
         guard let player = player else { return }
+        lastURL = url
+        lastOptions = options
+        loadedSlaves = slaves
         let media: VLCMedia = VLCMedia(url: url)
         var all: [String: Any] = ["network-caching": 3000]
         if startAt > 0 {
@@ -288,6 +358,8 @@ final class VLCPlayerModel: ObservableObject {
         } else if tickCount % 4 == 0 {
             updateNowPlaying()
         }
+        syncPictureInPicture()
+        if trackRestore != nil && started { applyTrackRestore() }
 
         if !started && t > 0 {
             started = true
@@ -334,8 +406,10 @@ final class VLCPlayerModel: ObservableObject {
         // A new stream starts without the shift: the one chosen for the release stays.
         if audioDelayMs != 0 || subtitleDelayMs != 0 { applyDelays() }
         refreshTracks()
+        applyTrackRestore()
         // The next episode started while the app is in the background: sound only.
         if videoOff { hideVideo() }
+        if renderMode == .sampleBuffer { checkFramesArrive() }
     }
 
     func refreshTracks() {
@@ -368,9 +442,29 @@ final class VLCPlayerModel: ObservableObject {
     func addAudioSlave(_ url: URL) {
         guard let player = player else { return }
         _ = player.addPlaybackSlave(url, type: .audio, enforce: true)
+        extraSlaves.append((url, .audio))
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 1_500_000_000)
             self?.refreshTracks()
+        }
+    }
+
+    /// Connects a subtitle file (found on OpenSubtitles); `select` turns it on.
+    func addSubtitleSlave(_ url: URL, select: Bool) {
+        guard let player = player else { return }
+        let before = Set(subtitleTracks.map(\.id))
+        _ = player.addPlaybackSlave(url, type: .subtitle, enforce: select)
+        extraSlaves.append((url, .subtitle))
+        Task { @MainActor [weak self] in
+            for _ in 0..<8 {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                guard let self else { return }
+                self.refreshTracks()
+                if let added = self.subtitleTracks.last(where: { $0.id >= 0 && !before.contains($0.id) }) {
+                    if select && self.currentSubtitle != added.id { self.setSubtitle(added.id) }
+                    return
+                }
+            }
         }
     }
 
@@ -388,6 +482,7 @@ final class VLCPlayerModel: ObservableObject {
         player.pause()
         isPlaying = false
         updateNowPlaying()
+        syncPictureInPicture()
     }
 
     func resume() {
@@ -400,6 +495,7 @@ final class VLCPlayerModel: ObservableObject {
         // Resumed from the lock screen while the app is in the background: sound only.
         if videoOff { hideVideo() }
         updateNowPlaying()
+        syncPictureInPicture()
     }
 
     func jump(_ seconds: Int32) {
@@ -609,6 +705,11 @@ final class VLCPlayerModel: ObservableObject {
 
     func applyAspect(force: Bool = false) {
         guard let player = player else { return }
+        if renderMode == .sampleBuffer {
+            // The frames are shown by the layer: the aspect mode is its geometry.
+            sampleView?.aspect = aspect
+            return
+        }
         let size = videoView.bounds.size
         guard size.width > 1, size.height > 1, size.width.isFinite, size.height.isFinite else { return }
         let screen = "\(Int(size.width.rounded())):\(Int(size.height.rounded()))"
@@ -666,11 +767,286 @@ final class VLCPlayerModel: ObservableObject {
         aspectTask?.cancel()
         aspectTask = nil
         disableRemoteControls()
+        tearDownPictureInPicture()
         guard let player = slot.player else { return }
         slot.player = nil
         isPlaying = false
         AppDiagnostics.shared.log("player", "Плеер закрыт")
         VLCPlayerGraveyard.bury(player, view: videoView)
+    }
+
+    // MARK: Picture in Picture
+
+    /// Shows the video in the floating window. VLC's own view cannot be shown there: the first
+    /// time the stream is reopened (from the same place) with its frames handed to a layer.
+    func enterPictureInPicture() {
+        guard PictureInPictureSupport.isAvailable, player != nil else {
+            pipMessage = "Картинка в картинке недоступна на этом устройстве"
+            return
+        }
+        if pipActive { return }
+        if renderMode == .native {
+            guard switchToSampleBuffer() else {
+                pipMessage = "Не удалось подготовить картинку в картинке"
+                return
+            }
+        }
+        startPictureInPictureWhenPossible()
+    }
+
+    func exitPictureInPicture() {
+        pipStartTask?.cancel()
+        preparingPiP = false
+        if pipController?.isPictureInPictureActive == true {
+            pipController?.stopPictureInPicture()
+        }
+    }
+
+    func clearPipMessage() {
+        pipMessage = nil
+    }
+
+    /// The app is back: frames are shown again (the layer stops while the app is in the background).
+    func recoverVideoLayer() {
+        sink?.recover()
+    }
+
+    private func startPictureInPictureWhenPossible() {
+        pipStartTask?.cancel()
+        preparingPiP = true
+        try? AVAudioSession.sharedInstance().setActive(true)
+        pipStartTask = Task { @MainActor [weak self] in
+            for _ in 0..<60 {
+                guard let self, !Task.isCancelled else { return }
+                if self.pipActive {
+                    self.preparingPiP = false
+                    return
+                }
+                if let controller = self.pipController, controller.isPictureInPicturePossible,
+                   (self.sink?.displayedFrames ?? 0) > 0 {
+                    controller.startPictureInPicture()
+                    try? await Task.sleep(nanoseconds: 1_500_000_000)
+                    self.preparingPiP = false
+                    return
+                }
+                try? await Task.sleep(nanoseconds: 200_000_000)
+            }
+            guard let self, !Task.isCancelled else { return }
+            self.preparingPiP = false
+            self.pipMessage = "Картинка в картинке не запустилась: видео ещё не готово"
+            AppDiagnostics.shared.log("pip", "Не стала возможной за 12 с")
+        }
+    }
+
+    /// Replaces the player by one that hands its frames to a sample buffer layer and opens the
+    /// stream again at the same place, with the same dub, subtitles, speed and shifts.
+    private func switchToSampleBuffer() -> Bool {
+        guard renderMode == .native, let old = slot.player, let url = lastURL else { return false }
+        let restartAt: Int32 = isLiveStream ? 0 : max(0, timeMs - 1_500)
+        let audio = audioTracks.first { $0.id == currentAudio }
+        let subtitle = subtitleTracks.isEmpty ? nil : (subtitleTracks.first { $0.id == currentSubtitle } ?? MediaTrack(id: -1, name: ""))
+        let size = old.videoSize
+        let aspectOfPixels = VLCPlayerModel.pixelAspect(of: old.media)
+        guard installSampleBufferPlayer(hint: size, pixelAspect: aspectOfPixels) else { return false }
+        trackRestore = TrackRestore(audio: audio, subtitle: subtitle, deadline: Date().addingTimeInterval(30))
+        AppDiagnostics.shared.log("pip", "Поток открыт заново для картинки в картинке с \(restartAt) мс")
+        loadMedia(url: url, startAt: restartAt, options: lastOptions, rate: rate, aspect: aspect,
+                  slaves: loadedSlaves + extraSlaves)
+        return true
+    }
+
+    /// The new player gets no view: VLC hands it the frames (vmem), the layer shows them.
+    private func installSampleBufferPlayer(hint: CGSize, pixelAspect: (Int, Int)?) -> Bool {
+        guard let old = slot.player else { return false }
+        let newSink = SampleBufferSink()
+        newSink.setHint(size: hint, pixelAspect: pixelAspect)
+        let fresh = VLCMediaPlayer()
+        guard LibVLCVideo.attach(newSink, to: fresh) else { return false }
+        timer?.invalidate()
+        timer = nil
+        slot.player = fresh
+        VLCPlayerGraveyard.bury(old, view: videoView)
+        let view = SampleBufferVideoView(sink: newSink)
+        view.frame = videoView.bounds
+        view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        view.aspect = aspect
+        videoView.addSubview(view)
+        videoView.frontView = view
+        sampleView = view
+        sink = newSink
+        renderMode = .sampleBuffer
+        appliedAspectKey = ""
+        makePictureInPictureController(for: newSink)
+        return true
+    }
+
+    /// No frame came (the frames cannot be converted on this device or for this video):
+    /// back to VLC's own view, at the same place.
+    private func switchToNative() {
+        guard renderMode == .sampleBuffer, let old = slot.player, let url = lastURL else { return }
+        let restartAt: Int32 = isLiveStream ? 0 : max(0, timeMs - 1_000)
+        let audio = audioTracks.first { $0.id == currentAudio }
+        let subtitle = subtitleTracks.isEmpty ? nil : (subtitleTracks.first { $0.id == currentSubtitle } ?? MediaTrack(id: -1, name: ""))
+        tearDownPictureInPicture()
+        timer?.invalidate()
+        timer = nil
+        let fresh = VLCMediaPlayer()
+        fresh.drawable = videoView
+        slot.player = fresh
+        VLCPlayerGraveyard.bury(old, view: videoView)
+        sampleView?.removeFromSuperview()
+        sampleView = nil
+        videoView.frontView = nil
+        renderMode = .native
+        prefersSampleBuffer = false
+        appliedAspectKey = ""
+        trackRestore = TrackRestore(audio: audio, subtitle: subtitle, deadline: Date().addingTimeInterval(30))
+        loadMedia(url: url, startAt: restartAt, options: lastOptions, rate: rate, aspect: aspect,
+                  slaves: loadedSlaves + extraSlaves)
+    }
+
+    private func checkFramesArrive() {
+        frameCheckTask?.cancel()
+        frameCheckTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 6_000_000_000)
+            guard let self, !Task.isCancelled, self.renderMode == .sampleBuffer, !self.videoOff,
+                  UIApplication.shared.applicationState == .active,
+                  let player = self.player, player.isPlaying,
+                  (self.sink?.displayedFrames ?? 0) == 0 else { return }
+            let hasVideo = player.videoTrackIndexes.contains { (($0 as? NSNumber)?.int32Value ?? -1) >= 0 }
+            guard hasVideo else { return }
+            AppDiagnostics.shared.log("pip", "Кадры не пришли за 6 с, обычный вывод видео")
+            self.pipMessage = "Картинка в картинке не работает с этим видео"
+            self.switchToNative()
+        }
+    }
+
+    private func makePictureInPictureController(for sink: SampleBufferSink) {
+        tearDownPictureInPicture(keepSink: true)
+        let bridge = PictureInPictureBridge { [weak self] event in
+            self?.handlePictureInPicture(event)
+        }
+        let source = AVPictureInPictureController.ContentSource(sampleBufferDisplayLayer: sink.layer, playbackDelegate: bridge)
+        let controller = AVPictureInPictureController(contentSource: source)
+        controller.delegate = bridge
+        controller.canStartPictureInPictureAutomaticallyFromInline = automaticPictureInPicture
+        pipBridge = bridge
+        pipController = controller
+        pipPossibleObservation = controller.observe(\.isPictureInPicturePossible, options: [.initial, .new]) { [weak self] controller, _ in
+            let possible = controller.isPictureInPicturePossible
+            Task { @MainActor [weak self] in
+                if self?.pipPossible != possible { self?.pipPossible = possible }
+            }
+        }
+        syncPictureInPicture()
+    }
+
+    private func tearDownPictureInPicture(keepSink: Bool = false) {
+        pipStartTask?.cancel()
+        pipStartTask = nil
+        frameCheckTask?.cancel()
+        frameCheckTask = nil
+        pipPossibleObservation?.invalidate()
+        pipPossibleObservation = nil
+        if let controller = pipController {
+            if controller.isPictureInPictureActive { controller.stopPictureInPicture() }
+            controller.delegate = nil
+        }
+        pipController = nil
+        pipBridge = nil
+        if pipActive { pipActive = false }
+        if preparingPiP { preparingPiP = false }
+        pipPossible = false
+        guard !keepSink else { return }
+        sink?.invalidate()
+        sink = nil
+    }
+
+    private func handlePictureInPicture(_ event: PictureInPictureBridge.Event) {
+        switch event {
+        case .willStart:
+            pipStartedAutomatically = UIApplication.shared.applicationState != .active
+        case .didStart:
+            pipActive = true
+            preparingPiP = false
+            pipStarts += 1
+            AppDiagnostics.shared.log("pip", pipStartedAutomatically ? "Картинка в картинке: автоматически" : "Картинка в картинке")
+        case .failed(let text):
+            pipActive = false
+            preparingPiP = false
+            pipMessage = "Картинка в картинке не запустилась: \(text)"
+            AppDiagnostics.shared.log("pip", "Ошибка запуска: \(text)")
+        case .willStop:
+            break
+        case .didStop:
+            pipActive = false
+            if pipRestoring {
+                pipRestoring = false
+            } else {
+                pipClosedRequests += 1
+            }
+            pipStartedAutomatically = false
+            sink?.recover()
+        case .restore(let completion):
+            pipRestoring = true
+            pipRestoreRequests += 1
+            completion(true)
+        case .setPlaying(let playing):
+            if playing { resume() } else { pause() }
+        case .skip(let seconds):
+            jump(Int32(max(-600, min(600, seconds.rounded()))))
+        }
+    }
+
+    /// The position, the speed and the pause shown by the Picture in Picture window.
+    private func syncPictureInPicture() {
+        guard let sink else { return }
+        sink.updateClock(seconds: Double(timeMs) / 1_000, rate: isPlaying ? Double(rate) : 0)
+        guard let bridge = pipBridge else { return }
+        let live = isLiveStream || lengthMs <= 0
+        if bridge.update(paused: !isPlaying, duration: Double(lengthMs) / 1_000, live: live) {
+            pipController?.invalidatePlaybackState()
+        }
+    }
+
+    /// The dub and the subtitles chosen before the stream was reopened.
+    private func applyTrackRestore() {
+        guard let restore = trackRestore else { return }
+        if Date() > restore.deadline {
+            trackRestore = nil
+            return
+        }
+        var done = true
+        if let audio = restore.audio {
+            if let track = audioTracks.first(where: { $0.id == audio.id && $0.name == audio.name })
+                ?? audioTracks.first(where: { $0.name == audio.name }) {
+                if currentAudio != track.id { setAudio(track.id) }
+            } else {
+                done = false
+            }
+        }
+        if let subtitle = restore.subtitle {
+            if subtitle.id == -1 {
+                if currentSubtitle != -1, !subtitleTracks.isEmpty { setSubtitle(-1) }
+                if subtitleTracks.isEmpty { done = false }
+            } else if let track = subtitleTracks.first(where: { $0.id == subtitle.id && $0.name == subtitle.name })
+                        ?? subtitleTracks.first(where: { $0.name == subtitle.name }) {
+                if currentSubtitle != track.id { setSubtitle(track.id) }
+            } else {
+                done = false
+            }
+        }
+        if done { trackRestore = nil }
+    }
+
+    private static func pixelAspect(of media: VLCMedia?) -> (Int, Int)? {
+        guard let tracks = media?.tracksInformation as? [[String: Any]] else { return nil }
+        for track in tracks where (track[VLCMediaTracksInformationType] as? String) == VLCMediaTracksInformationTypeVideo {
+            let numerator = (track[VLCMediaTracksInformationSourceAspectRatio] as? NSNumber)?.intValue ?? 0
+            let denominator = (track[VLCMediaTracksInformationSourceAspectRatioDenominator] as? NSNumber)?.intValue ?? 0
+            if numerator > 0, denominator > 0 { return (numerator, denominator) }
+        }
+        return nil
     }
 }
 
@@ -686,7 +1062,7 @@ struct VLCVideoView: UIViewRepresentable {
 
 @MainActor
 enum OrientationHelper {
-    private static var scene: UIWindowScene? {
+    static var scene: UIWindowScene? {
         let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
         return scenes.first { $0.activationState == .foregroundActive } ?? scenes.first
     }

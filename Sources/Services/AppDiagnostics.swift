@@ -46,7 +46,6 @@ final class AppDiagnostics: NSObject, MXMetricManagerSubscriber, @unchecked Send
     private var previousEvents: [String] = []
     private var pingPending = false
     private var pingSentAt: TimeInterval = 0
-    private var sessionWritePending = false
     private var sampler: DispatchSourceTimer?
     private var samplerTicks = 0
 
@@ -471,7 +470,9 @@ final class AppDiagnostics: NSObject, MXMetricManagerSubscriber, @unchecked Send
         let server = TorrServer.shared
         let engine = server.isRunning ? "запущен" : "не запущен" + (server.startError.map { " (\($0))" } ?? "")
         let profile = server.activeProfile.map { "профиль " + $0.summary } ?? "профиль не проверен"
-        report += "Движок: \(engine), порт \(server.port), \(profile)\n"
+        let reopened = server.relistens
+        let portText = "порт \(server.port)" + (reopened > 0 ? ", открыт заново: \(reopened)" : "")
+        report += "Движок: \(engine), \(portText), \(profile)\n"
         func section(_ title: String, _ url: URL, tail: Int? = nil) {
             let data: Data?
             if let tail = tail {

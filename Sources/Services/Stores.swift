@@ -170,14 +170,6 @@ final class LibraryStore: ObservableObject {
         }
     }
 
-    func removeSources(at offsets: IndexSet, for key: String) {
-        mutate { d in
-            var list = d.sources[key] ?? []
-            list.remove(atOffsets: offsets)
-            d.sources[key] = list.isEmpty ? nil : list
-        }
-    }
-
     // Playback positions (not published: updated often while playing)
     func resumePosition(for streamKey: String) -> Int32 {
         data.resume[streamKey] ?? 0
@@ -518,16 +510,37 @@ extension PlayRequest {
 
 @MainActor
 final class PlayerCoordinator: ObservableObject {
-    @Published var request: PlayRequest?
+    @Published private(set) var request: PlayRequest?
+    /// The video plays in Picture in Picture and the app (catalog, search) is usable meanwhile.
+    @Published var minimized = false
+    private var pending: Task<Void, Never>?
 
     func play(_ request: PlayRequest, delay: Double = 0) {
+        pending?.cancel()
+        pending = nil
         guard delay > 0 else {
-            self.request = request
+            show(request)
             return
         }
-        Task { @MainActor [weak self] in
+        pending = Task { @MainActor [weak self] in
             try? await Task.sleep(seconds: delay)
-            self?.request = request
+            guard !Task.isCancelled else { return }
+            self?.show(request)
         }
+    }
+
+    private func show(_ request: PlayRequest) {
+        minimized = false
+        self.request = request
+    }
+
+    /// Closes the player. With an identifier only that request is closed: a player that is
+    /// finishing late must not close the next one that has already opened.
+    func close(_ id: UUID? = nil) {
+        if let id, request?.id != id { return }
+        pending?.cancel()
+        pending = nil
+        minimized = false
+        request = nil
     }
 }

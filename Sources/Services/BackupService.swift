@@ -27,6 +27,13 @@ struct BackupSettings: Codable {
     var playerGestures: Bool
     /// Added in 0.9.0 (older copies do not have it).
     var engineEncryption: String?
+    /// Added in 0.12.0: picture in picture, downloads and subtitle search.
+    var pipAuto: Bool?
+    var downloadsWifiOnly: Bool?
+    var downloadsPauseWhileWatching: Bool?
+    var subtitleLanguage: String?
+    var subtitleEnglishFallback: Bool?
+    var subtitleAuto: Bool?
 
     static func current(defaults: UserDefaults = .standard) -> BackupSettings {
         BackupSettings(
@@ -45,7 +52,13 @@ struct BackupSettings: Codable {
             automaticRecovery: defaults.bool(forKey: SettingsKeys.automaticRecovery),
             preloadNextEpisode: defaults.bool(forKey: SettingsKeys.preloadNextEpisode),
             playerGestures: defaults.bool(forKey: SettingsKeys.playerGestures),
-            engineEncryption: defaults.string(forKey: SettingsKeys.engineEncryption)
+            engineEncryption: defaults.string(forKey: SettingsKeys.engineEncryption),
+            pipAuto: defaults.bool(forKey: SettingsKeys.pipAuto),
+            downloadsWifiOnly: defaults.bool(forKey: SettingsKeys.downloadsWifiOnly),
+            downloadsPauseWhileWatching: defaults.bool(forKey: SettingsKeys.downloadsPauseWhileWatching),
+            subtitleLanguage: defaults.string(forKey: SettingsKeys.subtitleLanguage),
+            subtitleEnglishFallback: defaults.bool(forKey: SettingsKeys.subtitleEnglishFallback),
+            subtitleAuto: defaults.bool(forKey: SettingsKeys.subtitleAuto)
         )
     }
 
@@ -68,6 +81,12 @@ struct BackupSettings: Codable {
         if let mode = engineEncryption, EngineEncryptionMode(rawValue: mode) != nil {
             defaults.set(mode, forKey: SettingsKeys.engineEncryption)
         }
+        if let value = pipAuto { defaults.set(value, forKey: SettingsKeys.pipAuto) }
+        if let value = downloadsWifiOnly { defaults.set(value, forKey: SettingsKeys.downloadsWifiOnly) }
+        if let value = downloadsPauseWhileWatching { defaults.set(value, forKey: SettingsKeys.downloadsPauseWhileWatching) }
+        if let value = subtitleLanguage?.nonEmpty { defaults.set(value, forKey: SettingsKeys.subtitleLanguage) }
+        if let value = subtitleEnglishFallback { defaults.set(value, forKey: SettingsKeys.subtitleEnglishFallback) }
+        if let value = subtitleAuto { defaults.set(value, forKey: SettingsKeys.subtitleAuto) }
     }
 }
 

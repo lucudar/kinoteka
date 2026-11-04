@@ -81,7 +81,7 @@ final class TorrentWarmup {
     /// nothing in Low Data Mode).
     private func readAhead(hash: String, files: [TorrentFile], target: WarmupTarget?) {
         guard let target = target else { return }
-        let profile = TorrServer.shared.activeProfile ?? TorrServer.shared.desiredProfile
+        let profile = currentProfile
         let head = profile.warmupHead
         let tail = profile.warmupTail
         guard head > 0 else { return }
@@ -98,18 +98,61 @@ final class TorrentWarmup {
             let key = "\(hash):\(file.id)"
             guard key != readKey else { return }
             readKey = key
-            let started = Date()
-            let tailLength = file.length > head + tail ? tail : 0
-            async let start = TorrServer.shared.readAhead(hash: hash, file: file, offset: 0, length: min(head, file.length))
-            async let end = TorrServer.shared.readAhead(hash: hash, file: file, offset: file.length - tailLength, length: tailLength)
-            let (startBytes, endBytes) = await (start, end)
-            if Task.isCancelled {
-                if readKey == key { readKey = nil }
-                return
-            }
-            let seconds = Date().timeIntervalSince(started)
-            AppDiagnostics.shared.log("torrent", "Заранее загружено: начало \(startBytes >> 20) МБ, конец \(endBytes >> 20) МБ за \(String(format: "%.1f", seconds)) с")
+            await load(hash: hash, file: file, key: key, head: head, tail: tail, label: "Заранее загружено")
         }
+    }
+
+    /// The player opens a torrent file: its end is downloaded at the same time as the player
+    /// reads the start, so a file with the index at the end (an MP4 without "fast start", AVI)
+    /// does not wait for it before the first frame. Nothing when the film page has read the file.
+    func playbackWillStart(hash: String, file: TorrentFile) {
+        let tail = currentProfile.warmupTail
+        let hash = hash.lowercased()
+        let key = "\(hash):\(file.id)"
+        guard tail > 0, key != readKey else { return }
+        readTask?.cancel()
+        readHash = hash
+        readKey = key
+        readTask = Task {
+            await load(hash: hash, file: file, key: key, head: 0, tail: tail, label: "Конец файла загружен вместе с началом")
+        }
+    }
+
+    /// The next episode plays soon: its start and end are downloaded in advance, the way a film
+    /// page prepares the first file, so it starts at once. Stops when the calling task is cancelled.
+    func prepareNext(hash: String, file: TorrentFile) async {
+        let profile = currentProfile
+        let hash = hash.lowercased()
+        let key = "\(hash):\(file.id)"
+        guard profile.warmupHead > 0, key != readKey else { return }
+        readTask?.cancel()
+        readTask = nil
+        readHash = hash
+        readKey = key
+        await load(hash: hash, file: file, key: key, head: profile.warmupHead, tail: profile.warmupTail,
+                   label: "Следующая серия загружена заранее")
+    }
+
+    /// The engine profile now (before the first check, the one it is being tuned to).
+    private var currentProfile: EngineProfile {
+        TorrServer.shared.activeProfile ?? TorrServer.shared.desiredProfile
+    }
+
+    /// Reads `head` bytes from the start of `file` and `tail` bytes from its end at the same time.
+    private func load(hash: String, file: TorrentFile, key: String, head: Int64, tail: Int64, label: String) async {
+        let headLength = min(head, file.length)
+        let tailLength = file.length > headLength + tail ? tail : 0
+        guard headLength > 0 || tailLength > 0 else { return }
+        let started = Date()
+        async let start = TorrServer.shared.readAhead(hash: hash, file: file, offset: 0, length: headLength)
+        async let end = TorrServer.shared.readAhead(hash: hash, file: file, offset: file.length - tailLength, length: tailLength)
+        let (startBytes, endBytes) = await (start, end)
+        if Task.isCancelled {
+            if readKey == key { readKey = nil }
+            return
+        }
+        let seconds = Date().timeIntervalSince(started)
+        AppDiagnostics.shared.log("torrent", "\(label): начало \(startBytes >> 20) МБ, конец \(endBytes >> 20) МБ за \(String(format: "%.1f", seconds)) с")
     }
 
     /// Keeps the torrent of the open page from being closed by the engine.
